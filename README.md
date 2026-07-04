@@ -1,25 +1,25 @@
-# dispatch
+# bridge
 
 **Text your Claude Code agents from your phone. Any terminal, any machine, no intermediary.**
 
 Tell your running agent:
 
-> "use dispatch so we can text"
+> "use bridge so we can text"
 
-The agent installs dispatch, moves itself into a managed terminal, and hands
-you two commands: `dispatch attach` (keep chatting in a terminal) and
-`dispatch pair` (put your agent on your phone). From then on you're texting —
+The agent installs bridge, moves itself into a managed terminal, and hands
+you two commands: `bridge attach` (keep chatting in a terminal) and
+`bridge pair` (put your agent on your phone). From then on you're texting —
 from anywhere on your tailnet, with nobody between your thumb and your agent.
 
 ## How it works
 
 ```
-phone (PWA) ⇄ dispatch daemon (127.0.0.1, tailnet-only HTTPS) ⇄ managed PTYs
+phone (PWA) ⇄ bridge daemon (127.0.0.1, tailnet-only HTTPS) ⇄ managed PTYs
                         ▲
               agents register themselves
 ```
 
-- **Consent-first onboarding** — the agent joins dispatch; dispatch never
+- **Consent-first onboarding** — the agent joins dispatch; bridge never
   seizes a session. Registration *rehomes* the agent: a `claude --resume`
   of its own session inside a PTY the daemon controls, full memory intact.
   The old terminal copy signs off and asks you to quit it — one fork, zero
@@ -47,7 +47,7 @@ question that started as "can my Emacs agents text me?" and ended as "can
 
 - [magnus](https://github.com/hrishikeshs/magnus) — agent orchestration in Emacs
 - [magnus-bridge](https://github.com/hrishikeshs/magnus-bridge) — the phone
-  bridge for Magnus agents; dispatch generalizes its protocol to every
+  bridge for Magnus agents; bridge generalizes its protocol to every
   terminal
 
 ## License
