@@ -51,10 +51,24 @@ func tmux(args ...string) (string, error) {
 	return out.String(), err
 }
 
-// tmuxAlive reports whether the named tmux session exists.
+// tmuxAlive reports whether TARGET ("bridge:<name>") names a live window.
+// has-session validates only the session, so we check the window list.
 func tmuxAlive(target string) bool {
-	_, err := tmux("has-session", "-t", target)
-	return err == nil
+	sess, win, found := strings.Cut(target, ":")
+	if !found {
+		_, err := tmux("has-session", "-t", target)
+		return err == nil
+	}
+	out, err := tmux("list-windows", "-t", sess, "-F", "#{window_name}")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if line == win {
+			return true
+		}
+	}
+	return false
 }
 
 // tmuxDeliver types TEXT into the agent's terminal as one literal line and
@@ -303,12 +317,22 @@ func runConnect(ctx *cliCtx) error {
 		return fmt.Errorf("no Claude Code session found for %s — run this from inside a session", cwd)
 	}
 	sessionID := sessionIDFromPath(sessionFile)
-	target := "bridge-" + name
+	target := "bridge:" + name
 
 	if !tmuxAlive(target) {
-		if _, err := tmux("new-session", "-d", "-s", target, "-c", cwd,
-			"-e", "BRIDGE_CONTACT="+name,
-			"claude", "--resume", sessionID); err != nil {
+		// All agents live as windows in one shared "bridge" session, so a
+		// single `bridge attach` groups them under one terminal window with a
+		// tab (window) each. Isolation is per-window: send-keys/capture-pane
+		// target one window and never leak across.
+		var err error
+		if _, e := tmux("has-session", "-t", "bridge"); e != nil {
+			_, err = tmux("new-session", "-d", "-s", "bridge", "-n", name, "-c", cwd,
+				"-e", "BRIDGE_CONTACT="+name, "claude", "--resume", sessionID)
+		} else {
+			_, err = tmux("new-window", "-t", "bridge", "-n", name, "-c", cwd,
+				"-e", "BRIDGE_CONTACT="+name, "claude", "--resume", sessionID)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to rehome into tmux (is tmux installed?): %w", err)
 		}
 	}
@@ -336,17 +360,17 @@ See you on the other side.
 	return nil
 }
 
-// runAttach hands the terminal to a managed session (exec tmux attach).
+// runAttach hands the terminal to the grouped "bridge" tmux session — all
+// agents as windows (tabs). With a name, it selects that agent's window first.
 func runAttach(ctx *cliCtx) error {
-	if len(ctx.args) < 1 {
-		return fmt.Errorf("bridge attach <name>")
-	}
-	target := "bridge-" + ctx.args[0]
 	bin, err := exec.LookPath("tmux")
 	if err != nil {
 		return err
 	}
-	return syscall.Exec(bin, []string{"tmux", "attach", "-t", target}, os.Environ())
+	if len(ctx.args) >= 1 {
+		_, _ = tmux("select-window", "-t", "bridge:"+ctx.args[0])
+	}
+	return syscall.Exec(bin, []string{"tmux", "attach", "-t", "bridge"}, os.Environ())
 }
 
 // runSend delivers a message from this agent — to the phone by default, or to
