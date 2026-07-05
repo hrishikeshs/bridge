@@ -120,6 +120,10 @@ func runServe(port int) error {
 
 	startHeartbeat()
 	startSessionManager() // assigned in session.go: tail loops + liveness
+	if err := loadVAPID(); err != nil {
+		fmt.Printf("(push disabled: %v)\n", err)
+	}
+	loadPushSubs()
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
@@ -193,6 +197,12 @@ func route(w http.ResponseWriter, r *http.Request) {
 		handleApprove(w, r, id)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/upload":
 		handleUpload(w, r, id)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/push/key":
+		handlePushKey(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/push/subscribe":
+		handlePushSubscribe(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/push/debug":
+		handlePushDebug(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not-found"})
 	}
@@ -592,6 +602,8 @@ func handleLocal(w http.ResponseWriter, r *http.Request) {
 		audit("lockdown", "revoke-all + shutdown", "local")
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		requestShutdown()
+	case r.Method == http.MethodPost && r.URL.Path == "/local/push-test":
+		handlePushTest(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not-found"})
 	}

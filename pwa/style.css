@@ -407,3 +407,15 @@ footer { border-top: 1px solid var(--border); }
   border-radius: 50%;
 }
 #send-btn:disabled { opacity: 0.4; }
+
+/* enable-notifications prompt (iOS needs a tap to raise the permission dialog) */
+#enable-push {
+  margin: 8px 12px 0;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--accent);
+  border: none;
+  border-radius: 12px;
+}

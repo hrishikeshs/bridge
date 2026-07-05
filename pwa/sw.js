@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE = 'bridge-v3';
+const CACHE = 'bridge-v4';
 const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest',
                '/icons/icon-192.png', '/icons/icon-512.png'];
 
@@ -33,4 +33,26 @@ self.addEventListener('fetch', (e) => {
       })
       .catch(() => caches.match(e.request, { ignoreSearch: true }))
   );
+});
+
+// Web Push: the daemon fires these so the phone rings with the app closed.
+self.addEventListener('push', (e) => {
+  let d = { title: 'bridge', body: '' };
+  try { d = e.data.json(); } catch (_) { if (e.data) d.body = e.data.text(); }
+  e.waitUntil(self.registration.showNotification(d.title || 'bridge', {
+    body: d.body || '',
+    tag: d.tag || undefined,
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    data: { url: '/' },
+  }));
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true })
+    .then((wins) => {
+      for (const w of wins) if ('focus' in w) return w.focus();
+      return clients.openWindow((e.notification.data && e.notification.data.url) || '/');
+    }));
 });

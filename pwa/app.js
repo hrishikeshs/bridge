@@ -60,6 +60,7 @@ async function init() {
   });
   window.addEventListener('online', () => { connectEvents(); flushOutbox(); });
   window.addEventListener('offline', () => setConnected(false));
+  updatePushButton();          // iOS only prompts on a tap, so offer a button
 }
 
 /* Server unreachable (laptop asleep, daemon restarting): show the last
@@ -775,10 +776,76 @@ async function approve(agent, key) {
 
 /* ---------- notifications (best-effort; no-op where unsupported) ---------- */
 
-function requestNotifyPermission() {
-  if ('Notification' in window && Notification.permission === 'default') {
-    Notification.requestPermission().catch(() => {});
+function pushDebug(msg) {
+  fetch('/api/push/debug', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg: String(msg), perm: (window.Notification && Notification.permission) }),
+  }).catch(() => {});
+}
+
+// Show the enable-notifications button whenever push is supported but not yet
+// granted+subscribed. iOS requires the permission prompt to come from a tap.
+function updatePushButton() {
+  const btn = $('enable-push');
+  if (!btn) return;
+  const supported = 'Notification' in window && 'serviceWorker' in navigator && 'PushManager' in window;
+  const granted = supported && Notification.permission === 'granted';
+  btn.classList.toggle('hidden', !supported || granted);
+  if (granted) enablePush();   // already allowed on a prior visit: (re)subscribe
+}
+
+$('enable-push').addEventListener('click', async () => {
+  pushDebug('enable-push tapped');
+  await requestNotifyPermission();
+  updatePushButton();
+});
+
+async function requestNotifyPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    await Notification.requestPermission().catch(() => {});
   }
+  if (Notification.permission === 'granted') enablePush();
+}
+
+/* Subscribe this device to Web Push so the daemon can ring it with the app
+   closed. Idempotent — safe to call on every load once permission is granted. */
+async function enablePush() {
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      pushDebug('unsupported'); return;
+    }
+    if (Notification.permission !== 'granted') { pushDebug('not granted'); return; }
+    const reg = await navigator.serviceWorker.ready;
+    pushDebug('sw ready');
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      const res = await fetch('/api/push/key');
+      if (!res.ok) { pushDebug('key fetch failed ' + res.status); return; }
+      const { key } = await res.json();
+      pushDebug('got key, subscribing');
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlB64ToUint8Array(key),
+      });
+      pushDebug('subscribed ok');
+    } else {
+      pushDebug('already had subscription');
+    }
+    const r = await fetch('/api/push/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sub),
+    });
+    pushDebug('posted subscription ' + r.status);
+  } catch (e) { pushDebug('ERROR ' + (e && e.message ? e.message : e)); }
+}
+
+function urlB64ToUint8Array(base64) {
+  const pad = '='.repeat((4 - (base64.length % 4)) % 4);
+  const b64 = (base64 + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(b64);
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
 }
 
 function maybeNotify(event) {
