@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>bridge</title>
+  <meta name="theme-color" content="#0d1117">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="bridge">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/icon-180.png">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="pair-screen" class="hidden">
+    <div class="pair-box">
+      <img class="pair-logo" src="/icons/icon-192.png" alt="" width="72" height="72">
+      <h1>bridge</h1>
+      <p>Run <code>bridge pair</code> in a terminal,<br>then enter the code shown there.</p>
+      <input id="pair-code" inputmode="numeric" autocomplete="one-time-code"
+             maxlength="6" placeholder="000000">
+      <button id="pair-btn">Pair this device</button>
+      <p id="pair-error" class="error hidden">That code didn’t work — codes expire after 2 minutes.</p>
+    </div>
+  </div>
+
+  <div id="app" class="hidden">
+    <header>
+      <span class="title">bridge</span>
+      <span id="conn-dot" class="dot" title="connection"></span>
+    </header>
+    <div id="conn-banner" class="banner hidden"></div>
+    <nav id="contact-tabs"></nav>
+    <main id="feed"></main>
+    <footer>
+      <div id="attach-preview" class="hidden">
+        <img id="attach-thumb" alt="">
+        <button id="attach-remove">✕</button>
+      </div>
+      <div id="composer">
+        <button id="attach-btn" title="send a photo">📷</button>
+        <input id="attach-input" type="file" accept="image/*" class="hidden">
+        <!-- The focus dance in app.js suppresses iOS's keyboard accessory
+             bar (single-focusable-element rule). Autocorrect and QuickType
+             stay on by user preference. -->
+        <textarea id="msg-input" rows="1" placeholder="Message a contact…"
+                  autocomplete="off" inputmode="text"></textarea>
+        <button id="send-btn">↑</button>
+      </div>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
