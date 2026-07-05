@@ -117,6 +117,9 @@ $('pair-btn').addEventListener('click', async () => {
 
 async function refreshStatus() {
   const res = await fetch('/api/status').catch(() => null);
+  // A revoked or missing device token is an auth problem, not a dead Mac:
+  // route back to pairing instead of showing "unreachable" forever.
+  if (res && res.status === 401) return showPairing();
   if (!res || !res.ok) return setConnected(false);
   const data = await res.json();
   const wasOffline = new Map(state.contacts.map((c) => [c.id, c.status === 'offline']));
@@ -163,8 +166,11 @@ function connectEvents() {
       renderFeed();
       return;
     }
-    if (event.type === 'sent') dropPendingEcho(event.agent, event.text);
-    ingest(event);
+    const added = ingest(event);
+    // Drop the local echo only once the server's own 'sent' event has been
+    // accepted for render — otherwise a deduped event would remove the echo
+    // and leave no bubble at all.
+    if (added && event.type === 'sent') dropPendingEcho(event.agent, event.text);
     cacheEvents();
     renderFeed();
     renderTabs();
@@ -179,7 +185,7 @@ function scheduleReconnect() {
 }
 
 function ingest(event) {
-  if (event.id <= state.lastEventId) return;
+  if (event.id <= state.lastEventId) return false;
   state.lastEventId = event.id;
   state.events.push(event);
   if (event.type === 'attention') {
@@ -190,6 +196,7 @@ function ingest(event) {
   if (event.type === 'reply' || event.type === 'mention') {
     state.typing.delete(event.agent);   // the reply arrived; stop the dots
   }
+  return true;
 }
 
 function setConnected(on) {

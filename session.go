@@ -131,16 +131,22 @@ func startSessionManager() {
 	go func() {
 		for {
 			for _, c := range registry.Roster() {
-				if c.Status != "live" {
-					continue
-				}
-				if !tmuxAlive(c.TmuxTarget) {
+				alive := c.TmuxTarget != "" && tmuxAlive(c.TmuxTarget)
+				switch {
+				case c.Status == "live" && !alive:
+					// Its tmux window ended: retire it.
 					registry.SetOffline(c.ID)
 					Emit("attention-clear", c.ID, c.Name, "")
 					delete(tails, c.ID)
-					continue
+				case c.Status != "live" && alive:
+					// Its window outlived a daemon restart: revive it so a
+					// restart never orphans a running agent.
+					registry.Connect(c.Name, c.Directory, c.SessionID, c.TmuxTarget)
+					Emit("connected", c.ID, c.Name, "")
+					flushMailbox(&Contact{ID: c.ID, Name: c.Name, TmuxTarget: c.TmuxTarget})
+				case c.Status == "live" && alive:
+					pollReplies(c)
 				}
-				pollReplies(c)
 			}
 			time.Sleep(2 * time.Second)
 		}
@@ -241,11 +247,15 @@ var nonProjectChar = regexp.MustCompile(`[^A-Za-z0-9-]`)
 // sessions rooted at DIR (path components joined by hyphens).
 func projectDir(dir string) string {
 	home, _ := os.UserHomeDir()
-	abs, err := filepath.Abs(dir)
+	// Claude Code encodes the *resolved* path, so resolve symlinks (e.g. the
+	// macOS /tmp -> /private/tmp link) to match where it actually writes.
+	resolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		abs = dir
+		if resolved, err = filepath.Abs(dir); err != nil {
+			resolved = dir
+		}
 	}
-	encoded := nonProjectChar.ReplaceAllString(abs, "-")
+	encoded := nonProjectChar.ReplaceAllString(resolved, "-")
 	return filepath.Join(home, ".claude", "projects", encoded)
 }
 
@@ -502,4 +512,22 @@ func tailscaleCLI() (string, error) {
 		return app, nil
 	}
 	return "", fmt.Errorf("tailscale CLI not found — install from https://tailscale.com/download")
+}
+
+// looksLikePrompt reports whether a captured pane is showing a Claude Code
+// permission dialog right now — the gate that keeps routine idle/waiting
+// notifications from raising a false attention card.
+func looksLikePrompt(pane string) bool {
+	if pane == "" {
+		return false
+	}
+	low := strings.ToLower(pane)
+	// The permission dialog always offers numbered choices and an Esc-cancel
+	// line; requiring both avoids matching ordinary numbered output.
+	hasChoices := strings.Contains(pane, "1.") && strings.Contains(pane, "2.")
+	hasProceed := strings.Contains(low, "do you want") ||
+		strings.Contains(low, "esc to cancel") ||
+		strings.Contains(low, "no, and tell") ||
+		strings.Contains(low, "yes, and")
+	return hasChoices && hasProceed
 }

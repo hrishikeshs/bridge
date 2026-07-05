@@ -298,7 +298,7 @@ func serveStatic(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePair redeems a pairing code and, on success, sets the device token as
-// an HttpOnly Secure SameSite=Strict cookie.
+// an HttpOnly Secure SameSite=Lax cookie.
 func handlePair(w http.ResponseWriter, r *http.Request, id string) {
 	data, ok := readBody(w, r)
 	if !ok {
@@ -324,7 +324,10 @@ func handlePair(w http.ResponseWriter, r *http.Request, id string) {
 		MaxAge:   31536000,
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
+		// Lax, not Strict: standalone iOS PWAs drop Strict cookies on
+		// EventSource/background requests, breaking the live event stream.
+		// The tailnet perimeter is the real CSRF defense, and no GET mutates.
+		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -655,16 +658,28 @@ func handleLocalEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "ignored": true})
 		return
 	}
-	if strings.Contains(strings.ToLower(req.Kind), "idle") {
-		registry.SetPrompt(c.ID, false)
-		Emit("attention-clear", c.ID, c.Name, "")
-	} else {
-		snapshot := capturePrompt(c)
-		if snapshot == "" {
-			snapshot = req.Message
-		}
+	// The Notification hook fires for both permission prompts and routine
+	// idle/waiting notifications. Don't trust the notification kind alone —
+	// gate the attention card on the terminal actually showing a permission
+	// dialog right now. An idle notification, or a screen with no prompt,
+	// clears any open prompt instead of raising a false card.
+	//
+	// The dialog may still be painting when the hook fires, so retry the
+	// capture briefly until it looks like a prompt rather than grabbing a
+	// stale frame.
+	snapshot := capturePrompt(c)
+	for i := 0; i < 5 && !looksLikePrompt(snapshot); i++ {
+		time.Sleep(150 * time.Millisecond)
+		snapshot = capturePrompt(c)
+	}
+	if looksLikePrompt(snapshot) {
 		registry.SetPrompt(c.ID, true)
 		Emit("attention", c.ID, c.Name, snapshot)
+	} else {
+		if c.PromptOpen {
+			registry.SetPrompt(c.ID, false)
+			Emit("attention-clear", c.ID, c.Name, "")
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
