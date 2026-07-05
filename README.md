@@ -67,8 +67,64 @@ bridge pair                              # one-time code for your phone
 Open the printed `https://…ts.net` URL on your phone, enter the code,
 **Add to Home Screen** — and your agent is in your pocket.
 
-Requires [tmux](https://github.com/tmux/tmux) and, for phone access,
-[Tailscale](https://tailscale.com) on both devices.
+## Requirements
+
+| Dependency | Why | Notes |
+|---|---|---|
+| **[tmux](https://github.com/tmux/tmux)** | **Required.** bridge rehomes each agent into a tmux window and delivers your messages with `tmux send-keys`. No tmux, no inbound. | `brew install tmux` · `apt install tmux`. The agent can install it itself. |
+| **[Tailscale](https://tailscale.com)** | Phone access. Publishes the daemon to your devices over WireGuard — the only road in. | On your machine **and** your phone (free for personal use). Omit it and bridge still works locally over `127.0.0.1`. |
+| **Claude Code** | The agent you're texting. bridge reads its session JSONL and drives it via `--resume`. | A running session in a git/project dir. |
+| **macOS or Linux** | POSIX + tmux. | Windows (ConPTY) is not yet supported. |
+
+Install bridge itself with `brew install hrishikeshs/tap/bridge` or
+`go install github.com/hrishikeshs/bridge@latest`.
+
+## Tailscale setup
+
+bridge is designed so **your messages never touch a third party** — the
+daemon binds `127.0.0.1` only, and [Tailscale](https://tailscale.com) is what
+carries your phone to it, over your own WireGuard tailnet. Nothing is ever
+exposed to the public internet (bridge uses `tailscale serve`, never Funnel).
+
+**Publish it:**
+
+```sh
+bridge expose        # wraps `tailscale serve` — prints your https://<host>.ts.net URL
+```
+
+That URL is reachable **only** from devices signed into your tailnet. Open it
+on your phone (which must have the Tailscale app, connected to the same
+tailnet) and pair.
+
+**Lock it to yourself.** `tailscale serve` injects the caller's tailnet
+identity as a request header; restrict the daemon to your own login in
+`~/.bridge/config.json`:
+
+```json
+{
+  "allowed_logins": ["you@example.com"],
+  "require_identity": true
+}
+```
+
+- `require_identity: true` (the default) rejects any request without a valid
+  tailnet identity header — so even another device on your tailnet can't reach
+  the API without also clearing the per-device pairing token.
+- `allowed_logins` narrows it further to specific accounts. Leave it empty to
+  accept any identity on your tailnet (still gated by pairing).
+
+**Running alongside another tailnet service** (e.g.
+[magnus-bridge](https://github.com/hrishikeshs/magnus-bridge) on `/`): give
+bridge its own HTTPS port instead of the root path —
+
+```sh
+tailscale serve --bg --https=8443 8378   # bridge daemon (8378) at :8443
+```
+
+then open `https://<host>.ts.net:8443` on your phone.
+
+Restart the machine and the daemon comes back, but `tailscale serve` config
+persists on its own — you only re-run `bridge expose` if you reset it.
 
 ## Commands
 
