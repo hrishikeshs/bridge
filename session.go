@@ -359,13 +359,18 @@ func runConnect(ctx *cliCtx) error {
 	if err := installHook(); err != nil {
 		fmt.Printf("(note: could not install the permission hook: %v)\n", err)
 	}
-	fmt.Printf(`I've moved into a managed terminal — same memory, now reachable from your phone.
+	fmt.Printf(`I've moved into a managed tmux session — same memory, now running
+headless. I'm not gone; I just don't live in a terminal window anymore.
 
-  • This session (the one you're reading) is now a retired copy. Quit it.
-  • bridge attach %s    keep a terminal on me
-  • bridge pair         put me on your phone
+Reach me however's closest — and both channels work at the same time:
 
-See you on the other side.
+  • bridge attach %-8s talk to me in a terminal
+      (Ctrl-b d to detach and leave me running; I keep going headless)
+  • bridge pair          text me from your phone
+
+Type at your desk, text from the couch — same me, same conversation.
+
+This window is now a retired copy — quit it whenever; I'm no longer in it.
 `, name)
 	return nil
 }
