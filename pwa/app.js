@@ -208,6 +208,23 @@ function setConnected(on) {
 
 /* Slim status banner under the header. Hidden when the bridge is reachable;
    distinguishes "phone has no network" from "phone online, Mac asleep". */
+function updateAttentionBanner() {
+  const el = $('attn-banner');
+  if (!el) return;
+  // the first unresolved attention that isn't the contact you're looking at
+  let target = null;
+  for (const [id, ev] of state.attentions) {
+    if (id !== state.selected) { target = { id, name: ev.name }; break; }
+  }
+  if (target) {
+    el.textContent = '🔔 ' + (target.name || 'an agent') + ' needs your approval →';
+    el.classList.remove('hidden');
+    el.onclick = () => selectContact(target.id);
+  } else {
+    el.classList.add('hidden');
+  }
+}
+
 function updateBanner() {
   const banner = $('conn-banner');
   if (state.connected) {
@@ -235,6 +252,7 @@ function hasUnread(contactId) {
 /* ---------- tabs ---------- */
 
 function renderTabs() {
+  updateAttentionBanner();
   const tabs = $('contact-tabs');
   tabs.innerHTML = '';
   tabs.appendChild(makeTab('all', 'All', null, null));
@@ -265,14 +283,18 @@ function makeTab(id, label, health, status) {
   } else if (id !== 'all' && hasUnread(id)) {
     el.appendChild(chip('unread', ''));
   }
-  el.onclick = () => {
-    state.selected = id;
-    if (id !== 'all') markSeen(id);
-    renderTabs();
-    renderFeed();
-    restoreDraft();
-  };
+  el.onclick = () => selectContact(id);
   return el;
+}
+
+// Select a contact's thread (from a tab tap, a deep-link, or the attention
+// banner) and refresh the view.
+function selectContact(id) {
+  state.selected = id;
+  if (id !== 'all') markSeen(id);
+  renderTabs();
+  renderFeed();
+  restoreDraft();
 }
 
 function chip(cls, text) {

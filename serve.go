@@ -685,7 +685,7 @@ func handleLocalEvent(w http.ResponseWriter, r *http.Request) {
 	if looksLikePrompt(snapshot) {
 		registry.SetPrompt(c.ID, true)
 		Emit("attention", c.ID, c.Name, snapshot)
-		notifyPush(c.Name+" needs you", firstPromptLine(snapshot), "attn-"+c.ID)
+		notifyPush(c.Name+" needs you", firstPromptLine(snapshot), "attn-"+c.ID, c.ID)
 	} else {
 		if c.PromptOpen {
 			registry.SetPrompt(c.ID, false)
@@ -723,7 +723,7 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 	if req.To == "" {
 		audit("agent-send", senderName+": "+req.Text, "local")
 		Emit("reply", senderID, senderName, req.Text)
-		notifyPush(senderName, req.Text, "msg-"+senderID)
+		notifyPush(senderName, req.Text, "msg-"+senderID, senderID)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}

@@ -419,3 +419,19 @@ footer { border-top: 1px solid var(--border); }
   border: none;
   border-radius: 12px;
 }
+
+
+/* attention banner: jumps you to an agent that needs approval */
+#attn-banner {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 8px 12px 0;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+  color: var(--bg);
+  background: var(--warn);
+  border: none;
+  border-radius: 12px;
+}

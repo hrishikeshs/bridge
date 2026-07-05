@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE = 'bridge-v5';
+const CACHE = 'bridge-v6';
 const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest',
                '/icons/icon-192.png', '/icons/icon-512.png'];
 
@@ -44,15 +44,22 @@ self.addEventListener('push', (e) => {
     tag: d.tag || undefined,
     icon: '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
-    data: { url: '/' },
+    data: { contact: d.contact || '' },   // deep-link target on tap
   }));
 });
 
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
+  const contact = (e.notification.data && e.notification.data.contact) || '';
+  const url = contact ? '/?contact=' + encodeURIComponent(contact) : '/';
   e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true })
     .then((wins) => {
-      for (const w of wins) if ('focus' in w) return w.focus();
-      return clients.openWindow((e.notification.data && e.notification.data.url) || '/');
+      for (const w of wins) {
+        if ('focus' in w) {
+          if (contact) w.postMessage({ type: 'open-contact', contact });
+          return w.focus();
+        }
+      }
+      return clients.openWindow(url);
     }));
 });

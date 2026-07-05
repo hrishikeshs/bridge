@@ -87,9 +87,10 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 
 // pushPayload is the notification shape the service worker renders.
 type pushPayload struct {
-	Title string `json:"title"`
-	Body  string `json:"body"`
-	Tag   string `json:"tag,omitempty"`
+	Title   string `json:"title"`
+	Body    string `json:"body"`
+	Tag     string `json:"tag,omitempty"`
+	Contact string `json:"contact,omitempty"` // deep-link target on tap
 }
 
 // sendPush delivers one notification to every subscribed device. Dead
@@ -148,7 +149,7 @@ var (
 // notifyPush fires a phone notification for a high-signal event, off the
 // request path (async) and debounced per tag so a burst can't spam the lock
 // screen. This is the async loop: an agent reaches you when it needs you.
-func notifyPush(title, body, tag string) {
+func notifyPush(title, body, tag, contact string) {
 	pushLastMu.Lock()
 	now := nowUnix()
 	if tag != "" && now-pushLast[tag] < 3 {
@@ -159,7 +160,7 @@ func notifyPush(title, body, tag string) {
 		pushLast[tag] = now
 	}
 	pushLastMu.Unlock()
-	go sendPush(pushPayload{Title: title, Body: truncateRunes(body, 160), Tag: tag})
+	go sendPush(pushPayload{Title: title, Body: truncateRunes(body, 160), Tag: tag, Contact: contact})
 }
 
 func truncateRunes(s string, n int) string {
