@@ -127,7 +127,7 @@ func hookCmd() *cobra.Command {
 func pairCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "pair",
-		Short: "Print a one-time pairing code for your phone (valid 2 minutes)",
+		Short: "Print a one-time pairing code for your phone (valid 10 minutes)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var resp struct {
 				Code string `json:"code"`
@@ -135,7 +135,7 @@ func pairCmd() *cobra.Command {
 			if err := daemonRequest(http.MethodPost, "/local/pair", nil, &resp); err != nil {
 				return err
 			}
-			fmt.Printf("Pairing code: %s  (valid 2 minutes)\n", resp.Code)
+			fmt.Printf("Pairing code: %s  (valid 10 minutes)\n", resp.Code)
 			return nil
 		},
 	}

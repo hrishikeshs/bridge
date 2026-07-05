@@ -201,8 +201,6 @@ func route(w http.ResponseWriter, r *http.Request) {
 		handlePushKey(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/push/subscribe":
 		handlePushSubscribe(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/api/push/debug":
-		handlePushDebug(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not-found"})
 	}
@@ -687,6 +685,7 @@ func handleLocalEvent(w http.ResponseWriter, r *http.Request) {
 	if looksLikePrompt(snapshot) {
 		registry.SetPrompt(c.ID, true)
 		Emit("attention", c.ID, c.Name, snapshot)
+		notifyPush(c.Name+" needs you", firstPromptLine(snapshot), "attn-"+c.ID)
 	} else {
 		if c.PromptOpen {
 			registry.SetPrompt(c.ID, false)
@@ -724,6 +723,7 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 	if req.To == "" {
 		audit("agent-send", senderName+": "+req.Text, "local")
 		Emit("reply", senderID, senderName, req.Text)
+		notifyPush(senderName, req.Text, "msg-"+senderID)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}

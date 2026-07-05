@@ -536,3 +536,42 @@ func looksLikePrompt(pane string) bool {
 		strings.Contains(low, "yes, and")
 	return hasChoices && hasProceed
 }
+
+// timeNowUnix returns the current unix time in seconds.
+func timeNowUnix() int64 { return time.Now().Unix() }
+
+// firstPromptLine pulls the most informative line out of a permission-dialog
+// capture for a push body: the tool call (Bash(...)), the "don't ask again
+// for: X" command family, or the command line just above the approval ask.
+func firstPromptLine(pane string) string {
+	lines := strings.Split(pane, "\n")
+	// 1. a tool invocation like Bash(git push) / Write(file.go)
+	for _, ln := range lines {
+		t := strings.TrimSpace(strings.TrimLeft(ln, "⏺ "))
+		if toolCallRe.MatchString(t) {
+			return t
+		}
+	}
+	// 2. the "don't ask again for: <cmd>" hint names the command family
+	for _, ln := range lines {
+		if i := strings.Index(strings.ToLower(ln), "don't ask again for:"); i >= 0 {
+			if cmd := strings.TrimSpace(ln[i+len("don't ask again for:"):]); cmd != "" {
+				return strings.TrimSuffix(cmd, " *")
+			}
+		}
+	}
+	// 3. the first meaningful line above the approval ask is the command
+	for i, ln := range lines {
+		low := strings.ToLower(ln)
+		if strings.Contains(low, "requires approval") || strings.Contains(low, "do you want to proceed") {
+			for j := i - 1; j >= 0; j-- {
+				if t := strings.TrimSpace(lines[j]); t != "" {
+					return t
+				}
+			}
+		}
+	}
+	return "wants your approval — tap to review"
+}
+
+var toolCallRe = regexp.MustCompile(`^[A-Z][A-Za-z]*\(.+\)`)

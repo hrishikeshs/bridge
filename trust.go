@@ -15,7 +15,7 @@ import (
 )
 
 // pairingTTL is how long a printed pairing code stays redeemable.
-const pairingTTL = 2 * time.Minute
+const pairingTTL = 10 * time.Minute
 
 // bridgeDir returns the ~/.bridge configuration directory.
 func bridgeDir() string {
@@ -149,7 +149,7 @@ var (
 	pairingExp  time.Time
 )
 
-// issuePairingCode mints a single-use, six-digit code valid for two minutes.
+// issuePairingCode mints a single-use, six-digit code valid for ten minutes.
 // It is returned only to the on-machine caller (bridge pair); the code is the
 // second factor precisely because it is displayed nowhere the network reaches.
 func issuePairingCode() string {

@@ -776,13 +776,6 @@ async function approve(agent, key) {
 
 /* ---------- notifications (best-effort; no-op where unsupported) ---------- */
 
-function pushDebug(msg) {
-  fetch('/api/push/debug', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ msg: String(msg), perm: (window.Notification && Notification.permission) }),
-  }).catch(() => {});
-}
-
 // Show the enable-notifications button whenever push is supported but not yet
 // granted+subscribed. iOS requires the permission prompt to come from a tap.
 function updatePushButton() {
@@ -795,7 +788,6 @@ function updatePushButton() {
 }
 
 $('enable-push').addEventListener('click', async () => {
-  pushDebug('enable-push tapped');
   await requestNotifyPermission();
   updatePushButton();
 });
@@ -812,32 +804,26 @@ async function requestNotifyPermission() {
    closed. Idempotent — safe to call on every load once permission is granted. */
 async function enablePush() {
   try {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      pushDebug('unsupported'); return;
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) { return;
     }
     if (Notification.permission !== 'granted') { pushDebug('not granted'); return; }
     const reg = await navigator.serviceWorker.ready;
-    pushDebug('sw ready');
     let sub = await reg.pushManager.getSubscription();
     if (!sub) {
       const res = await fetch('/api/push/key');
       if (!res.ok) { pushDebug('key fetch failed ' + res.status); return; }
       const { key } = await res.json();
-      pushDebug('got key, subscribing');
       sub = await reg.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: urlB64ToUint8Array(key),
       });
-      pushDebug('subscribed ok');
     } else {
-      pushDebug('already had subscription');
     }
     const r = await fetch('/api/push/subscribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(sub),
     });
-    pushDebug('posted subscription ' + r.status);
   } catch (e) { pushDebug('ERROR ' + (e && e.message ? e.message : e)); }
 }
 

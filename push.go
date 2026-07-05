@@ -7,10 +7,10 @@ package main
 
 import (
 	"encoding/json"
-	"os"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
@@ -140,12 +140,34 @@ func sendPush(p pushPayload) (int, error) {
 	return sent, nil
 }
 
-// handlePushDebug records a client-side breadcrumb to the audit log so we can
-// see where subscription fails on a device we can't open a console on.
-func handlePushDebug(w http.ResponseWriter, r *http.Request) {
-	data, _ := readBody(w, r)
-	audit("push-debug", string(data), "-")
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+var (
+	pushLast   = map[string]int64{} // tag -> last-sent unix seconds (debounce)
+	pushLastMu sync.Mutex
+)
+
+// notifyPush fires a phone notification for a high-signal event, off the
+// request path (async) and debounced per tag so a burst can't spam the lock
+// screen. This is the async loop: an agent reaches you when it needs you.
+func notifyPush(title, body, tag string) {
+	pushLastMu.Lock()
+	now := nowUnix()
+	if tag != "" && now-pushLast[tag] < 3 {
+		pushLastMu.Unlock()
+		return
+	}
+	if tag != "" {
+		pushLast[tag] = now
+	}
+	pushLastMu.Unlock()
+	go sendPush(pushPayload{Title: title, Body: truncateRunes(body, 160), Tag: tag})
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // handlePushTest fires a test notification to all subscribed devices.
@@ -161,3 +183,6 @@ func handlePushTest(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"sent": n})
 }
+
+// nowUnix is the current time in whole seconds (for push debounce).
+func nowUnix() int64 { return timeNowUnix() }
