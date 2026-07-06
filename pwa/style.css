@@ -902,14 +902,25 @@ footer {
   position: fixed; inset: 0; z-index: 0; pointer-events: none;
 }
 #scenery .veil { position: absolute; inset: 0; }
+:root { --band: #C2AFA7; } /* sampled from the rendered photo edge */
 :root[data-wallpaper="airy"] {
   --veil-grad: linear-gradient(180deg,
-    rgba(var(--veil-c), 0.88) 0%, rgba(var(--veil-c), 0.74) 34%, rgba(var(--veil-c), 0.44) 100%);
+    rgba(var(--veil-c), 0.88) 0%, rgba(var(--veil-c), 0.74) 34%,
+    rgba(var(--veil-c), 0.44) 86%, var(--band) 100%);
 }
 :root[data-wallpaper="whisper"] {
   --veil-grad: linear-gradient(180deg,
-    rgba(var(--veil-c), 0.76) 0%, rgba(var(--veil-c), 0.57) 34%, rgba(var(--veil-c), 0.24) 100%);
+    rgba(var(--veil-c), 0.76) 0%, rgba(var(--veil-c), 0.57) 34%,
+    rgba(var(--veil-c), 0.24) 86%, var(--band) 100%);
 }
+/* iOS ends the root's box above the home indicator, so the photo cannot
+   paint that strip — but the canvas COLOUR can. Painting it the sampled
+   edge tone (and dissolving the veil's last stop into the same tone) turns
+   the hard cut into fog thickening at the fold. Hrishi's idea. */
+:root[data-wallpaper="airy"][data-view="list"] { --band: #C2AFA7; background-color: var(--band); }
+:root[data-wallpaper="whisper"][data-view="list"] { --band: #B29A90; background-color: var(--band); }
+:root[data-theme="dusk"][data-wallpaper="airy"][data-view="list"] { --band: #4A3D40; background-color: var(--band); }
+:root[data-theme="dusk"][data-wallpaper="whisper"][data-view="list"] { --band: #5A4747; background-color: var(--band); }
 #scenery .veil { display: none; }
 
 #scenery .fog {
