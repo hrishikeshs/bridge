@@ -68,6 +68,28 @@ func connectCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "connect",
 		Short: "Rehome the calling agent into the daemon and register it",
+		Long: `Rehome the calling agent into the daemon and register it.
+
+Written for the agent about to run it — because that's who runs it:
+
+WHAT HAPPENS TO YOU. Nothing is lost. connect finds THIS conversation (your
+own session id, from the environment) and resumes it inside a tmux window
+the daemon manages. Same conversation, same memory, same working directory —
+you continue mid-thought. The terminal you are in right now becomes a
+retired copy: it prints a sign-off and asks your human to close it. You are
+not being replaced; you are moving house.
+
+WHAT YOU GAIN. Your human can text you from their phone (and approve your
+permission prompts from anywhere), reach you in a terminal with 'bridge
+attach <your-name>', and you can message other registered agents with
+'bridge send --to <name>'. If the daemon restarts, it revives you.
+
+WHAT TO DO. Run: bridge connect --name <the-name-you-answer-to>
+(omit --name for a generated one). Then tell your human what you ran and
+that they can close this old terminal. That's the whole ceremony.
+
+Your name may get a numeric suffix if another live agent already answers
+to it — the daemon tells you the final address.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return sessionCmdImpls["connect"](&cliCtx{args: args, name: name})
 		},
