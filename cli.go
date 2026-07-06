@@ -25,6 +25,7 @@ func init() {
 		"connect": runConnect,
 		"attach":  runAttach,
 		"send":    runSend,
+		"status":  runStatus,
 		"hook":    runHook,
 		"expose":  runExpose,
 	}
@@ -32,9 +33,10 @@ func init() {
 
 // cliCtx carries parsed flags/args to a session CLI verb.
 type cliCtx struct {
-	args []string
-	name string // --name (connect)
-	to   string // --to (send)
+	args  []string
+	name  string // --name (connect)
+	to    string // --to (send)
+	clear bool   // --clear (status)
 }
 
 // nameConnectRe validates a user-supplied --name: it must start with a letter
@@ -274,7 +276,8 @@ func runSend(ctx *cliCtx) error {
 		body["to"] = ctx.to
 	}
 	var resp struct {
-		Queued bool `json:"queued"`
+		Queued   bool   `json:"queued"`
+		UserAway string `json:"user_away"`
 	}
 	if err := daemonRequest("POST", "/local/send", body, &resp); err != nil {
 		return err
@@ -282,7 +285,71 @@ func runSend(ctx *cliCtx) error {
 	if resp.Queued {
 		fmt.Printf("queued — %s is offline right now; the daemon delivers it when they're back\n", ctx.to)
 	}
+	// AIM auto-responder: a send to the phone (no --to) may come back carrying
+	// the human's away line. Surface it as a single line the moment this agent
+	// reached out, so it reads like a status message in its own transcript.
+	// stripControl scrubs it (delivery.go): my-status is printed straight into
+	// a terminal, so control bytes must never survive to drive the TUI.
+	if resp.UserAway != "" {
+		fmt.Printf("away message from Hrishi: %s\n", strings.TrimSpace(stripControl(resp.UserAway)))
+	}
 	return nil
+}
+
+// runStatus sets, clears, or prints the calling agent's away/status line — the
+// AIM status the phone shows beside its name. The agent identifies ITSELF via
+// BRIDGE_CONTACT, exactly like runSend (an arbitrary contact string would be an
+// identity-forgery vector the daemon rejects, H9). `bridge status <text>` sets
+// it, `--clear` (or an empty text) clears it, and a bare `bridge status` prints
+// the current one.
+func runStatus(ctx *cliCtx) error {
+	from := os.Getenv("BRIDGE_CONTACT")
+	if from == "" {
+		return fmt.Errorf("bridge status must run inside a bridge-managed session")
+	}
+	// Bare `bridge status`: report the current line rather than clobbering it.
+	if !ctx.clear && len(ctx.args) == 0 {
+		if away := currentAway(from); away != "" {
+			fmt.Printf("status: %s\n", away)
+		} else {
+			fmt.Println("no status set — `bridge status <text>` to set one")
+		}
+		return nil
+	}
+	text := ""
+	if !ctx.clear {
+		text = strings.Join(ctx.args, " ")
+	}
+	if err := daemonRequest("POST", "/local/status", map[string]string{"contact": from, "text": text}, nil); err != nil {
+		return err
+	}
+	if strings.TrimSpace(text) == "" {
+		fmt.Println("status cleared")
+	} else {
+		fmt.Printf("status set: %s\n", text)
+	}
+	return nil
+}
+
+// currentAway fetches this agent's away line from the daemon roster, matching on
+// the immutable contact id (BRIDGE_CONTACT). Empty when unset, unknown, or the
+// daemon is unreachable — a bare read never errors out the caller.
+func currentAway(id string) string {
+	var resp struct {
+		Contacts []struct {
+			ID   string `json:"id"`
+			Away string `json:"away"`
+		} `json:"contacts"`
+	}
+	if err := daemonRequest("GET", "/local/contacts", nil, &resp); err != nil {
+		return ""
+	}
+	for _, c := range resp.Contacts {
+		if c.ID == id {
+			return c.Away
+		}
+	}
+	return ""
 }
 
 // runHook is the Claude Code Notification-hook shim: it reads the hook JSON on

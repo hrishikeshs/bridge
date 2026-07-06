@@ -50,6 +50,8 @@ func handleLocal(w http.ResponseWriter, r *http.Request) {
 		handleLocalEvent(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/local/send":
 		handleLocalSend(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/local/status":
+		handleLocalStatus(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/local/contacts":
 		cs := registry.Roster()
 		if cs == nil {
@@ -274,7 +276,16 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 		Emit("reply", senderID, senderName, req.Text)
 		notifyPush(senderName, req.Text, "msg-"+senderID, senderID)
 		dispatchPluginEvent("reply.out", registry.Resolve(senderID), map[string]any{"text": req.Text})
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		// AIM auto-responder: the instant an agent reaches out to the phone,
+		// hand back the human's away line (if any) so it lands in the agent's
+		// own transcript at that moment — runSend prints it as "away message
+		// from Hrishi: …". The phone byline is unchanged; only this response
+		// carries it, so nothing new becomes a thread bubble.
+		resp := map[string]any{"ok": true}
+		if away := myStatus(); away != "" {
+			resp["user_away"] = away
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
@@ -303,5 +314,67 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 	audit("switchboard", senderName+" -> "+target.Name+": "+req.Text, "local")
 	Emit("peer", target.ID, senderName, req.Text)
 	holdInbound(target, MailMessage{From: senderName, Via: "bridge", Text: req.Text, TS: nowUTC(), Emitted: true})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// awayMaxRunes caps a status line so a long message can't bloat the roster file
+// or overrun the phone's single-line row. Runes, not bytes, so multibyte text
+// is never cut mid-character.
+const awayMaxRunes = 120
+
+// clampAway flattens a status line to one bounded row: newline/CR/tab collapse
+// to a single space (it renders on one line beside the agent's name) and it is
+// truncated — never rejected — to awayMaxRunes. It does NOT drop other control
+// runes: a status is phone-display-only (no terminal path), and the ONE place a
+// status becomes terminal text — the human's my-status printed by runSend — is
+// scrubbed with stripControl at that print site (delivery.go).
+func clampAway(text string) string {
+	flat := strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		}
+		return r
+	}, text)
+	flat = strings.TrimSpace(flat)
+	if runes := []rune(flat); len(runes) > awayMaxRunes {
+		flat = strings.TrimSpace(string(runes[:awayMaxRunes]))
+	}
+	return flat
+}
+
+// handleLocalStatus sets (or clears, on empty text) the calling agent's away
+// line — the AIM status the phone shows beside its name. Like handleLocalSend
+// the "contact" field is the SENDER's OWN identity and MUST resolve to a
+// registered contact: it becomes the id SetAway writes and the byline the phone
+// renders, so an arbitrary string here is the same identity-forgery vector H9
+// closes for sends. An empty text is a clear, not an error.
+func handleLocalStatus(w http.ResponseWriter, r *http.Request) {
+	data, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Contact string `json:"contact"` // the calling agent (from BRIDGE_CONTACT)
+		Text    string `json:"text"`
+	}
+	_ = json.Unmarshal(data, &req)
+
+	s := registry.Resolve(req.Contact)
+	if s == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown sender"})
+		return
+	}
+	text := clampAway(req.Text)
+	registry.SetAway(s.ID, text)
+	if text == "" {
+		audit("status-clear", s.Name, "local")
+	} else {
+		audit("status", s.Name+": "+text, "local")
+	}
+	// One event carries both set and clear (empty text): the phone folds it into
+	// the contact's row and thread header live, never a thread bubble (app.js
+	// ingest treats it like a transient roster update).
+	Emit("status", s.ID, s.Name, text)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

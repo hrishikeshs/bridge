@@ -102,6 +102,7 @@ const state = {
   attentions: new Map(), // contact id -> latest unresolved attention event
   view: 'list',          // 'list' (conversation list) | 'thread' (one contact)
   selected: null,        // contact id of the open thread, or null on the list
+  myStatus: '',          // the human's away line, delivered to agents on reach-out
   lastEventId: 0,
   lastSeen: JSON.parse(localStorage.getItem('lastSeen') || '{}'),
   source: null,          // EventSource
@@ -141,6 +142,7 @@ async function init() {
   if (res.status === 401) return showPairing();
   const data = await res.json();
   state.contacts = data.contacts || [];
+  state.myStatus = data.my_status || '';
   noteServerClocks(data);
   setConnected(true);
   showApp();
@@ -260,6 +262,7 @@ async function refreshStatus() {
   const data = await res.json();
   const wasOffline = new Map(state.contacts.map((c) => [c.id, c.status === 'offline']));
   state.contacts = data.contacts || [];
+  state.myStatus = data.my_status || '';
   noteServerClocks(data);
   setConnected(true);
   // A contact that just came back to life can receive its queued messages.
@@ -361,6 +364,21 @@ function scheduleReconnect() {
 function ingest(event) {
   if (event.id <= state.lastEventId) return false;
   state.lastEventId = event.id;
+  // Away statuses are roster state, not thread messages: fold a 'status' into
+  // its contact and a 'mystatus' into state.myStatus, then stop before the feed.
+  // They are durable (Emit, so a reconnect's history replay reaches here too),
+  // but must render like a transient roster update — never a bubble (as 'typing'
+  // does in connectEvents). The live onmessage path re-renders the list and
+  // thread header right after ingest, so this alone keeps the phone in sync.
+  if (event.type === 'status') {
+    const c = state.contacts.find((x) => x.id === event.agent);
+    if (c) c.away = event.text;
+    return false;
+  }
+  if (event.type === 'mystatus') {
+    state.myStatus = event.text;
+    return false;
+  }
   state.events.push(event);
   if (event.type === 'attention') {
     state.attentions.set(event.agent, event);
@@ -594,10 +612,40 @@ $('notif-row').addEventListener('click', async () => {
   renderNotifState();
 });
 
+// My status: the human's away line. 'change' fires on blur/Enter for a text
+// input, so an edit saves when you leave the field; Enter blurs to commit it.
+// The ✕ clears. Both POST /api/mystatus {text}; the daemon echoes a live
+// 'mystatus' event so every open phone (and the next agent to reach out) syncs.
+$('mystatus-input').addEventListener('change', (e) => saveMyStatus(e.target.value));
+$('mystatus-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+});
+// preventDefault on mousedown keeps the input focused when ✕ is tapped, so its
+// blur doesn't fire a spurious 'change' (old value) that races the clear's POST.
+$('mystatus-clear').addEventListener('mousedown', (e) => e.preventDefault());
+$('mystatus-clear').addEventListener('click', () => { $('mystatus-input').value = ''; saveMyStatus(''); });
+
+async function saveMyStatus(text) {
+  // Mirror the daemon's clampAway: one line, capped — so the input and the
+  // stored value never disagree (the daemon clamps again authoritatively).
+  text = (text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120);
+  state.myStatus = text;
+  $('mystatus-input').value = text;
+  renderMyStatus();
+  try {
+    await fetch('/api/mystatus', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+  } catch (e) { /* offline — the daemon keeps its last value; a later edit retries */ }
+}
+
 function openSettings() {
   renderThemeOptions();
   renderWallpaperOptions();
   renderNotifState();
+  $('mystatus-input').value = state.myStatus || '';
   $('settings-sheet').classList.remove('hidden');
 }
 
@@ -692,7 +740,21 @@ function listSort(a, b) {
   return (a.name || '').localeCompare(b.name || '');
 }
 
+// The subtle "You: <status>" line under the list header — your own away line,
+// shown only when set. It mirrors exactly what an agent hears the moment it
+// messages you (the daemon's AIM auto-responder). Rendered from renderList (the
+// single hook every roster/status change already flows through) so it stays in
+// sync without scattering calls.
+function renderMyStatus() {
+  const el = $('my-status');
+  if (!el) return;
+  const t = state.myStatus || '';
+  el.textContent = t ? 'You: ' + t : '';
+  el.classList.toggle('hidden', !t);
+}
+
 function renderList() {
+  renderMyStatus();
   const list = $('contact-list');
   const empty = $('list-empty');
   if (!state.contacts.length) {
@@ -793,11 +855,15 @@ function avatarColor(name) {
 }
 
 // The one-line row preview. Precedence per the charter: live typing → open
-// prompt → newest message → the contact's directory / a placeholder.
+// prompt → away status (only when nothing is unread) → newest message → the
+// contact's directory / a placeholder. The away line stands in for an already-
+// read history, but a fresh reply must never hide behind a stale status — so
+// unread previews win (spec).
 function previewFor(contact) {
   const id = contact.id;
   if ((state.typing.get(id) || 0) > Date.now()) return { text: 'typing…', cls: 'typing' };
   if (contact.health === 'prompt') return { text: '🔔 needs your approval', cls: 'alert' };
+  if (contact.away && unreadCount(id) === 0) return { text: '💬 ' + contact.away, cls: 'away' };
   const item = newestMessage(id);
   if (!item) return { text: contact.directory || 'no messages yet', cls: 'muted' };
   const out = item.type === 'sent' || item.mstate !== undefined;   // event vs outbox echo
@@ -863,9 +929,16 @@ function updateThreadHeader() {
 
 function threadStatusText(contact) {
   if (!contact) return '';
-  if (contact.status === 'offline') return 'offline';
-  const h = HEALTH_LABELS[contact.health];
-  return 'live' + (h ? ' · ' + h : '');
+  let s = 'live';
+  if (contact.status === 'offline') {
+    s = 'offline';
+  } else {
+    const h = HEALTH_LABELS[contact.health];
+    if (h) s += ' · ' + h;
+  }
+  // The away line rides under the name, after presence/health.
+  if (contact.away) s += ' · 💬 ' + contact.away;
+  return s;
 }
 
 // Total unread across contacts → app-icon badge (where supported) + a

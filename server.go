@@ -98,7 +98,8 @@ func runServe(port int) error {
 	loadTokens()
 	loadRegistry()
 	loadHistory()
-	loadTails() // restore per-contact tail offsets so a restart resumes, not skips (4b)
+	loadMyStatus() // restore the human's away line (the AIM auto-responder text)
+	loadTails()    // restore per-contact tail offsets so a restart resumes, not skips (4b)
 
 	daemonStartUnix = timeNowUnix() // exposed on /api/status; anchors the wake watchdog
 
@@ -191,6 +192,8 @@ func route(w http.ResponseWriter, r *http.Request) {
 		handleEvents(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/status":
 		handleStatus(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/mystatus":
+		handleMyStatus(w, r, id)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/history":
 		handleHistory(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/send":

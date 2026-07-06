@@ -97,14 +97,15 @@ func releaseClientID(id string, ok bool) {
 	}
 }
 
-// formatInbound builds the prefix a delivered message wears in the agent's
-// terminal, collapsing whitespace so it lands as a single send-keys line and
-// stripping control bytes. newline/CR/tab become a single space; every other
-// non-printable rune (ESC, arrow/cursor sequences, other C0/C1 controls, format
-// characters) is dropped so a peer message can't drive the recipient agent's TUI
-// (L4). Printable characters, including non-ASCII graphics, pass through.
-func formatInbound(from, via, text string) string {
-	flat := strings.Map(func(r rune) rune {
+// stripControl flattens text to a single terminal-safe line: newline/CR/tab
+// become one space, and every other non-printable rune (ESC, arrow/cursor
+// sequences, other C0/C1 controls, format characters) is dropped so untrusted
+// text can't drive a TUI when it reaches a pane — or an agent's stdout (L4).
+// Printable characters, including non-ASCII graphics, pass through. Shared by
+// formatInbound (peer/phone mail) and runSend (the human's my-status echoed
+// into an agent's transcript).
+func stripControl(text string) string {
+	return strings.Map(func(r rune) rune {
 		switch r {
 		case '\n', '\r', '\t':
 			return ' '
@@ -114,7 +115,13 @@ func formatInbound(from, via, text string) string {
 		}
 		return r
 	}, text)
-	return fmt.Sprintf("[From %s (%s)]: %s", from, via, strings.TrimSpace(flat))
+}
+
+// formatInbound builds the prefix a delivered message wears in the agent's
+// terminal, collapsing whitespace so it lands as a single send-keys line and
+// stripping control bytes (stripControl, L4).
+func formatInbound(from, via, text string) string {
+	return fmt.Sprintf("[From %s (%s)]: %s", from, via, strings.TrimSpace(stripControl(text)))
 }
 
 // neutralizeFrame rewrites the daemon's framing alphabet out of a message

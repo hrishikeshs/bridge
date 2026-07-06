@@ -49,6 +49,9 @@
         <span id="conn-dot" class="dot" title="connection"></span>
         <button id="settings-btn" title="settings">⚙</button>
       </header>
+      <!-- Your own away line ("You: …"), echoed to any agent that reaches out.
+           Subtle, and hidden entirely when unset. -->
+      <div id="my-status" class="my-status hidden"></div>
       <div id="contact-list"></div>
       <div id="list-empty" class="hidden">
         <p class="empty-title">No conversations yet</p>
@@ -97,6 +100,13 @@
         <div class="sheet-header">
           <span class="sheet-title">Settings</span>
           <button id="settings-close">Done</button>
+        </div>
+        <div class="sheet-label">My status</div>
+        <div class="mystatus-edit">
+          <input id="mystatus-input" type="text" maxlength="120"
+                 placeholder="Away? Tell your agents…"
+                 autocomplete="off" enterkeyhint="done">
+          <button id="mystatus-clear" title="clear status">✕</button>
         </div>
         <div class="sheet-label">Theme</div>
         <div id="theme-options"></div>

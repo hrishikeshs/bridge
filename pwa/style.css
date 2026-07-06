@@ -257,6 +257,18 @@ header {
 
 /* ---- conversation list ---- */
 
+/* Your own away line, a subtle italic strip under the header (floats on the
+   scenery like the wordmark; hidden entirely when unset). */
+.my-status {
+  padding: 4px 16px 8px;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 #contact-list {
   flex: 1;
   min-height: 0;
@@ -348,6 +360,7 @@ header {
 }
 .row-preview.typing { font-style: italic; }
 .row-preview.alert { color: var(--attn); font-weight: 600; }
+.row-preview.away { font-style: italic; }   /* an away status stands in for the last line */
 .row-badge {
   flex: none;
   min-width: 20px;
@@ -879,6 +892,34 @@ footer {
 .sheet-row:disabled { opacity: 0.55; }
 .sheet-row:active { background: var(--hairline); }
 
+/* My-status editor: a text input plus a clear (✕) button. */
+.mystatus-edit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px;
+}
+#mystatus-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  font-size: 15px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+}
+#mystatus-clear {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  font-size: 15px;
+  color: var(--dim);
+  background: none;
+  border: none;
+}
+#mystatus-clear:active { color: var(--ink); }
+
 /* ---- motion (opt-in) ---- */
 
 @media (prefers-reduced-motion: no-preference) {
@@ -970,7 +1011,8 @@ footer {
    rows. Threads deliberately have NO wallpaper — words beat weather. The navy
    header bars of international-orange stay opaque — brand, not ground. */
 #list-view { position: relative; }
-#list-view > header, #list-view > #contact-list, #list-view > #list-empty { position: relative; }
+#list-view > header, #list-view > #my-status,
+#list-view > #contact-list, #list-view > #list-empty { position: relative; }
 :root[data-wallpaper="airy"] .row, :root[data-wallpaper="whisper"] .row { background: var(--glass); }
 :root[data-wallpaper="airy"]:not([data-theme="international-orange"]) .list-header,
 :root[data-wallpaper="whisper"]:not([data-theme="international-orange"]) .list-header { background: transparent; }

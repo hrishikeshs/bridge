@@ -24,6 +24,12 @@ type Contact struct {
 	PromptOpen  bool   `json:"prompt_open"`  // a permission prompt is hook-attested open
 	PromptSince int64  `json:"prompt_since"` // unix seconds the current prompt opened; 0 when none (drives frozen-agent escalation)
 
+	// Away is the agent's self-set AIM-style status line ("brb, compiling"),
+	// set by `bridge status` and shown beside its name on the phone. Empty when
+	// none. It is durable, agent-authored metadata — unlike Health (a live
+	// runtime signal), it survives an offline blip until the agent clears it.
+	Away string `json:"away,omitempty"`
+
 	// Fields are plugin-set key/value annotations (docs/plugins.md set-field):
 	// expertise tags, last-memory-save stamps, whatever a plugin wants to pin
 	// on a contact. Capped at maxContactFields; surfaced in /api/status.
@@ -479,6 +485,21 @@ func (r *Registry) SetHealth(id, health string) {
 			// the agent.idle plugins hear about (docs/plugins.md).
 			dispatchPluginEvent("agent.idle", c, nil)
 		}
+	}
+}
+
+// SetAway records (or clears, on "") a contact's away/status line. It follows
+// SetHealth's shape but is deliberately NOT gated on live: an away message is
+// durable, agent-authored metadata (like SetField), not a live runtime signal,
+// so an agent that set "brb" keeps it across a brief offline blip until it
+// clears it. The caller has already flattened and capped the text
+// (handleLocalStatus) — this only persists it.
+func (r *Registry) SetAway(id, text string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if c, ok := r.contacts[id]; ok {
+		c.Away = text
+		r.save()
 	}
 }
 

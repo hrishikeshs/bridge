@@ -324,6 +324,25 @@ body_has "switchboard offline recipient queued -> queued:true" '"queued":true' "
 HOOK_RESP=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d '{"session_id":"00000000-0000-4000-8000-00000000d00d","message":"x","kind":"notification"}' $BASE/local/event)
 body_has "unclaimed hook event parked (H8)" '"parked":true' "$HOOK_RESP"
 
+# --- away messages (AIM statuses, both directions) ------------------------
+# Direction 1 — an agent sets its away line via /local/status. The "contact"
+# field is the SENDER's own identity (like /local/send), so an unregistered
+# sender is the same H9 forgery vector and must be refused; a registered one's
+# status is stored and surfaced on /api/status as the contact's "away".
+STATUS_UNKNOWN_BODY='{"contact":"nobody-here","text":"brb"}'
+STATUS_SET_BODY="{\"contact\":\"$CNAME\",\"text\":\"in a meeting\"}"
+check "away status unknown sender -> 400"   400 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$STATUS_UNKNOWN_BODY" $BASE/local/status)"
+check "away status set -> 200"              200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$STATUS_SET_BODY" $BASE/local/status)"
+STATUS_BODY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/status)
+body_has "away surfaced on /api/status"     '"away":"in a meeting"' "$STATUS_BODY"
+# Direction 2 — the human sets "My status" (device-token authed). It surfaces on
+# /api/status as a top-level my_status and is the auto-responder delivered to an
+# agent the moment it reaches out.
+MYSTATUS_BODY='{"text":"on the couch"}'
+check "my-status set -> 200"                200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$MYSTATUS_BODY" $BASE/api/mystatus)"
+STATUS_BODY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/status)
+body_has "my_status surfaced on /api/status" '"my_status":"on the couch"' "$STATUS_BODY"
+
 # --- web push -------------------------------------------------------------
 check "push key -> 200"                    200 "$(code "${DEV_AUTH[@]}" $BASE/api/push/key)"
 PUSH_KEY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/push/key | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')

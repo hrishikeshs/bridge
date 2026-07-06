@@ -41,6 +41,7 @@ pair' (put it on your phone).`,
 		attachCmd(),
 		pairCmd(),
 		sendCmd(),
+		statusCmd(),
 		retireCmd(),
 		exposeCmd(),
 		hookCmd(),
@@ -122,6 +123,20 @@ func sendCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&to, "to", "", "deliver to another agent by name instead of the phone")
+	return cmd
+}
+
+// statusCmd is implemented in cli.go; here it is a stub carrying the flag.
+func statusCmd() *cobra.Command {
+	var clear bool
+	cmd := &cobra.Command{
+		Use:   "status [text...]",
+		Short: "Set this agent's away/status line (no args prints it; --clear removes it)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return sessionCmdImpls["status"](&cliCtx{args: args, clear: clear})
+		},
+	}
+	cmd.Flags().BoolVar(&clear, "clear", false, "clear the away/status line")
 	return cmd
 }
 

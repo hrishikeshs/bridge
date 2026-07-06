@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -61,11 +62,12 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		Status    string            `json:"status"`
 		Health    string            `json:"health"`
 		Attention bool              `json:"attention"`
+		Away      string            `json:"away,omitempty"`   // agent's self-set status line
 		Fields    map[string]string `json:"fields,omitempty"` // plugin annotations
 	}
 	items := []item{}
 	for _, c := range registry.Roster() {
-		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Fields})
+		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Away, c.Fields})
 	}
 	// Clocks for phone-side presence truth (round 4): the phone compares `now`
 	// to its own clock and its last-contact timestamp to distinguish "my
@@ -74,15 +76,87 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	// reconnecting phone can say "Mac was asleep 10:02–12:55" instead of a bare
 	// "unreachable".
 	resp := map[string]any{
-		"contacts": items,
-		"version":  version,
-		"now":      timeNowUnix(),
-		"started":  daemonStartUnix,
+		"contacts":  items,
+		"version":   version,
+		"now":       timeNowUnix(),
+		"started":   daemonStartUnix,
+		"my_status": myStatus(), // the human's away line, for the settings sheet
 	}
 	if from, to := wakeGap(); to != 0 {
 		resp["wake_from"], resp["wake_to"] = from, to
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// myStatusText holds the human's away line — the AIM auto-responder delivered to
+// an agent the moment it messages the phone (handleLocalSend). It is persisted
+// under ~/.bridge/mystatus.json so it survives a daemon restart, guarded by
+// myStatusMu since both the HTTP handler and the send path touch it.
+var (
+	myStatusMu   sync.Mutex
+	myStatusText string
+)
+
+// myStatusFile is the on-disk shape: an object, not a bare string, so the file
+// can gain fields later without a format break (matching tokens.json's shape).
+type myStatusFile struct {
+	Text string `json:"text"`
+}
+
+// loadMyStatus restores the human's away line at startup (called from runServe).
+// A missing or unparseable file leaves it empty — the secure, quiet default.
+func loadMyStatus() {
+	myStatusMu.Lock()
+	defer myStatusMu.Unlock()
+	data, err := os.ReadFile(bridgePath("mystatus.json"))
+	if err != nil {
+		return
+	}
+	var f myStatusFile
+	if json.Unmarshal(data, &f) == nil {
+		myStatusText = f.Text
+	}
+}
+
+// setMyStatus records the human's away line and persists it 0600. Empty clears.
+func setMyStatus(text string) {
+	myStatusMu.Lock()
+	defer myStatusMu.Unlock()
+	myStatusText = text
+	data, _ := json.Marshal(myStatusFile{Text: text})
+	_ = writeFilePrivate(bridgePath("mystatus.json"), data)
+}
+
+// myStatus returns the current human away line ("" when none).
+func myStatus() string {
+	myStatusMu.Lock()
+	defer myStatusMu.Unlock()
+	return myStatusText
+}
+
+// handleMyStatus sets (or clears, on empty text) the human's away line. It is
+// device-token authed like every /api mutation; the value is flattened/capped
+// exactly like an agent status (clampAway), surfaced on /api/status as
+// my_status, and pushed live as a "mystatus" event so every open phone syncs.
+func handleMyStatus(w http.ResponseWriter, r *http.Request, id string) {
+	data, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(data, &req)
+
+	text := clampAway(req.Text)
+	setMyStatus(text)
+	if text == "" {
+		audit("mystatus-clear", "", id)
+	} else {
+		audit("mystatus", text, id)
+	}
+	Emit("mystatus", "", authConfig.UserMention, text)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // handleHistory returns stored events newer than ?since=N.
