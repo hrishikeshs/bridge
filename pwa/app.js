@@ -380,6 +380,7 @@ function unreadCount(contactId) {
 function showList() {
   state.view = 'list';
   state.selected = null;
+  document.documentElement.setAttribute('data-view', 'list');   // scenery on
   $('list-view').classList.remove('hidden');
   $('thread-view').classList.add('hidden');
   renderList();
@@ -389,6 +390,7 @@ function showList() {
 function openThread(id) {
   state.view = 'thread';
   state.selected = id;
+  document.documentElement.setAttribute('data-view', 'thread');  // scenery off
   $('thread-view').classList.remove('hidden');
   $('list-view').classList.add('hidden');
   if (!document.hidden) markSeen(id);
@@ -929,22 +931,52 @@ function appendPlain(container, chunk) {
   el.className = 'plain';
   if (chunk.length > 1200) {
     const short = chunk.slice(0, 1000) + '…';
-    appendLinkified(el, short);
+    appendRich(el, short);
     const more = document.createElement('button');
     more.className = 'show-more';
     more.textContent = 'show more';
     more.onclick = () => {   // a toggle, not a one-way door
       const expanded = more.textContent === 'collapse';
       el.textContent = '';
-      appendLinkified(el, expanded ? short : chunk);
+      appendRich(el, expanded ? short : chunk);
       more.textContent = expanded ? 'show more' : 'collapse';
     };
     container.appendChild(el);
     container.appendChild(more);
   } else {
-    appendLinkified(el, chunk);
+    appendRich(el, chunk);
     container.appendChild(el);
   }
+}
+
+/* Minimal inline markdown for bubbles — **bold**, *italic*, `code` — built
+   from DOM nodes exactly like the linkifier (never innerHTML), so message
+   content still cannot inject markup. Single-level on purpose: code spans
+   don't linkify, bold/italic contents still do. Anything unmatched renders
+   as the literal text it always was. */
+function appendRich(parent, text) {
+  const re = /(`[^`\n]+`)|(\*\*(?=\S)[^*]+?(?<=\S)\*\*)|(\*(?=\S)[^*\n]+?(?<=\S)\*)/g;
+  let cursor = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > cursor) appendLinkified(parent, text.slice(cursor, m.index));
+    if (m[1]) {
+      const code = document.createElement('code');
+      code.className = 'md-code';
+      code.textContent = m[1].slice(1, -1);
+      parent.appendChild(code);
+    } else if (m[2]) {
+      const b = document.createElement('strong');
+      appendLinkified(b, m[2].slice(2, -2));
+      parent.appendChild(b);
+    } else {
+      const i = document.createElement('em');
+      appendLinkified(i, m[3].slice(1, -1));
+      parent.appendChild(i);
+    }
+    cursor = m.index + m[0].length;
+  }
+  if (cursor < text.length) appendLinkified(parent, text.slice(cursor));
 }
 
 /* Append TEXT to PARENT, turning http(s) URLs into tappable links. Builds

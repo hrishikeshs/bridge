@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE = 'bridge-v14';
+const CACHE = 'bridge-v15';
 const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest',
                '/wallpaper.jpg',
                '/icons/icon-192.png', '/icons/icon-512.png'];

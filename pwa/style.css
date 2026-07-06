@@ -883,10 +883,10 @@ footer {
 :root[data-theme="international-orange"] { --glass: rgba(255,255,255,0.92); --veil-c: 255,253,248; }
 
 #scenery { display: none; }
-:root[data-wallpaper="airy"] #scenery,
-:root[data-wallpaper="whisper"] #scenery {
+:root[data-wallpaper="airy"][data-view="list"] #scenery,
+:root[data-wallpaper="whisper"][data-view="list"] #scenery {
   display: block;
-  position: absolute; inset: 0; z-index: 0; pointer-events: none;
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
   background: url("/wallpaper.jpg") center 30% / cover no-repeat;
 }
 #scenery .veil { position: absolute; inset: 0; }
@@ -926,3 +926,15 @@ footer {
 :root[data-wallpaper="airy"] .row, :root[data-wallpaper="whisper"] .row { background: var(--glass); }
 :root[data-wallpaper="airy"]:not([data-theme="international-orange"]) .list-header,
 :root[data-wallpaper="whisper"]:not([data-theme="international-orange"]) .list-header { background: transparent; }
+
+/* ---- inline markdown in bubbles (appendRich) ---- */
+.plain strong { font-weight: 650; }
+.plain em { font-style: italic; }
+.md-code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.86em;
+  background: var(--code-bg);
+  color: var(--code-ink);
+  padding: 1px 5px;
+  border-radius: 5px;
+}
