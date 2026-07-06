@@ -112,6 +112,7 @@ func runServe(port int) error {
 	loadTokens()
 	loadRegistry()
 	loadHistory()
+	loadTails() // restore per-contact tail offsets so a restart resumes, not skips (4b)
 
 	daemonStartUnix = timeNowUnix() // exposed on /api/status; anchors the wake watchdog
 

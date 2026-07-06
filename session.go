@@ -162,6 +162,57 @@ type tailState struct {
 
 var tails = map[string]*tailState{}
 
+// tailsDirty marks that a tail offset advanced since the last persist. Reconcile
+// goroutine only — saveTails runs from the same goroutine, so tails needs no
+// lock.
+var tailsDirty bool
+
+// loadedTails holds offsets restored from disk at startup, consumed once each
+// as pollReplies first sees the matching contact. A restored offset lets the
+// tail RESUME where the previous daemon stopped instead of skipping to EOF —
+// so output an agent wrote while the daemon was down (a restart, a crash, the
+// deploy dance) is relayed rather than silently swallowed (round 4b).
+var loadedTails map[string]tailStateDisk
+
+// tailStateDisk is the persisted shape of a tailState.
+type tailStateDisk struct {
+	Path   string           `json:"path"`
+	Offset int64            `json:"offset"`
+	Seen   map[string]int64 `json:"seen"`
+}
+
+func tailsPath() string { return bridgePath("tails.json") }
+
+// loadTails restores persisted tail offsets. Called once from runServe before
+// the reconcile goroutine starts, so it needs no lock.
+func loadTails() {
+	data, err := os.ReadFile(tailsPath())
+	if err != nil {
+		return
+	}
+	var snap struct {
+		Contacts map[string]tailStateDisk `json:"contacts"`
+	}
+	if json.Unmarshal(data, &snap) == nil {
+		loadedTails = snap.Contacts
+	}
+}
+
+// saveTails persists the current tail offsets 0600 (atomic write). Called from
+// the reconcile goroutine when an offset advanced, so the next daemon resumes
+// instead of skipping. Best-effort: a failed persist just risks re-relaying a
+// little output on the next restart, never losing any.
+func saveTails() {
+	snap := struct {
+		Contacts map[string]tailStateDisk `json:"contacts"`
+	}{Contacts: make(map[string]tailStateDisk, len(tails))}
+	for id, st := range tails {
+		snap.Contacts[id] = tailStateDisk{Path: st.path, Offset: st.offset, Seen: st.seen}
+	}
+	data, _ := json.Marshal(snap)
+	_ = writeFilePrivate(tailsPath(), data)
+}
+
 // startSessionManager launches the reconcile loop that keeps a JSONL tail
 // running for every live contact and retires contacts whose tmux session has
 // ended. Called once from runServe.
@@ -228,6 +279,10 @@ func startSessionManager() {
 					escalateFrozenPrompt(c)
 				}
 			}
+			if tailsDirty { // persist advanced offsets once per pass (4b)
+				saveTails()
+				tailsDirty = false
+			}
 			time.Sleep(2 * time.Second)
 		}
 	}()
@@ -272,13 +327,35 @@ func pollReplies(c *Contact) {
 	}
 	st := tails[c.ID]
 	if st == nil {
-		st = &tailState{path: path, offset: fileSize(path), seen: map[string]int64{}}
+		st = &tailState{path: path, seen: map[string]int64{}}
+		size := fileSize(path)
+		resumed := false
+		// A persisted offset for this exact file lets the tail resume where the
+		// previous daemon stopped — relaying whatever the agent wrote while the
+		// daemon was down instead of skipping it (round 4b). Guard against a
+		// rotated/truncated file (offset past EOF): fall back to EOF then.
+		if saved, ok := loadedTails[c.ID]; ok {
+			delete(loadedTails, c.ID) // consume once, however it resolves
+			if saved.Path == path && saved.Offset >= 0 && saved.Offset <= size {
+				st.offset = saved.Offset
+				if saved.Seen != nil {
+					st.seen = saved.Seen
+				}
+				resumed = true
+			}
+		}
+		if !resumed {
+			st.offset = size
+		}
 		st.seen[path] = st.offset
 		tails[c.ID] = st
 		if base := sessionIDFromPath(path); base != "" && base != c.SessionID {
 			registry.SetSession(c.ID, base)
 		}
-		return // first sight of any file: skip its backlog
+		if !resumed {
+			return // genuinely first sight of this file: skip its backlog
+		}
+		// resumed: fall through and relay everything since the saved offset
 	}
 	if st.path != path {
 		st.seen[st.path] = st.offset
@@ -337,7 +414,10 @@ func pollReplies(c *Contact) {
 			consumed += skip
 		}
 	}
-	st.offset += consumed
+	if consumed > 0 {
+		st.offset += consumed
+		tailsDirty = true // persist the advance so a restart resumes here (4b)
+	}
 	if len(texts) > 0 {
 		registry.SetHealth(c.ID, "ok")
 		for _, t := range texts {
