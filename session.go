@@ -423,10 +423,18 @@ func sessionFileFor(c *Contact) string {
 	if base == "" {
 		return currentSessionFile(c.Directory)
 	}
-	// A prior chain-heal stored a verified descendant; the pane still shows
-	// the launch id forever. Prefer the descendant when it is the fresher file.
-	if c.SessionID != "" && c.SessionID != base && fileNewer(dir, c.SessionID, base) {
-		base = c.SessionID
+	// A prior chain-heal (or manual surgery) stored a verified session while
+	// the pane still shows its launch id forever. When they disagree, decide by
+	// CONTENT, never mtime — an mtime race here once demoted a healed pin back
+	// to its dead mirror file and silenced a thread for an hour (2026-07-06,
+	// afternoon): one coincidental write to the mirror made fileNewer prefer
+	// the launch id, and SetSession below then overwrote the pin, making the
+	// downgrade permanent. Follow the launch id only when its file STRICTLY
+	// continues the pin (holds the pin's tail and the pin doesn't hold its own
+	// — "never follow anything that could follow you back"); a diverged mirror
+	// pair keeps the pin, the last verified truth.
+	if c.SessionID != "" && c.SessionID != base {
+		base = resolveLaunchVsPin(dir, c, c.SessionID, base)
 	}
 	path := filepath.Join(dir, base+".jsonl")
 	// When the resolved file has gone quiet, check (throttled) whether the
@@ -456,6 +464,52 @@ func sessionFileFor(c *Contact) string {
 // chainChecked throttles rollover-chain scans per contact. Reconcile
 // goroutine only.
 var chainChecked = map[string]time.Time{}
+
+// lastResolve caches resolveLaunchVsPin verdicts per contact so the content
+// scans (transcripts reach hundreds of MB) stay off the 2s poll path.
+// Reconcile goroutine only.
+var lastResolve = map[string]resolveVerdict{}
+
+type resolveVerdict struct {
+	pin, pane, winner string
+	at                time.Time
+}
+
+// resolveLaunchVsPin decides, by content, whether to tail the stored pin or
+// the pane's launch id when they name different sessions. The launch id wins
+// only when its file strictly continues the pin — it contains the pin's final
+// record uuid while the pin's file does not contain its own (a true roll
+// carries history exactly one way; a mirror pair matches both ways or
+// neither). Everything else keeps the pin: launch args go stale, surgery and
+// chain-heals are deliberate. The verdict is cached and refreshed at most
+// every 5 minutes per unchanged (pin, pane) pair; a real roll is a once-ever
+// event and the chain-check path handles it within its own throttle anyway.
+func resolveLaunchVsPin(dir string, c *Contact, pin, pane string) string {
+	if v, ok := lastResolve[c.ID]; ok && v.pin == pin && v.pane == pane &&
+		time.Since(v.at) < 5*time.Minute {
+		return v.winner
+	}
+	pinFile := filepath.Join(dir, pin+".jsonl")
+	paneFile := filepath.Join(dir, pane+".jsonl")
+	winner := pin
+	pinTail := lastRecordUUID(pinFile)
+	if pinTail == "" {
+		winner = pane // pin's file is gone or empty: the launch id is all we have
+	} else {
+		paneTail := lastRecordUUID(paneFile)
+		paneContinuesPin := fileContainsUUID(paneFile, pinTail)
+		pinContinuesPane := paneTail != "" && fileContainsUUID(pinFile, paneTail)
+		if paneContinuesPin && !pinContinuesPane {
+			winner = pane
+		}
+	}
+	if v, ok := lastResolve[c.ID]; !ok || v.winner != winner {
+		audit("session-resolve", fmt.Sprintf("%s pin=%.8s pane=%.8s -> %.8s",
+			c.Name, pin, pane, winner), "daemon")
+	}
+	lastResolve[c.ID] = resolveVerdict{pin: pin, pane: pane, winner: winner, at: time.Now()}
+	return winner
+}
 
 var uuidRecRe = regexp.MustCompile(`"uuid":"([0-9a-f-]{36})"`)
 
@@ -556,19 +610,6 @@ func fileContainsUUID(path, uuid string) bool {
 			return false
 		}
 	}
-}
-
-// fileNewer reports whether a's transcript is more recently written than b's.
-func fileNewer(dir, a, b string) bool {
-	ia, ea := os.Stat(filepath.Join(dir, a+".jsonl"))
-	ib, eb := os.Stat(filepath.Join(dir, b+".jsonl"))
-	if ea != nil {
-		return false
-	}
-	if eb != nil {
-		return true
-	}
-	return ia.ModTime().After(ib.ModTime())
 }
 
 // paneSessionID reads the session id straight off the contact's pane: every
