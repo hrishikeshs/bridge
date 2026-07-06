@@ -352,15 +352,32 @@ func currentSessionFile(dir string) string {
 // skipped rather than re-read forever (M11).
 const maxJSONLLine = 8 * 1024 * 1024
 
-// sessionFileFor returns the JSONL to tail for c: its own session file when it
-// has a SessionID, so two agents rehomed from the same directory never tail
-// each other's conversation (H2). It falls back to the newest .jsonl in the
-// directory only before any session id is known.
+// sessionStaleAfter is how long a pinned session file may go without growing
+// before the tail treats it as possibly-dead and looks for a replacement. It is
+// deliberately long: today's `claude --resume` keeps the same id, so a quiet
+// pinned file almost always just means an idle agent, not a forked id.
+const sessionStaleAfter = 30 * time.Minute
+
+// sessionFileFor returns the JSONL to tail for c. With a SessionID it pins on
+// that file — `claude --resume` preserves the id (verified empirically), so two
+// agents rehomed from the same directory never tail each other's conversation
+// (H2). Insurance against a hypothetical future Claude Code that forks the id on
+// resume: if the pinned file is gone or has stopped growing for a long time,
+// fall back to the newest .jsonl in the directory that no *other* live contact
+// is already tailing (never adopt a sibling's conversation — H2).
 func sessionFileFor(c *Contact) string {
-	if c.SessionID != "" {
-		return filepath.Join(projectDir(c.Directory), c.SessionID+".jsonl")
+	if c.SessionID == "" {
+		return currentSessionFile(c.Directory)
 	}
-	return currentSessionFile(c.Directory)
+	pinned := filepath.Join(projectDir(c.Directory), c.SessionID+".jsonl")
+	if info, err := os.Stat(pinned); err == nil && time.Since(info.ModTime()) < sessionStaleAfter {
+		return pinned // present and recently grown: correct on today's Claude Code
+	}
+	if alt := currentSessionFile(c.Directory); alt != "" && alt != pinned &&
+		!registry.SessionHeldByOther(sessionIDFromPath(alt), c.ID) {
+		return alt
+	}
+	return pinned
 }
 
 // skipOversizedLine returns the byte length (including the terminating newline)
@@ -376,11 +393,24 @@ func skipOversizedLine(path string, offset int64) int64 {
 	if _, err := f.Seek(offset, 0); err != nil {
 		return 0
 	}
-	line, err := bufio.NewReader(f).ReadBytes('\n')
-	if err != nil {
-		return 0 // no terminating newline yet: wait for the writer to finish it
+	// Scan forward in fixed 64 KB chunks, counting bytes to the next newline and
+	// retaining nothing. The line is oversized by definition (it already blew the
+	// scanner cap), so buffering it whole — as bufio.ReadBytes would — is the very
+	// OOM this is meant to avoid (#4).
+	buf := make([]byte, 64*1024)
+	var n int64
+	for {
+		read, err := f.Read(buf)
+		for i := 0; i < read; i++ {
+			n++
+			if buf[i] == '\n' {
+				return n // bytes up to and including the terminating newline
+			}
+		}
+		if err != nil {
+			return 0 // no terminating newline yet: wait for the writer to finish it
+		}
 	}
-	return int64(len(line))
 }
 
 func sessionIDFromPath(path string) string {
@@ -413,11 +443,11 @@ type cliCtx struct {
 var nameConnectRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,30}$`)
 
 // runConnect rehomes the calling agent: it finds this session's conversation,
-// spawns a daemon-managed tmux running `claude --resume` on it, registers the
-// contact, installs the Notification hook, and prints the handoff. --name is
-// optional; when omitted an adjective-animal address is generated. The daemon
-// owns final naming (uniqueness among live contacts), so we create the window,
-// register, then rename the window if the daemon suffixed the name.
+// creates a daemon-managed tmux window, registers the contact to settle its
+// final address and immutable id, then launches `claude --resume` in that window
+// with the id baked into its environment. --name is optional; when omitted an
+// adjective-animal address is generated. All agents share one "bridge" tmux
+// session so `bridge attach` groups them as tabs.
 func runConnect(ctx *cliCtx) error {
 	name := ctx.name
 	if name != "" && !nameConnectRe.MatchString(name) {
@@ -435,14 +465,38 @@ func runConnect(ctx *cliCtx) error {
 		return fmt.Errorf("no Claude Code session found for %s — run this from inside a session", cwd)
 	}
 	sessionID := sessionIDFromPath(sessionFile)
+
+	// One roster read drives both auto-naming and reconnect reuse.
+	contacts := liveContacts()
+	taken := map[string]bool{}
+	for _, c := range contacts {
+		if c.Status == "live" && c.Name != "" {
+			taken[c.Name] = true
+		}
+	}
 	if name == "" {
-		name = generateName(liveContactNames())
+		name = generateName(taken)
 	}
 
-	// Create (or reuse) this agent's window in the shared "bridge" session and
-	// capture its window id (@N) as the routing target — immune to tmux's target
-	// grammar, so a numeric/relative name can never misroute a message (C2).
-	target, err := ensureWindow(name, cwd, sessionID)
+	// Reconnect reuse: reuse a window only if THIS identity (name+directory)
+	// already owns a live one, keyed by its stored window id — never by matching a
+	// name, which could belong to a different live agent and hijack its pane (#2).
+	reuse := ""
+	for _, c := range contacts {
+		if c.Status == "live" && c.Name == name && c.Directory == cwd &&
+			strings.HasPrefix(c.TmuxTarget, "@") {
+			reuse = c.TmuxTarget
+			break
+		}
+	}
+	// A fresh connect settles its final (possibly suffixed) address BEFORE the
+	// window is born, so the window is created under its final name and is never
+	// renamed out from under another agent later (#2).
+	if reuse == "" {
+		name = uniqueName(name, taken)
+	}
+
+	target, created, err := ensureWindow(name, cwd, reuse)
 	if err != nil {
 		return err
 	}
@@ -457,13 +511,27 @@ func runConnect(ctx *cliCtx) error {
 	}, &reg); err != nil {
 		return err
 	}
-	// The daemon guarantees uniqueness among live contacts; if it suffixed the
-	// name to dodge a collision, rename the window to the final address so
-	// `bridge attach` and the roster match what the phone will use.
-	if reg.Name != "" && reg.Name != name {
+	// The daemon is the final authority on uniqueness; if a connect raced ours and
+	// took the name in between, it appends one more suffix. Rename our OWN freshly
+	// created window to match — safe now that ensureWindow never adopts another
+	// agent's window (#2). A reused window belongs to this same contact, so the
+	// daemon returns its existing name and this branch does not fire.
+	if created && reg.Name != "" && reg.Name != name {
 		_, _ = tmux("rename-window", "-t", target, reg.Name)
 		name = reg.Name
 	}
+
+	// Launch claude with the immutable contact id in its environment: `bridge
+	// send` self-identifies by this id, so a suffixed display name can never make
+	// it post as — or be resolved to — another agent (#6). The id is known only
+	// after registration, so the window was created empty and claude is started
+	// now. A reused window already has claude running with this same id baked in.
+	if created {
+		if err := launchClaude(target, cwd, sessionID, reg.ID); err != nil {
+			return err
+		}
+	}
+
 	if err := installHook(); err != nil {
 		fmt.Printf("(note: could not install the permission hook: %v)\n", err)
 	}
@@ -483,52 +551,79 @@ This window is now a retired copy — quit it whenever; I'm no longer in it.
 	return nil
 }
 
-// ensureWindow makes sure the agent has a window in the shared "bridge" tmux
-// session running `claude --resume`, and returns its window id ("@N"). Reusing
-// an existing same-named window keeps reconnects idempotent. All agents share
-// one session so `bridge attach` groups them as tabs; isolation is per window,
-// and the returned @N is the grammar-immune routing target.
-func ensureWindow(name, cwd, sessionID string) (string, error) {
-	if id := tmuxWindowID(name); id != "" {
-		return id, nil
+// ensureWindow returns the tmux window id ("@N") to host the agent and whether it
+// created a fresh one. On reconnect — reuse is this contact's own still-live
+// window id — it returns that window with created=false (claude is already
+// running there). Otherwise it creates a fresh window running only a shell and
+// returns created=true; claude is launched later by launchClaude, once
+// registration has minted the immutable id to bake into its environment (#6). A
+// new connect never adopts an existing window by name: that window could be a
+// different live agent's, and typing into it would misroute exactly like C2 (#2).
+// All agents share one "bridge" session so `bridge attach` groups them as tabs.
+func ensureWindow(name, cwd, reuse string) (string, bool, error) {
+	if reuse != "" && tmuxAlive(reuse) {
+		return reuse, false, nil
 	}
 	var out string
 	var err error
 	if _, e := tmux("has-session", "-t", "bridge"); e != nil {
 		out, err = tmux("new-session", "-d", "-s", "bridge", "-n", name, "-c", cwd,
-			"-P", "-F", "#{window_id}",
-			"-e", "BRIDGE_CONTACT="+name, "claude", "--resume", sessionID)
+			"-P", "-F", "#{window_id}")
 	} else {
 		out, err = tmux("new-window", "-t", "bridge", "-n", name, "-c", cwd,
-			"-P", "-F", "#{window_id}",
-			"-e", "BRIDGE_CONTACT="+name, "claude", "--resume", sessionID)
+			"-P", "-F", "#{window_id}")
 	}
 	if err != nil {
-		return "", fmt.Errorf("failed to rehome into tmux (is tmux installed?): %w", err)
+		return "", false, fmt.Errorf("failed to rehome into tmux (is tmux installed?): %w", err)
 	}
-	return strings.TrimSpace(out), nil
+	return strings.TrimSpace(out), true, nil
 }
 
-// liveContactNames fetches the daemon roster and returns the set of names in
-// use, so CLI-side auto-naming avoids obvious collisions before it even asks the
-// daemon. The daemon still enforces true uniqueness among live contacts; this is
-// only a best-effort first pass.
-func liveContactNames() map[string]bool {
-	taken := map[string]bool{}
+// launchClaude starts `claude --resume` in the (already created, still empty)
+// window, replacing its shell, with BRIDGE_CONTACT set to the immutable contact
+// id. respawn-pane -k delivers the environment straight to the new process, so
+// there is no shell-timing race and the id is present the moment claude — and
+// thus any `bridge send` it runs — starts (#6).
+func launchClaude(target, cwd, sessionID, contactID string) error {
+	if _, err := tmux("respawn-pane", "-k", "-t", target, "-c", cwd,
+		"-e", "BRIDGE_CONTACT="+contactID, "claude", "--resume", sessionID); err != nil {
+		return fmt.Errorf("failed to start claude in the managed window: %w", err)
+	}
+	return nil
+}
+
+// uniqueName returns name with the smallest numeric suffix absent from taken
+// (name, name-2, name-3, ...). It mirrors the daemon's own suffixing so a fresh
+// window is usually born with its final address; the daemon still has the last
+// word if a concurrent connect races it.
+func uniqueName(name string, taken map[string]bool) string {
+	final := name
+	for n := 2; taken[final]; n++ {
+		final = fmt.Sprintf("%s-%d", name, n)
+	}
+	return final
+}
+
+// liveContact is the subset of a roster entry the connect CLI needs: enough to
+// avoid name collisions and to recognize this identity's own window on reconnect.
+type liveContact struct {
+	Name       string `json:"name"`
+	Directory  string `json:"directory"`
+	TmuxTarget string `json:"tmux_target"`
+	Status     string `json:"status"`
+}
+
+// liveContacts fetches the daemon roster. The daemon still enforces true
+// uniqueness among live contacts; the CLI uses this only for a best-effort first
+// pass at naming and for reconnect reuse.
+func liveContacts() []liveContact {
 	var resp struct {
-		Contacts []struct {
-			Name string `json:"name"`
-		} `json:"contacts"`
+		Contacts []liveContact `json:"contacts"`
 	}
 	if err := daemonRequest("GET", "/local/contacts", nil, &resp); err != nil {
-		return taken
+		return nil
 	}
-	for _, c := range resp.Contacts {
-		if c.Name != "" {
-			taken[c.Name] = true
-		}
-	}
-	return taken
+	return resp.Contacts
 }
 
 // runAttach hands the terminal to the grouped "bridge" tmux session — all

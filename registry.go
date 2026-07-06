@@ -6,17 +6,18 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 )
 
 // Contact is a managed agent: a stable, daemon-minted identity that outlives
-// session churn. Each --resume mints a new SessionID, but the Contact (and its
-// thread and outbox) persists.
+// session churn. The Contact (and its thread and outbox) persists across daemon
+// restarts and reconnects, keyed by name+directory; its id never changes.
 type Contact struct {
-	ID         string `json:"id"`          // daemon-minted uuid for the agent
-	Name       string `json:"name"`        // self-chosen address, unique among the living
+	ID         string `json:"id"`          // daemon-minted uuid for the agent; the immutable identity
+	Name       string `json:"name"`        // self-chosen address, unique among the living (a display name; may be suffixed)
 	Directory  string `json:"directory"`   // the agent's working directory
-	SessionID  string `json:"session_id"`  // current Claude Code conversation id (churns on resume)
+	SessionID  string `json:"session_id"`  // Claude Code conversation id; `claude --resume` PRESERVES it (verified empirically), so it is stable across resume — the tail pins on it, falling back to the newest .jsonl only if it goes missing/stale (see sessionFileFor)
 	TmuxTarget string `json:"tmux_target"` // tmux window id ("@N") hosting the agent; legacy rows may hold "bridge:<name>"
 	Status     string `json:"status"`      // "live" | "offline"
 	Health     string `json:"health"`      // "ok" | "working" | "prompt" | "offline"
@@ -76,9 +77,9 @@ func newID() string {
 }
 
 // nameAdjectives and nameAnimals seed auto-generated agent addresses
-// (adjective-animal, e.g. "swift-fox"). Ported from Magnus's wordlists and
-// padded to 16 each for collision headroom (and clean modulo — no rejection
-// sampling needed since 256 % 16 == 0).
+// (adjective-animal, e.g. "swift-fox"). Ported from Magnus's wordlists; indices
+// are drawn with the shared randInt (uniform, rejection-sampled), so the list
+// lengths no longer have to divide 256 to stay unbiased.
 var (
 	nameAdjectives = []string{
 		"swift", "bright", "calm", "bold", "keen", "wise", "quick", "sharp",
@@ -96,22 +97,13 @@ var (
 // the /local/contacts roster) and the daemon can reuse it. `taken` may be nil.
 func generateName(taken map[string]bool) string {
 	for i := 0; i < 100; i++ {
-		n := nameAdjectives[randIndex(len(nameAdjectives))] + "-" + nameAnimals[randIndex(len(nameAnimals))]
+		n := nameAdjectives[randInt(len(nameAdjectives))] + "-" + nameAnimals[randInt(len(nameAnimals))]
 		if !taken[n] {
 			return n
 		}
 	}
-	return nameAdjectives[randIndex(len(nameAdjectives))] + "-" +
-		nameAnimals[randIndex(len(nameAnimals))] + "-" + newID()[:4]
-}
-
-// randIndex returns a crypto-random index in [0,n); n must be in (0,256].
-func randIndex(n int) int {
-	var b [1]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("bridge: crypto/rand unavailable: " + err.Error())
-	}
-	return int(b[0]) % n
+	return nameAdjectives[randInt(len(nameAdjectives))] + "-" +
+		nameAnimals[randInt(len(nameAnimals))] + "-" + newID()[:4]
 }
 
 // loadRegistry restores contacts and mailboxes from disk. Every contact loads
@@ -167,6 +159,29 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 			break
 		}
 	}
+	// Sanitize a NEW registration here, at the choke point every producer flows
+	// through, so no caller of the local connect endpoint (a rollback binary, a
+	// stale client) can bypass runConnect's CLI-side checks and register a
+	// routing-hostile identity (C2). A *revive* of an existing contact is left
+	// alone: its name was validated when first registered, and the session
+	// manager has already migrated a legacy name-based target to a window id
+	// before calling us — so legacy stored state still reconciles.
+	if c == nil {
+		if !nameConnectRe.MatchString(name) {
+			// A numeric/relative/whitespace name is exactly what tmux misresolves
+			// via its target grammar; replace it with a safe generated address
+			// rather than store it as a routing key.
+			name = generateName(r.liveNames())
+		}
+		if !strings.HasPrefix(tmuxTarget, "@") {
+			// Only a window id ("@N") is immune to tmux's target grammar. A
+			// name-based target ("bridge:1") could send-keys to a window *index* —
+			// the original misroute. Neutralize it: an empty target never routes
+			// (tmuxAlive is false), so the contact stays offline until it
+			// reconnects with a real window id.
+			tmuxTarget = ""
+		}
+	}
 	// Guarantee the name is unique among *live* contacts so the phone can address
 	// an agent unambiguously. On collision with a different live contact, append
 	// a numeric suffix (swift-fox-2, -3, ...). The final name is returned via
@@ -199,6 +214,18 @@ func (r *Registry) liveNameTaken(name string, self *Contact) bool {
 		}
 	}
 	return false
+}
+
+// liveNames returns the set of names held by live contacts, for generating a
+// fresh non-colliding address. Caller holds r.mu.
+func (r *Registry) liveNames() map[string]bool {
+	taken := map[string]bool{}
+	for _, c := range r.contacts {
+		if c.Status == "live" && c.Name != "" {
+			taken[c.Name] = true
+		}
+	}
+	return taken
 }
 
 // Resolve maps a handle (contact id, or a name unique among the living) to a
@@ -341,11 +368,20 @@ func (r *Registry) FlushMailbox(id string, deliver func(MailMessage) error) {
 			return // leave m and the rest queued for the next flush
 		}
 
-		// Delivered: drop the front (still the message we delivered — Queue only
-		// appends) and persist before moving on.
+		// Delivered: remove that exact message and persist before moving on. The
+		// head may have shifted while the lock was released — a concurrent Queue at
+		// the maxMailbox cap drops the oldest — so re-find m by value instead of
+		// assuming it is still q[0], which would discard a never-delivered message
+		// (#5). If m was itself the one the cap dropped, it is already gone and
+		// there is nothing to remove.
 		r.mu.Lock()
 		if q := r.mailbox[id]; len(q) > 0 {
-			r.mailbox[id] = q[1:]
+			for i := range q {
+				if q[i] == m {
+					r.mailbox[id] = append(q[:i:i], q[i+1:]...)
+					break
+				}
+			}
 			if len(r.mailbox[id]) == 0 {
 				delete(r.mailbox, id)
 			}
@@ -353,28 +389,6 @@ func (r *Registry) FlushMailbox(id string, deliver func(MailMessage) error) {
 		r.save()
 		r.mu.Unlock()
 	}
-}
-
-// TakeMailbox returns and clears a contact's queued messages.
-func (r *Registry) TakeMailbox(id string) []MailMessage {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	msgs := r.mailbox[id]
-	delete(r.mailbox, id)
-	r.save()
-	return msgs
-}
-
-// Requeue restores messages to the front of a contact's mailbox when delivery
-// of a drained mailbox fails partway through.
-func (r *Registry) Requeue(id string, msgs []MailMessage) {
-	if len(msgs) == 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.mailbox[id] = append(append([]MailMessage{}, msgs...), r.mailbox[id]...)
-	r.save()
 }
 
 // SetHealth updates a live contact's health indicator (e.g. "working" while
@@ -388,8 +402,26 @@ func (r *Registry) SetHealth(id, health string) {
 	}
 }
 
-// SetSession records a contact's current Claude Code session id, which churns
-// on every --resume; the tail loop re-resolves the JSONL when it changes.
+// SessionHeldByOther reports whether a live contact other than exceptID is
+// already tailing sessionID's JSONL. The stale-file fallback consults it so it
+// never adopts a sibling agent's conversation in the same directory (H2).
+func (r *Registry) SessionHeldByOther(sessionID, exceptID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.contacts {
+		if c.ID != exceptID && c.Status == "live" && c.SessionID == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSession records a contact's current Claude Code session id. `claude
+// --resume` preserves the id today, so this changes rarely; the tail loop
+// re-resolves the JSONL when it does.
 func (r *Registry) SetSession(id, sessionID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
