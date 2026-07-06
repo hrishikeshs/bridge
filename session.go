@@ -157,6 +157,7 @@ func tmuxSendKey(c *Contact, key string) error {
 type tailState struct {
 	path   string
 	offset int64
+	seen   map[string]int64 // path -> resume offset: a re-adopted file continues where it left off
 }
 
 var tails = map[string]*tailState{}
@@ -235,14 +236,29 @@ func pollReplies(c *Contact) {
 		return
 	}
 	st := tails[c.ID]
-	if st == nil || st.path != path {
-		size := fileSize(path)
-		st = &tailState{path: path, offset: size}
+	if st == nil {
+		st = &tailState{path: path, offset: fileSize(path), seen: map[string]int64{}}
+		st.seen[path] = st.offset
 		tails[c.ID] = st
 		if base := sessionIDFromPath(path); base != "" && base != c.SessionID {
 			registry.SetSession(c.ID, base)
 		}
-		return // first sight of this file: skip its backlog
+		return // first sight of any file: skip its backlog
+	}
+	if st.path != path {
+		st.seen[st.path] = st.offset
+		off, known := st.seen[path]
+		st.path = path
+		if known {
+			st.offset = off // resume: a path flip must never eat the gap
+		} else {
+			st.offset = fileSize(path)
+			st.seen[path] = st.offset
+			if base := sessionIDFromPath(path); base != "" && base != c.SessionID {
+				registry.SetSession(c.ID, base)
+			}
+			return // genuinely new file: skip its backlog once
+		}
 	}
 	size := fileSize(path)
 	if size <= st.offset {
@@ -439,11 +455,15 @@ func sessionFileFor(c *Contact) string {
 // goroutine only.
 var chainChecked = map[string]time.Time{}
 
-var parentUuidRe = regexp.MustCompile(`"parentUuid":"([0-9a-f-]{36})"`)
+var uuidRecRe = regexp.MustCompile(`"uuid":"([0-9a-f-]{36})"`)
 
 // sessionChainTip follows clear/compaction rollovers from id to the current
-// tip. A successor file's earliest parented records reference message uuids
-// that live INSIDE the predecessor — cryptographic-strength continuity.
+// tip. The test is DIRECTIONAL by construction: a true continuation contains
+// its predecessor's final record uuid (the roll copies history forward); an
+// ancestor can never contain its descendant's future. The first head-uuid
+// heuristic matched in BOTH directions on mirror-superset files and made the
+// pin oscillate, eating replies — never follow anything that could also
+// follow you back.
 func sessionChainTip(dir, id string) string {
 	for range [5]struct{}{} {
 		child := sessionChildOf(dir, id)
@@ -455,34 +475,54 @@ func sessionChainTip(dir, id string) string {
 	return id
 }
 
-// sessionChildOf finds the file that continues session id, if any.
+// sessionChildOf finds the file that continues session id, if any: the one
+// containing id's final record uuid.
 func sessionChildOf(dir, id string) string {
+	tail := lastRecordUUID(filepath.Join(dir, id+".jsonl"))
+	if tail == "" {
+		return ""
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return ""
 	}
-	cur := filepath.Join(dir, id+".jsonl")
 	for _, e := range entries {
 		cand, ok := strings.CutSuffix(e.Name(), ".jsonl")
 		if !ok || cand == id {
 			continue
 		}
-		f, err := os.Open(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		head := make([]byte, 256*1024)
-		n, _ := io.ReadFull(f, head)
-		f.Close()
-		m := parentUuidRe.FindSubmatch(head[:n])
-		if m == nil {
-			continue
-		}
-		if fileContainsUUID(cur, string(m[1])) {
+		if fileContainsUUID(filepath.Join(dir, e.Name()), tail) {
 			return cand
 		}
 	}
 	return ""
+}
+
+// lastRecordUUID returns the uuid of the final record in a transcript,
+// scanning only the tail (files reach hundreds of MB).
+func lastRecordUUID(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	off := st.Size() - 64*1024
+	if off < 0 {
+		off = 0
+	}
+	if _, err := f.Seek(off, 0); err != nil {
+		return ""
+	}
+	b, _ := io.ReadAll(f)
+	ms := uuidRecRe.FindAllSubmatch(b, -1)
+	if len(ms) == 0 {
+		return ""
+	}
+	return string(ms[len(ms)-1][1])
 }
 
 // fileContainsUUID streams (transcripts reach hundreds of MB) looking for the
@@ -975,16 +1015,30 @@ func looksLikePrompt(pane string) bool {
 	if pane == "" {
 		return false
 	}
-	low := strings.ToLower(pane)
-	// The permission dialog always offers numbered choices and an Esc-cancel
-	// line; requiring both avoids matching ordinary numbered output.
-	hasChoices := strings.Contains(pane, "1.") && strings.Contains(pane, "2.")
+	// Judge only the pane's last screenful and demand the dialog's actual
+	// FRAME, not its vocabulary: agents constantly write prose ABOUT prompts
+	// ("1. Yes", "esc to cancel"), and the old substring test minted fake
+	// attention cards out of agent chatter — including message text captured
+	// off the pane. A real dialog has the ❯ selector plus a line-anchored
+	// numbered option in its final lines.
+	lines := strings.Split(strings.TrimRight(pane, "\n"), "\n")
+	if len(lines) > 18 {
+		lines = lines[len(lines)-18:]
+	}
+	tail := strings.Join(lines, "\n")
+	low := strings.ToLower(tail)
+	hasSelector := strings.Contains(tail, "❯")
+	hasOption := promptOptionRe.MatchString(tail)
 	hasProceed := strings.Contains(low, "do you want") ||
 		strings.Contains(low, "esc to cancel") ||
 		strings.Contains(low, "no, and tell") ||
 		strings.Contains(low, "yes, and")
-	return hasChoices && hasProceed
+	return hasSelector && hasOption && hasProceed
 }
+
+// promptOptionRe matches a dialog option at the start of a line ("❯ 1. Yes",
+// "  2. No…") — prose mentions of "1." mid-sentence do not anchor.
+var promptOptionRe = regexp.MustCompile(`(?m)^\s*(?:❯\s*)?[123]\.\s`)
 
 // timeNowUnix returns the current unix time in seconds.
 func timeNowUnix() int64 { return time.Now().Unix() }
