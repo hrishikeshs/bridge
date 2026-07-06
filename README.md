@@ -21,14 +21,12 @@ terminal, and `bridge pair` to put it on your phone. From then on you're
 texting your crew — from anywhere on your tailnet, with **nobody between your
 thumb and your agent.**
 
-<p align="center">
-  <img src="assets/screen-list.jpg" width="255" alt="The conversation list — Golden Hour theme, the Golden Gate under drifting fog">
-  <img src="assets/screen-approve.jpg" width="255" alt="A real Claude Code permission prompt with Yes / No keys, approved from the couch">
-  <img src="assets/screen-thread.jpg" width="255" alt="A thread — rendered markdown on solid ground">
-</p>
-<p align="center"><sub><i>Real screenshots, unstaged: the buddy list, a live permission card, a thread.
-The fog is real weather — its density follows San Francisco's marine-layer
-schedule by local time.</i></sub></p>
+| The buddy list | Approve from the couch | A thread |
+|:---:|:---:|:---:|
+| ![The conversation list — Golden Hour theme, the Golden Gate under drifting fog](assets/screen-list.jpg) | ![A real Claude Code permission prompt with Yes / No keys](assets/screen-approve.jpg) | ![A thread — rendered markdown on solid ground](assets/screen-thread.jpg) |
+
+<sub><i>Real screenshots, unstaged. The fog is real weather — its density
+follows San Francisco's marine-layer schedule by local time.</i></sub>
 
 ## How it works
 
