@@ -27,6 +27,13 @@
   </div>
 
   <div id="app" class="hidden">
+    <!-- The scenery layer: the Golden Gate under an ivory veil, fog drifting
+         over it on the marine-layer schedule. Hidden when the Background
+         setting is Off; all content paints above it. -->
+    <div id="scenery" aria-hidden="true">
+      <span class="veil"></span>
+      <span class="fog f1"></span><span class="fog f2"></span><span class="fog f3"></span>
+    </div>
     <!-- Shared strips (sit under the notch, above whichever view is showing). -->
     <div id="conn-banner" class="banner hidden"></div>
     <button id="enable-push" class="hidden">🔔 Tap to enable notifications</button>
@@ -87,6 +94,8 @@
         </div>
         <div class="sheet-label">Theme</div>
         <div id="theme-options"></div>
+        <div class="sheet-label">Background</div>
+        <div id="wallpaper-options"></div>
         <div class="sheet-label">Notifications</div>
         <button id="notif-row" class="sheet-row"><span id="notif-state"></span></button>
       </div>

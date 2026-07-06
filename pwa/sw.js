@@ -4,8 +4,9 @@
 
 'use strict';
 
-const CACHE = 'bridge-v11';
+const CACHE = 'bridge-v12';
 const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest',
+               '/wallpaper.jpg',
                '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {

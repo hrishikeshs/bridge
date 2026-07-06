@@ -869,3 +869,60 @@ footer {
     to { transform: translateY(0); }
   }
 }
+
+/* ---- scenery: the real bridge under a veil (Background setting) ----
+   One fixed layer under everything: Hrishi's Golden Gate photo, an ivory
+   veil (strong at the top where rows live, lighter below), and three fog
+   banks drifting at different speeds. The veil strength is the setting
+   (airy | whisper); fog density follows the marine-layer schedule via
+   --fog-density (set hourly in app.js). Dusk darkens the veil instead of
+   lightening it. Tokens live here so the whole feature is one block. */
+
+:root { --glass: rgba(255,255,255,0.90); --fog-c: 250,245,236; --veil-c: 250,245,236; --fog-density: 0.7; }
+:root[data-theme="dusk"] { --glass: rgba(29,40,54,0.90); --fog-c: 138,170,201; --veil-c: 20,27,38; }
+:root[data-theme="international-orange"] { --glass: rgba(255,255,255,0.92); --veil-c: 255,253,248; }
+
+#scenery { display: none; }
+:root[data-wallpaper="airy"] #scenery,
+:root[data-wallpaper="whisper"] #scenery {
+  display: block;
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background: url("/wallpaper.jpg") center 30% / cover no-repeat;
+}
+#scenery .veil { position: absolute; inset: 0; }
+:root[data-wallpaper="airy"] #scenery .veil {
+  background: linear-gradient(180deg,
+    rgba(var(--veil-c), 0.88) 0%, rgba(var(--veil-c), 0.74) 34%, rgba(var(--veil-c), 0.44) 100%);
+}
+:root[data-wallpaper="whisper"] #scenery .veil {
+  background: linear-gradient(180deg,
+    rgba(var(--veil-c), 0.76) 0%, rgba(var(--veil-c), 0.57) 34%, rgba(var(--veil-c), 0.24) 100%);
+}
+
+#scenery .fog {
+  position: absolute; border-radius: 50%; filter: blur(16px);
+  opacity: var(--fog-density);
+}
+#scenery .f1 { width: 150%; height: 14%; bottom: 12%; left: -30%;
+  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.85), rgba(var(--fog-c), 0)); }
+#scenery .f2 { width: 130%; height: 11%; bottom: 22%; left: 10%;
+  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.7), rgba(var(--fog-c), 0)); }
+#scenery .f3 { width: 170%; height: 17%; bottom: 3%; left: -50%;
+  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.8), rgba(var(--fog-c), 0)); }
+@media (prefers-reduced-motion: no-preference) {
+  #scenery .f1 { animation: fog-drift-1 52s ease-in-out infinite alternate; }
+  #scenery .f2 { animation: fog-drift-2 74s ease-in-out infinite alternate; }
+  #scenery .f3 { animation: fog-drift-3 96s ease-in-out infinite alternate; }
+  @keyframes fog-drift-1 { to { transform: translateX(18%); } }
+  @keyframes fog-drift-2 { to { transform: translateX(-14%); } }
+  @keyframes fog-drift-3 { to { transform: translateX(22%); } }
+}
+
+/* Content floats on the weather: glass rows, quiet chrome. The navy header
+   bars of international-orange stay opaque — they are the brand, not ground. */
+:root[data-wallpaper="airy"] .row, :root[data-wallpaper="whisper"] .row { background: var(--glass); }
+:root[data-wallpaper="airy"] footer, :root[data-wallpaper="whisper"] footer { background: transparent; }
+:root[data-wallpaper="airy"]:not([data-theme="international-orange"]) .list-header,
+:root[data-wallpaper="whisper"]:not([data-theme="international-orange"]) .list-header,
+:root[data-wallpaper="airy"]:not([data-theme="international-orange"]) .thread-header,
+:root[data-wallpaper="whisper"]:not([data-theme="international-orange"]) .thread-header { background: transparent; }

@@ -51,6 +51,48 @@ function setTheme(theme) {
 
 applyTheme(currentTheme());
 
+/* ---------- background (the scenery layer) ----------
+   Off / airy / whisper — the veil strength over the Golden Gate photo.
+   Fog density follows the real San Francisco marine-layer schedule: dense
+   mornings, burned off by afternoon, rolling back at dusk. */
+
+const WALLPAPERS = ['airy', 'whisper', 'off'];
+const WALLPAPER_NAMES = { airy: 'Bridge · airy veil', whisper: 'Bridge · whisper veil', off: 'Off' };
+
+function currentWallpaper() {
+  const w = localStorage.getItem('wallpaper');
+  return WALLPAPERS.includes(w) ? w : 'airy';
+}
+
+function applyWallpaper(w) {
+  if (!WALLPAPERS.includes(w)) w = 'airy';
+  document.documentElement.setAttribute('data-wallpaper', w);
+  updateFog();
+}
+
+function setWallpaper(w) {
+  if (!WALLPAPERS.includes(w)) return;
+  localStorage.setItem('wallpaper', w);
+  applyWallpaper(w);
+}
+
+// SF marine layer, by local hour: thick mornings, clear afternoons, the bank
+// rolls back in around dusk, settles overnight. The app has weather.
+function fogDensity(hour) {
+  if (hour >= 5 && hour < 11) return 1.0;
+  if (hour >= 11 && hour < 17) return 0.35;
+  if (hour >= 17 && hour < 22) return 0.85;
+  return 0.6;
+}
+
+function updateFog() {
+  document.documentElement.style.setProperty(
+    '--fog-density', String(fogDensity(new Date().getHours())));
+}
+
+setInterval(updateFog, 30 * 60 * 1000);   // re-check the weather twice an hour
+applyWallpaper(currentWallpaper());
+
 const HEALTH_LABELS = { working: 'working', prompt: 'waiting on you', offline: 'offline' };
 const STATE_GLYPH = { sending: '🕐', sent: '✓', failed: '⚠️', queued: '📮' };
 
@@ -410,8 +452,29 @@ $('notif-row').addEventListener('click', async () => {
 
 function openSettings() {
   renderThemeOptions();
+  renderWallpaperOptions();
   renderNotifState();
   $('settings-sheet').classList.remove('hidden');
+}
+
+function renderWallpaperOptions() {
+  const box = $('wallpaper-options');
+  const active = currentWallpaper();
+  box.innerHTML = '';
+  for (const key of WALLPAPERS) {
+    const row = document.createElement('button');
+    row.className = 'theme-row';
+    const name = document.createElement('span');
+    name.className = 'theme-name';
+    name.textContent = WALLPAPER_NAMES[key];
+    const check = document.createElement('span');
+    check.className = 'check';
+    check.textContent = key === active ? '✓' : '';
+    row.appendChild(name);
+    row.appendChild(check);
+    row.onclick = () => { setWallpaper(key); renderWallpaperOptions(); };
+    box.appendChild(row);
+  }
 }
 
 function closeSettings() {
