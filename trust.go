@@ -15,13 +15,22 @@ import (
 	"time"
 )
 
-// pairingTTL is how long a printed pairing code stays redeemable. Kept short
-// (matches the documented/PWA value) to shrink the brute-force window.
-const pairingTTL = 2 * time.Minute
+// pairingTTL is how long a printed pairing code stays redeemable. Ten minutes
+// so a real phone setup needn't re-enter the code repeatedly; the brute-force
+// defence is the maxPairingFails attempt-cap below, not the window length (five
+// guesses out of 10^6 whether the window is 2 or 10 minutes), so the longer TTL
+// costs nothing (R0).
+const pairingTTL = 10 * time.Minute
 
 // maxPairingFails is how many wrong guesses a live pairing code tolerates
 // before it is invalidated and must be re-issued. This attempt-cap — not the
 // digit count — is what defeats the brute-force (C1).
+//
+// Design tension: the cap is global, so any identity-gated-but-unpaired tailnet
+// peer can burn 5 wrong guesses to invalidate every code you issue (a pairing
+// lockout-DoS). Contained on a solo tailnet — the only peer is the owner. If
+// bridge ever goes multi-user, cap per-source instead, or lock only after N
+// *distinct* device ids fail; don't add per-source tracking before then.
 const maxPairingFails = 5
 
 // bridgeDir returns the ~/.bridge configuration directory.
@@ -174,25 +183,11 @@ var (
 	pairingFails int // wrong guesses against the current code; guarded by pairingMu
 )
 
-// pairingDigits returns a uniform six-digit value in [0, 1000000) with no
-// modulo bias (reject-sampling the biased tail) and panics if crypto/rand
-// fails — matching randomHex's posture so an RNG failure can never silently
-// yield a guessable 000000.
+// pairingDigits returns a uniform six-digit value in [0, 1000000). It delegates
+// to randInt so the reject-sampling and panic-on-RNG-failure posture lives in
+// one place (an RNG failure must never silently yield a guessable 000000).
 func pairingDigits() int {
-	const mod = 1000000
-	// Largest multiple of mod that fits in 24 bits; values >= this would bias
-	// the low end, so resample them away.
-	const limit = (1 << 24) - ((1 << 24) % mod)
-	for {
-		b := make([]byte, 3)
-		if _, err := rand.Read(b); err != nil {
-			panic("bridge: crypto/rand unavailable: " + err.Error())
-		}
-		n := int(b[0])<<16 | int(b[1])<<8 | int(b[2])
-		if n < limit {
-			return n % mod
-		}
-	}
+	return randInt(1000000)
 }
 
 // issuePairingCode mints a single-use, six-digit code valid for pairingTTL.

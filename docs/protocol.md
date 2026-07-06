@@ -41,7 +41,7 @@ paired-device token, except `POST /api/pair` and static assets. Requests are
 audited; bodies capped; history durable (JSONL on disk).
 
 - `POST /api/pair {code, device}` → Set-Cookie token. Codes: 6 digits,
-  2-minute, single-use, printed only by `bridge pair` on the machine.
+  10-minute, single-use, printed only by `bridge pair` on the machine.
 - `GET  /api/status` → `{contacts: [{id, name, directory, status, health,
   attention}], version}`. `status`: `live | offline`. `health`:
   `ok | working | prompt | offline`.
@@ -122,7 +122,7 @@ offline semantics. The phone sees the traffic in the relevant threads.
 1. Daemon binds **127.0.0.1**; the tailnet (via `tailscale serve`) is the
    phone's only road in. `bridge expose` wraps the serve setup.
 2. Tailscale identity allowlist (`~/.bridge/config.json`) + per-device
-   pairing tokens (0600), single-use 2-minute codes printed only on-machine.
+   pairing tokens (0600), single-use 10-minute codes printed only on-machine.
 3. Local CLI↔daemon calls authenticate with the lockfile token (0600) —
    same local-trust posture as magnus-bridge, documented.
 4. Approve endpoint: whitelisted keys, hook-attested prompt state only.
