@@ -890,7 +890,12 @@ $('attach-input').addEventListener('change', async (e) => {
   e.target.value = '';
   if (!file) return;
   const dataUrl = await downscale(file).catch(() => null);
-  if (!dataUrl) return;
+  if (!dataUrl) {
+    // Never fail silently: a CSP block or an undecodable file used to end
+    // here with no trace (found live 2026-07-06).
+    alert('Couldn’t read that photo — try picking it again.');
+    return;
+  }
   pendingImage = dataUrl.split(',')[1];
   $('attach-thumb').src = dataUrl;
   $('attach-preview').classList.remove('hidden');

@@ -314,10 +314,14 @@ func formatInbound(from, via, text string) string {
 
 // cspPolicy is the strict Content-Security-Policy served with the app shell and
 // every static asset (M7). Same-origin only, no inline/eval script or style,
-// images may additionally be data: URIs (attachment previews), the page cannot be
-// framed and cannot set a <base>. It is the second line of defense if agent output
-// ever reaches an innerHTML sink.
-const cspPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+// the page cannot be framed and cannot set a <base>. It is the second line of
+// defense if agent output ever reaches an innerHTML sink. Images additionally
+// allow data: (attachment preview thumbnails) and blob: — downscale() loads the
+// picked photo through URL.createObjectURL before re-encoding, and without
+// blob: the CSP silently kills photo attach (found live 2026-07-06; blob:
+// object URLs are same-origin-created, so this widens nothing for injected
+// content).
+const cspPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 
 var staticTypes = map[string]string{
 	".html":        "text/html; charset=utf-8",
