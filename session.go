@@ -262,6 +262,7 @@ func pollReplies(c *Contact) {
 		registry.SetHealth(c.ID, "ok")
 		for _, t := range texts {
 			Emit("reply", c.ID, c.Name, t)
+			dispatchPluginEvent("reply.out", c, map[string]any{"text": t})
 		}
 	} else if consumed > 0 {
 		// File advanced but produced no visible text: the agent is thinking or

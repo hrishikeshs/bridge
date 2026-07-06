@@ -22,7 +22,16 @@ type Contact struct {
 	Status     string `json:"status"`      // "live" | "offline"
 	Health     string `json:"health"`      // "ok" | "working" | "prompt" | "offline"
 	PromptOpen bool   `json:"prompt_open"` // a permission prompt is hook-attested open
+
+	// Fields are plugin-set key/value annotations (docs/plugins.md set-field):
+	// expertise tags, last-memory-save stamps, whatever a plugin wants to pin
+	// on a contact. Capped at maxContactFields; surfaced in /api/status.
+	Fields map[string]string `json:"fields,omitempty"`
 }
+
+// maxContactFields bounds plugin annotations per contact so a chatty plugin
+// can't bloat contacts.json.
+const maxContactFields = 16
 
 // copy returns a detached copy safe to hand out from under the registry lock.
 func (c *Contact) copy() *Contact {
@@ -190,11 +199,16 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 	for n := 2; r.liveNameTaken(final, c); n++ {
 		final = fmt.Sprintf("%s-%d", name, n)
 	}
+	reason := "revive"
 	if c == nil {
+		reason = "connect"
 		c = &Contact{ID: newID(), Name: final, Directory: directory}
 		r.contacts[c.ID] = c
 	} else {
 		c.Name = final
+	}
+	if final != name {
+		reason = "suffixed"
 	}
 	c.SessionID = sessionID
 	c.TmuxTarget = tmuxTarget
@@ -202,6 +216,7 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 	c.Health = "ok"
 	c.PromptOpen = false
 	r.save()
+	dispatchPluginEvent("agent.connect", c, map[string]any{"reason": reason})
 	return c.copy()
 }
 
@@ -397,9 +412,36 @@ func (r *Registry) SetHealth(id, health string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if c, ok := r.contacts[id]; ok && c.Status == "live" {
+		wasWorking := c.Health == "working"
 		c.Health = health
 		r.save()
+		if wasWorking && health == "ok" {
+			// The tail went quiet after activity: the agent settled. This is
+			// the agent.idle plugins hear about (docs/plugins.md).
+			dispatchPluginEvent("agent.idle", c, nil)
+		}
 	}
+}
+
+// SetField pins a plugin annotation on a contact. Returns false when the
+// contact is unknown or the per-contact field cap would be exceeded by a new
+// key (updates to existing keys always succeed).
+func (r *Registry) SetField(id, key, value string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.contacts[id]
+	if !ok {
+		return false
+	}
+	if c.Fields == nil {
+		c.Fields = map[string]string{}
+	}
+	if _, exists := c.Fields[key]; !exists && len(c.Fields) >= maxContactFields {
+		return false
+	}
+	c.Fields[key] = value
+	r.save()
+	return true
 }
 
 // SessionHeldByOther reports whether a live contact other than exceptID is

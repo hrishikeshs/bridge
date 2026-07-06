@@ -125,6 +125,7 @@ func runServe(port int) error {
 		fmt.Printf("(push disabled: %v)\n", err)
 	}
 	loadPushSubs()
+	initPlugins() // hook runtime: docs/plugins.md
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
@@ -403,16 +404,17 @@ func handlePair(w http.ResponseWriter, r *http.Request, id string) {
 // handleStatus returns the roster and daemon version.
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	type item struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		Directory string `json:"directory"`
-		Status    string `json:"status"`
-		Health    string `json:"health"`
-		Attention bool   `json:"attention"`
+		ID        string            `json:"id"`
+		Name      string            `json:"name"`
+		Directory string            `json:"directory"`
+		Status    string            `json:"status"`
+		Health    string            `json:"health"`
+		Attention bool              `json:"attention"`
+		Fields    map[string]string `json:"fields,omitempty"` // plugin annotations
 	}
 	items := []item{}
 	for _, c := range registry.Roster() {
-		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen})
+		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Fields})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"contacts": items, "version": version})
 }
@@ -531,6 +533,7 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 	releaseClientID(req.ClientID, true) // delivered: a retry is now a safe duplicate ack
 	audit("send", c.Name+": "+req.Text, id)
 	Emit("sent", c.ID, c.Name, req.Text, req.ClientID)
+	dispatchPluginEvent("message.in", c, map[string]any{"text": req.Text, "via": "phone"})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -623,6 +626,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request, id string) {
 	releaseClientID(req.ClientID, true) // delivered: a retry is now a safe duplicate ack
 	audit("upload", fmt.Sprintf("%s <- %s (%d bytes)", c.Name, pathOnDisk, len(img)), id)
 	Emit("sent", c.ID, c.Name, strings.TrimSpace(req.Text)+" 📷 photo", req.ClientID)
+	dispatchPluginEvent("message.in", c, map[string]any{"text": msg, "via": "phone"})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -681,6 +685,7 @@ func handleLocal(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/local/lockdown":
 		revokeAllDevices()
 		audit("lockdown", "revoke-all + shutdown", "local")
+		pluginOff.Store(true) // no plugin runs again this process (docs/plugins.md)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		requestShutdown()
 	case r.Method == http.MethodPost && r.URL.Path == "/local/push-test":
@@ -770,6 +775,7 @@ func handleLocalEvent(w http.ResponseWriter, r *http.Request) {
 		registry.SetPrompt(c.ID, true)
 		Emit("attention", c.ID, c.Name, snapshot)
 		notifyPush(c.Name+" needs you", firstPromptLine(snapshot), "attn-"+c.ID, c.ID)
+		dispatchPluginEvent("permission.prompt", c, map[string]any{"prompt": firstPromptLine(snapshot)})
 	} else {
 		if c.PromptOpen {
 			registry.SetPrompt(c.ID, false)
@@ -808,6 +814,7 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 		audit("agent-send", senderName+": "+req.Text, "local")
 		Emit("reply", senderID, senderName, req.Text)
 		notifyPush(senderName, req.Text, "msg-"+senderID, senderID)
+		dispatchPluginEvent("reply.out", registry.Resolve(senderID), map[string]any{"text": req.Text})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
