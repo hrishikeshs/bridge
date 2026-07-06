@@ -27,6 +27,80 @@ mkdir -p "$HOME_DIR/.bridge"
 # header; per-device pairing tokens are still enforced.
 printf '%s\n' '{"require_identity": false}' > "$HOME_DIR/.bridge/config.json"
 
+# --- plugin runtime fixtures (installed BEFORE the daemon boots) ----------
+# docs/plugins.md: discovery scans ~/.bridge/plugins/ at daemon start and lazily
+# on dir-mtime change per dispatch. Installing the fixtures before boot is the
+# deterministic path (no race with a first dispatch). Three fixtures:
+#   smoke-recorder  — well-behaved: records envelopes, emits set-field + emit
+#   smoke-garbage   — prints non-JSON on stdout (must be dropped, not fatal)
+#   smoke-badperm   — world-writable (mode 0777): must be REFUSED, never run
+PLUGINS_DIR="$HOME_DIR/.bridge/plugins"
+mkdir -p "$PLUGINS_DIR"
+chmod 700 "$PLUGINS_DIR"   # spec: plugins dir must be 0700, owned by the daemon uid
+
+# Absolute marker paths under $TESTDIR so the "did it run?" assertions don't
+# depend on $BRIDGE_PLUGIN_HOME (which the daemon only creates for a plugin it
+# actually runs — so a refused plugin has none).
+GARBAGE_MARKER="$TESTDIR/garbage-ran"   # appears once the garbage plugin runs
+BADPERM_MARKER="$TESTDIR/badperm-ran"   # must NEVER appear (plugin is refused)
+
+# Fixture 1 — smoke-recorder: listens to message.in + tick. On every event it
+# appends the raw stdin envelope to $BRIDGE_PLUGIN_HOME/events.log, and when the
+# event carries a contact it emits set-field + emit for that contact. Pins the
+# stdin-envelope, BRIDGE_PLUGIN_HOME, set-field and emit clauses.
+cat > "$PLUGINS_DIR/smoke-recorder" <<'REC'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "manifest" ]; then
+  printf '%s\n' '{"name":"smoke-recorder","events":["message.in","tick"]}'
+  exit 0
+fi
+[ "${1:-}" = "event" ] || exit 0
+env_json="$(cat)"
+mkdir -p "${BRIDGE_PLUGIN_HOME:?BRIDGE_PLUGIN_HOME unset}"
+printf '%s\n' "$env_json" >> "$BRIDGE_PLUGIN_HOME/events.log"
+# The contact id (empty for tick, which carries no contact).
+cid="$(printf '%s' "$env_json" | python3 -c 'import json,sys
+try: e=json.load(sys.stdin)
+except Exception: sys.exit(0)
+print((e.get("contact") or {}).get("id") or "")')"
+[ -n "$cid" ] || exit 0
+printf '{"action":"set-field","contact":"%s","key":"smoke","value":"seen"}\n' "$cid"
+printf '{"action":"emit","contact":"%s","text":"smoke-recorder saw an event"}\n' "$cid"
+REC
+chmod 700 "$PLUGINS_DIR/smoke-recorder"
+
+# Fixture 2 — smoke-garbage: listens to message.in, drains stdin, records that
+# it ran, then prints unparseable garbage. The runtime must drop the garbage
+# (audited) and keep serving. Unquoted heredoc bakes in the marker path.
+cat > "$PLUGINS_DIR/smoke-garbage" <<GARB
+#!/usr/bin/env bash
+if [ "\${1:-}" = "manifest" ]; then
+  printf '%s\n' '{"name":"smoke-garbage","events":["message.in"]}'
+  exit 0
+fi
+[ "\${1:-}" = "event" ] || exit 0
+cat >/dev/null
+: > "$GARBAGE_MARKER"
+printf '%s\n' 'not json at all }{ <<< garbage'
+GARB
+chmod 700 "$PLUGINS_DIR/smoke-garbage"
+
+# Fixture 3 — smoke-badperm: would record on any event, but is made 0777 =
+# executable (so discovery considers it) AND world+group-writable (so the
+# runtime must refuse it per docs/plugins.md "Trust boundary"). A plain 0666
+# file would just be skipped as non-executable, exercising a different path.
+cat > "$PLUGINS_DIR/smoke-badperm" <<BADP
+#!/usr/bin/env bash
+if [ "\${1:-}" = "manifest" ]; then
+  printf '%s\n' '{"name":"smoke-badperm","events":["message.in"]}'
+  exit 0
+fi
+[ "\${1:-}" = "event" ] || exit 0
+: > "$BADPERM_MARKER"
+BADP
+chmod 0777 "$PLUGINS_DIR/smoke-badperm"
+
 SERVER_PID=""
 cleanup() {
   [ -n "$SERVER_PID" ] && { pkill -P "$SERVER_PID" 2>/dev/null || true; kill "$SERVER_PID" 2>/dev/null || true; }
@@ -229,6 +303,96 @@ if nslookup -timeout=3 web.push.apple.com >/dev/null 2>&1; then
   check "push subscribe real host -> 200"  200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$SUB_APPLE" $BASE/api/push/subscribe)"
 else
   echo "skip - push subscribe real host (no DNS)"
+fi
+
+# --- plugin runtime (docs/plugins.md) -------------------------------------
+# The three fixtures were installed into the isolated daemon's plugins dir
+# BEFORE it booted (top of this script), so discovery loaded them at start /
+# first dispatch. We drive one event through and assert on plugin-produced
+# state — fields, feed, marker files — never on send-keys side effects: the
+# smoke contact rides tmux_target "@999", so nothing ever reaches a terminal.
+#
+# NOTE (spec corner these checks assume): in this harness a send can never truly
+# "deliver" (there is no real tmux window; deliverToSession always fails), so
+# checks (a)/(b) require the runtime to fire message.in when a phone message is
+# ACCEPTED for a known contact (live-attempt OR mailbox-queue), independent of
+# send-keys success. If message.in is gated on successful delivery it is simply
+# unobservable here.
+
+# smoke-agent is retired to offline by the reconcile loop (tmux @999 is dead);
+# wait for that so the trigger send lands on a deterministic accept path.
+for _ in $(seq 40); do
+  curl -s "${DEV_AUTH[@]}" $BASE/api/status | grep -q '"offline"' && break
+  sleep 0.25
+done
+
+# The message.in trigger: a phone->agent send with no client_id (always
+# processed). To the offline smoke-agent it is accepted and mailboxed (409).
+PLUGIN_SEND_BODY="{\"agent\":\"$CNAME\",\"text\":\"plugin runtime trigger\"}"
+check "plugin trigger send accepted (offline -> 409)" 409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$PLUGIN_SEND_BODY" $BASE/api/send)"
+
+# (a) recorder ran on message.in and its envelope names the right contact. It
+#     appends every envelope to $BRIDGE_PLUGIN_HOME/events.log; tick envelopes
+#     also land there, so we match the message.in line specifically.
+REC_LOG="$HOME_DIR/.bridge/plugins/smoke-recorder.d/events.log"
+ran=n
+for _ in $(seq 40); do
+  if [ -f "$REC_LOG" ] && grep -q '"event":"message.in"' "$REC_LOG" && grep -q "\"name\":\"$CNAME\"" "$REC_LOG"; then
+    ran=y; break
+  fi
+  sleep 0.25
+done
+if [ "$ran" = y ]; then
+  pass_msg "plugin ran on message.in carrying contact '$CNAME' (envelope recorded)"
+else
+  fail_msg "recorder logged no message.in envelope for '$CNAME' (see $REC_LOG)"
+fi
+
+# (b) recorder's set-field action is persisted and surfaced in /api/status.
+seen=n
+for _ in $(seq 40); do
+  case "$(curl -s "${DEV_AUTH[@]}" $BASE/api/status)" in
+    *'"smoke":"seen"'*) seen=y; break ;;
+  esac
+  sleep 0.25
+done
+if [ "$seen" = y ]; then
+  pass_msg "set-field persisted + surfaced in /api/status (smoke=seen)"
+else
+  fail_msg "set-field not visible in /api/status (needs Contact.fields wired daemon-side)"
+fi
+
+# (d) a garbage-printing plugin is dropped, not fatal: it still ran (marker),
+#     and the daemon keeps serving both /api/status and the send path after.
+ran=n
+for _ in $(seq 40); do
+  [ -e "$GARBAGE_MARKER" ] && { ran=y; break; }
+  sleep 0.25
+done
+if [ "$ran" = y ]; then
+  pass_msg "garbage-printing plugin ran (its stdout was dropped, not fatal)"
+else
+  fail_msg "garbage plugin never ran (marker $GARBAGE_MARKER absent)"
+fi
+check "daemon still serves after garbage plugin (status 200)" 200 "$(code "${DEV_AUTH[@]}" $BASE/api/status)"
+check "send path still serves after garbage plugin (offline -> 409)" 409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$PLUGIN_SEND_BODY" $BASE/api/send)"
+
+# (c) a world-writable plugin file is refused: it must NEVER run, and (since a
+#     refused plugin is never invoked) its name appears in the audit log only as
+#     a refusal.
+if [ -e "$BADPERM_MARKER" ]; then
+  fail_msg "world-writable plugin RAN ($BADPERM_MARKER present) — refusal failed"
+else
+  pass_msg "world-writable plugin refused (never ran)"
+fi
+if [ -f "$HOME_DIR/.bridge/audit.log" ]; then
+  if grep -q "smoke-badperm" "$HOME_DIR/.bridge/audit.log"; then
+    pass_msg "world-writable plugin refusal was audited"
+  else
+    fail_msg "audit log has no refusal line for 'smoke-badperm'"
+  fi
+else
+  echo "skip - audit log not reachable"
 fi
 
 # --- lockdown (LAST: it stops the daemon) ---------------------------------

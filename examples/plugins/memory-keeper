@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# memory-keeper — the reference bridge plugin (see docs/plugins.md).
+#
+# A bridge plugin is ONE executable the daemon calls two ways:
+#
+#   <exe> manifest   -> print a one-line JSON manifest, then exit.
+#   <exe> event      -> the event envelope arrives on stdin; print zero or more
+#                       action JSON objects (one per line) on stdout, then exit.
+#
+# That is the entire interface — language-agnostic, no library, no linking.
+# This plugin listens to the `tick` event (the daemon fires it every 60s) and,
+# for every agent that is "live" and has not been nudged in the last 4 hours,
+# types a gentle "save your progress" reminder into that agent's session.
+#
+# STATE: the last time we nudged each contact lives as one tiny file per
+# contact under $BRIDGE_PLUGIN_HOME — a private 0700 scratch dir the daemon
+# creates for us on first run. That is the only state a plugin needs here.
+#
+# INSTALL: copy this file into ~/.bridge/plugins/ and `chmod +x` it. That is
+# all an install is. (See examples/plugins/README.md.)
+
+# Fail loudly on any error, an unset variable, or a broken pipe — a plugin
+# should never limp along in a half-broken state.
+set -euo pipefail
+
+# ---- config ---------------------------------------------------------------
+INTERVAL=14400   # never nudge the same contact more than once per 4h (seconds)
+NUDGE_TEXT="…gentle reminder: consider saving your progress notes."
+
+# $BRIDGE_PLUGIN_HOME is set by the daemon (0700, one dir per plugin). Fall back
+# to a temp dir so the script is still runnable by hand while you develop it.
+STATE_DIR="${BRIDGE_PLUGIN_HOME:-${TMPDIR:-/tmp}/memory-keeper}"
+mkdir -p "$STATE_DIR"   # tolerate a missing/empty state dir
+
+# ---- manifest --------------------------------------------------------------
+# The manifest declares the plugin's name and exactly which events it wants.
+# `name` must match ^[a-z][a-z0-9-]{0,30}$ and be unique among loaded plugins.
+if [ "${1:-}" = "manifest" ]; then
+  printf '%s\n' '{"name":"memory-keeper","events":["tick"]}'
+  exit 0
+fi
+
+# Any invocation other than `event` (or a missing arg) is a no-op: the golden
+# rule of the runtime is that a plugin emits nothing but valid action JSON, so
+# when in doubt we print nothing and exit clean.
+[ "${1:-}" = "event" ] || exit 0
+
+# ---- event: read the tick envelope from stdin ------------------------------
+envelope="$(cat)"
+
+# Parse JSON with python3, never hand-rolled grep/sed: ask it to print the id
+# of every contact whose status is "live", one per line. A malformed or empty
+# envelope yields no ids at all (and therefore no actions), so the plugin
+# degrades quietly instead of crashing the run.
+live_ids="$(
+  printf '%s' "$envelope" | python3 -c '
+import json, sys
+try:
+    env = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)                        # unreadable envelope -> emit nothing
+# `tick` carries the roster under data.contacts (and no top-level contact).
+for c in (env.get("data") or {}).get("contacts") or []:
+    if c.get("status") == "live":
+        ident = c.get("id") or c.get("name")   # id is stable; name is the fallback
+        if ident:
+            print(ident)
+'
+)"
+
+now="$(date +%s)"
+
+# ---- decide + act ----------------------------------------------------------
+# For each live contact, nudge only if we have not nudged it within INTERVAL.
+# The per-contact stamp file makes the 4h window survive across ticks (and
+# across daemon restarts, since it lives on disk).
+while IFS= read -r ident; do
+  [ -n "$ident" ] || continue
+
+  # Never trust an identifier as a filename: keep only safe characters.
+  safe="$(printf '%s' "$ident" | tr -c 'A-Za-z0-9._-' '_')"
+  stamp="$STATE_DIR/last-nudge.$safe"
+
+  last=0
+  if [ -f "$stamp" ]; then
+    last="$(cat "$stamp" 2>/dev/null || printf '0')"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac   # ignore a garbled stamp
+  fi
+
+  if [ "$(( now - last ))" -ge "$INTERVAL" ]; then
+    # Build the action JSON with json.dumps so the id and text are always
+    # correctly quoted — same rule as parsing: don't hand-roll JSON.
+    printf '%s' "$ident" | python3 -c '
+import json, sys
+ident = sys.stdin.read()
+text  = sys.argv[1]
+print(json.dumps({"action": "nudge", "contact": ident, "text": text},
+                 ensure_ascii=False))
+' "$NUDGE_TEXT"
+    printf '%s' "$now" > "$stamp"   # remember we just nudged this contact
+  fi
+done <<EOF
+$live_ids
+EOF

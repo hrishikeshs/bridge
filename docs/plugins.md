@@ -64,7 +64,7 @@ Envelope, always:
 
 | event               | fires when                                            | data |
 |---------------------|--------------------------------------------------------|------|
-| `message.in`        | a phone message was delivered to an agent             | `{"text": …, "via": "phone"}` |
+| `message.in`        | a phone message was durably accepted for an agent — delivered live, or queued to its mailbox while offline | `{"text": …, "via": "phone", "queued": bool}` |
 | `reply.out`         | an agent reply was relayed to the phone               | `{"text": …}` |
 | `permission.prompt` | the hook shim reported a permission prompt            | `{"prompt": …}` |
 | `agent.connect`     | a contact registered or revived                        | `{"reason": "connect"\|"revive"\|"suffixed"}` |

@@ -516,6 +516,10 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		if c != nil {
 			registry.Queue(c.ID, MailMessage{From: authConfig.UserMention, Via: "phone", Text: req.Text, TS: nowUTC()})
 			releaseClientID(req.ClientID, true) // durably queued: a retry must not re-queue
+			// message.in fires on durable ACCEPT, not send-keys success — a
+			// queued message is in the system (same standard H1 holds the
+			// client_id to). data.queued lets plugins tell the paths apart.
+			dispatchPluginEvent("message.in", c, map[string]any{"text": req.Text, "via": "phone", "queued": true})
 		} else {
 			releaseClientID(req.ClientID, false) // nothing durable happened: allow the retry
 		}
@@ -533,7 +537,7 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 	releaseClientID(req.ClientID, true) // delivered: a retry is now a safe duplicate ack
 	audit("send", c.Name+": "+req.Text, id)
 	Emit("sent", c.ID, c.Name, req.Text, req.ClientID)
-	dispatchPluginEvent("message.in", c, map[string]any{"text": req.Text, "via": "phone"})
+	dispatchPluginEvent("message.in", c, map[string]any{"text": req.Text, "via": "phone", "queued": false})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -626,7 +630,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request, id string) {
 	releaseClientID(req.ClientID, true) // delivered: a retry is now a safe duplicate ack
 	audit("upload", fmt.Sprintf("%s <- %s (%d bytes)", c.Name, pathOnDisk, len(img)), id)
 	Emit("sent", c.ID, c.Name, strings.TrimSpace(req.Text)+" 📷 photo", req.ClientID)
-	dispatchPluginEvent("message.in", c, map[string]any{"text": msg, "via": "phone"})
+	dispatchPluginEvent("message.in", c, map[string]any{"text": msg, "via": "phone", "queued": false})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
