@@ -928,14 +928,16 @@ function appendPlain(container, chunk) {
   const el = document.createElement('span');
   el.className = 'plain';
   if (chunk.length > 1200) {
-    appendLinkified(el, chunk.slice(0, 1000) + '…');
+    const short = chunk.slice(0, 1000) + '…';
+    appendLinkified(el, short);
     const more = document.createElement('button');
     more.className = 'show-more';
     more.textContent = 'show more';
-    more.onclick = () => {
+    more.onclick = () => {   // a toggle, not a one-way door
+      const expanded = more.textContent === 'collapse';
       el.textContent = '';
-      appendLinkified(el, chunk);
-      more.remove();
+      appendLinkified(el, expanded ? short : chunk);
+      more.textContent = expanded ? 'show more' : 'collapse';
     };
     container.appendChild(el);
     container.appendChild(more);
@@ -1060,11 +1062,16 @@ function promptExcerpt(text) {
   const pre = document.createElement('pre');
   const lines = (text || '').split('\n');
   if (lines.length > 4) {
-    pre.textContent = lines.slice(-4).join('\n');
+    const excerpt = lines.slice(-4).join('\n');
+    pre.textContent = excerpt;
     const more = document.createElement('button');
     more.className = 'show-more';
     more.textContent = 'show full prompt';
-    more.onclick = () => { pre.textContent = text; more.remove(); };
+    more.onclick = () => {   // a toggle, not a one-way door
+      const expanded = more.textContent === 'collapse';
+      pre.textContent = expanded ? excerpt : text;
+      more.textContent = expanded ? 'show full prompt' : 'collapse';
+    };
     const wrap = document.createElement('div');
     wrap.appendChild(more);
     wrap.appendChild(pre);
