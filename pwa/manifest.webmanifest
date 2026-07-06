@@ -4,8 +4,8 @@
   "description": "Text your contacts from anywhere on your tailnet.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#0d1117",
-  "theme_color": "#0d1117",
+  "background_color": "#FAF5EC",
+  "theme_color": "#FAF5EC",
   "icons": [
     { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
     { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },

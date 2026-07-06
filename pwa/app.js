@@ -5,6 +5,52 @@
 
 const $ = (id) => document.getElementById(id);
 
+/* ---------- theme ----------
+   Every colour is a CSS custom property; three [data-theme] palettes live in
+   style.css. Golden Hour is the default (the base :root values + the manifest
+   colours), so an unset attribute renders it with no flash. We apply the saved
+   theme as the very first thing app.js does — the CSP forbids an inline <script>
+   in <head>, so this is the earliest hook; a non-default theme may show one
+   Golden-Hour frame before this runs, which is acceptable. */
+
+const THEMES = ['golden-hour', 'dusk', 'international-orange'];
+// <meta name="theme-color"> per theme (browser/PWA chrome tint). The manifest
+// is static, so its theme_color/background_color track the default only.
+const THEME_META = {
+  'golden-hour': '#FAF5EC',
+  'dusk': '#141B26',
+  'international-orange': '#1C3A5E',
+};
+// Picker copy + a 5-swatch preview (ground, outbound, inbound, accent, resolved).
+const THEME_INFO = {
+  'golden-hour': { name: 'Golden Hour',
+    swatches: ['#FAF5EC', '#D3653B', '#EAF0F6', '#4E739F', '#59805D'] },
+  'dusk': { name: 'Dusk',
+    swatches: ['#141B26', '#DF7B4E', '#26344A', '#8AAAC9', '#7FB287'] },
+  'international-orange': { name: 'International Orange',
+    swatches: ['#1C3A5E', '#C8432B', '#EEF2F6', '#4C7FB5', '#55875B'] },
+};
+
+function currentTheme() {
+  const t = localStorage.getItem('theme');
+  return THEMES.includes(t) ? t : 'golden-hour';
+}
+
+function applyTheme(theme) {
+  if (!THEMES.includes(theme)) theme = 'golden-hour';
+  document.documentElement.setAttribute('data-theme', theme);
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', THEME_META[theme]);
+}
+
+function setTheme(theme) {
+  if (!THEMES.includes(theme)) return;
+  localStorage.setItem('theme', theme);
+  applyTheme(theme);
+}
+
+applyTheme(currentTheme());
+
 const HEALTH_LABELS = { working: 'working', prompt: 'waiting on you', offline: 'offline' };
 const STATE_GLYPH = { sending: '🕐', sent: '✓', failed: '⚠️', queued: '📮' };
 
@@ -349,12 +395,82 @@ function selectContactIfValid(id) {
 
 $('back-btn').addEventListener('click', () => history.back());
 
-// Settings entry point. The only setting today is notifications: the gear
-// (re)requests permission and reveals the enable-push control where relevant.
-$('settings-btn').addEventListener('click', async () => {
+/* ---------- settings sheet ---------- */
+
+// The gear opens a slide-up sheet: a theme picker (applies + persists on tap)
+// and the notification control (state + enable flow, relocated from the gear).
+$('settings-btn').addEventListener('click', openSettings);
+$('settings-close').addEventListener('click', closeSettings);
+$('settings-backdrop').addEventListener('click', closeSettings);
+$('notif-row').addEventListener('click', async () => {
   await requestNotifyPermission();
   updatePushButton();
+  renderNotifState();
 });
+
+function openSettings() {
+  renderThemeOptions();
+  renderNotifState();
+  $('settings-sheet').classList.remove('hidden');
+}
+
+function closeSettings() {
+  $('settings-sheet').classList.add('hidden');
+}
+
+function renderThemeOptions() {
+  const box = $('theme-options');
+  const active = currentTheme();
+  box.innerHTML = '';
+  for (const key of THEMES) {
+    const info = THEME_INFO[key];
+    const row = document.createElement('button');
+    row.className = 'theme-row';
+
+    const name = document.createElement('span');
+    name.className = 'theme-name';
+    name.textContent = info.name;
+
+    const strip = document.createElement('span');
+    strip.className = 'swatches';
+    for (const c of info.swatches) {
+      const sw = document.createElement('span');
+      sw.className = 'swatch';
+      sw.style.background = c;   // CSSOM write — allowed by the style-src CSP
+      strip.appendChild(sw);
+    }
+
+    const check = document.createElement('span');
+    check.className = 'check';
+    check.textContent = key === active ? '✓' : '';
+
+    row.appendChild(name);
+    row.appendChild(strip);
+    row.appendChild(check);
+    row.onclick = () => { setTheme(key); renderThemeOptions(); };
+    box.appendChild(row);
+  }
+}
+
+function renderNotifState() {
+  const el = $('notif-state');
+  const row = $('notif-row');
+  const supported = 'Notification' in window &&
+    'serviceWorker' in navigator && 'PushManager' in window;
+  if (!supported) {
+    el.textContent = 'Notifications · not supported here';
+    row.disabled = true;
+  } else if (Notification.permission === 'granted') {
+    el.textContent = 'Notifications · On';
+    row.disabled = true;
+  } else if (Notification.permission === 'denied') {
+    el.textContent = 'Notifications · blocked in iOS Settings';
+    row.disabled = true;
+  } else {
+    el.textContent = 'Notifications · tap to enable';
+    row.disabled = false;
+  }
+}
 
 /* ---------- conversation list ---------- */
 
@@ -417,6 +533,17 @@ function makeRow(contact) {
   top.appendChild(name);
   top.appendChild(time);
 
+  main.appendChild(top);
+  // Away/status one-liner from the plugin fields map; omitted when absent so
+  // it never leaves an empty gap.
+  const status = contact.fields && contact.fields.status;
+  if (status) {
+    const st = document.createElement('span');
+    st.className = 'row-status';
+    st.textContent = status;
+    main.appendChild(st);
+  }
+
   const bottom = document.createElement('span');
   bottom.className = 'row-bottom';
   const preview = document.createElement('span');
@@ -433,7 +560,6 @@ function makeRow(contact) {
     bottom.appendChild(badge);
   }
 
-  main.appendChild(top);
   main.appendChild(bottom);
   row.appendChild(main);
   return row;
@@ -448,11 +574,15 @@ function monogram(name) {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
+// Deterministic per-name hue → a 135° gradient (base hue to a darker stop),
+// richer than a flat disc. Assigned via the CSSOM (el.style.background), which
+// the strict style-src CSP allows — unlike a string style attribute.
 function avatarColor(name) {
   let h = 0;
   const s = name || '';
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return 'hsl(' + (h % 360) + ' 42% 42%)';   // muted, dark-theme friendly
+  const hue = h % 360;
+  return 'linear-gradient(135deg, hsl(' + hue + ' 52% 50%), hsl(' + hue + ' 56% 34%))';
 }
 
 // The one-line row preview. Precedence per the charter: live typing → open
@@ -553,8 +683,10 @@ function renderFeed() {
   const feed = $('feed');
   const stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
   feed.innerHTML = '';
+  const events = visibleEvents();
+  const resolutions = resolveAttentions(events);   // attn event id -> resolution
   let lastDay = '';
-  for (const event of visibleEvents()) {
+  for (const event of events) {
     const day = (event.ts || '').slice(0, 10);   // group by calendar day
     if (day && day !== lastDay) {
       lastDay = day;
@@ -563,7 +695,7 @@ function renderFeed() {
       sep.textContent = dayLabel(event.ts);       // Today / Yesterday / date
       feed.appendChild(sep);
     }
-    feed.appendChild(renderEvent(event));
+    feed.appendChild(renderEvent(event, resolutions.get(event.id)));
   }
   for (const msg of visiblePending()) feed.appendChild(renderPending(msg));
   const now = Date.now();
@@ -585,26 +717,24 @@ function contactName(id) {
   return contact && contact.name;
 }
 
-function renderEvent(event) {
+function renderEvent(event, resolution) {
+  if (event.type === 'attention') return attentionCard(event, resolution);
   const el = document.createElement('div');
   if (event.type === 'sent') {
     el.className = 'msg sent';
-    el.appendChild(who('you → ' + (event.name || '?'), event.ts));
+    el.appendChild(who('you → ' + (event.name || '?')));
     el.appendChild(richText(event.text));
+    appendStamp(el, event.ts);
   } else if (event.type === 'reply') {
     el.className = 'msg reply';
-    el.appendChild(who(event.name || '?', event.ts));
+    el.appendChild(who(event.name || '?'));
     el.appendChild(richText(event.text));
+    appendStamp(el, event.ts);
   } else if (event.type === 'mention') {
     el.className = 'msg mention';
-    el.appendChild(who((event.name || 'contact') + ' · @mention', event.ts));
+    el.appendChild(who((event.name || 'contact') + ' · @mention'));
     el.appendChild(richText(event.text));
-  } else if (event.type === 'attention') {
-    el.className = 'attention' +
-      (state.attentions.get(event.agent) === event ? '' : ' resolved');
-    el.appendChild(who((event.name || '?') + ' needs your attention', event.ts));
-    el.appendChild(promptExcerpt(event.text));
-    el.appendChild(approveKeys(event));
+    appendStamp(el, event.ts);
   } else {
     el.className = 'msg system';
     el.textContent = (event.name || '') + ' · ' + event.type +
@@ -620,7 +750,7 @@ function renderEvent(event) {
 function renderPending(msg) {
   const el = document.createElement('div');
   el.className = 'msg sent pending ' + msg.mstate;
-  const w = who('you → ' + msg.name, msg.ts);
+  const w = who('you → ' + msg.name);
   const badge = document.createElement('span');
   badge.className = 'mstate';
   badge.textContent = ' ' + (STATE_GLYPH[msg.mstate] || '');
@@ -641,6 +771,7 @@ function renderPending(msg) {
     retry.onclick = () => deliver(msg);
     el.appendChild(retry);
   }
+  appendStamp(el, msg.ts);
   return el;
 }
 
@@ -658,11 +789,22 @@ function typingBubble(name) {
   return el;
 }
 
-function who(label, ts) {
+function who(label) {
   const el = document.createElement('span');
   el.className = 'who';
-  el.textContent = label + (ts ? '  ' + localTime(ts) : '');
+  el.textContent = label;
   return el;
+}
+
+// Timestamp inside the bubble, bottom-right (styled by .msg .stamp). No-op
+// when the event carries no parseable time.
+function appendStamp(bubble, ts) {
+  const t = localTime(ts);
+  if (!t) return;
+  const el = document.createElement('span');
+  el.className = 'stamp';
+  el.textContent = t;
+  bubble.appendChild(el);
 }
 
 function localTime(ts) {
@@ -786,6 +928,70 @@ function appendThinking(container, thought) {
 }
 
 /* ---------- attention cards ---------- */
+
+/* Walk one contact's events in order and decide, for each `attention`, whether
+   a LATER event resolved it — so a stale prompt collapses instead of lingering.
+   Resolution is the FIRST of: an `approved` (a key sent from the phone → shown
+   "Approved from phone"), an `attention-clear` (resolved at the desk / timed
+   out / post-approval → "Resolved"), or a newer `attention` superseding it
+   (also "Resolved"). The first resolver wins, so an approve followed by the
+   daemon's own attention-clear still reads as "Approved from phone". An
+   attention with no later resolver stays live (absent from the map).
+   Returns Map(attentionEventId -> { kind: 'approved'|'cleared', ts }). */
+function resolveAttentions(events) {
+  const res = new Map();
+  let open = null;   // the currently-unresolved attention, if any
+  for (const e of events) {
+    if (e.type === 'attention') {
+      if (open) res.set(open.id, { kind: 'cleared', ts: e.ts });   // superseded
+      open = e;
+    } else if (e.type === 'approved') {
+      if (open) { res.set(open.id, { kind: 'approved', ts: e.ts }); open = null; }
+    } else if (e.type === 'attention-clear') {
+      if (open) { res.set(open.id, { kind: 'cleared', ts: e.ts }); open = null; }
+    }
+  }
+  return res;   // `open` (if set) is the one live card — deliberately not added
+}
+
+// First meaningful line of a captured prompt for the collapsed card: strip
+// TUI box-drawing / bullet noise and return the first line with real content.
+function firstLine(text) {
+  const lines = (text || '').split('\n');
+  let fallback = '';
+  for (const raw of lines) {
+    const cleaned = raw.replace(/[│╭╮╰╯─┌┐└┘|>❯•*\s]+/g, ' ').trim();
+    if (/[A-Za-z0-9]/.test(cleaned)) return cleaned;
+    if (!fallback && raw.trim()) fallback = raw.trim();
+  }
+  return fallback || '(prompt)';
+}
+
+/* An attention event. Live → the full tappable approval card. Resolved →
+   collapsed: one dimmed prompt line + a resolution line, no buttons. */
+function attentionCard(event, resolution) {
+  const el = document.createElement('div');
+  el.className = 'attention';
+  if (resolution) {
+    el.classList.add('resolved');
+    el.appendChild(who((event.name || '?') + ' needed your attention'));
+    const snippet = document.createElement('div');
+    snippet.className = 'attn-snippet';
+    snippet.textContent = firstLine(event.text);
+    el.appendChild(snippet);
+    const done = document.createElement('div');
+    done.className = 'attn-resolved';
+    const label = resolution.kind === 'approved'
+      ? '✓ Approved from phone' : '✓ Resolved';
+    done.textContent = label + ' · ' + localTime(resolution.ts);
+    el.appendChild(done);
+  } else {
+    el.appendChild(who((event.name || '?') + ' needs your attention'));
+    el.appendChild(promptExcerpt(event.text));
+    el.appendChild(approveKeys(event));
+  }
+  return el;
+}
 
 function promptExcerpt(text) {
   const pre = document.createElement('pre');
