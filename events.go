@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -233,6 +234,10 @@ func loadHistory() {
 	// Disk order isn't guaranteed to match id order (M9 appends outside the lock),
 	// so sort by id before trimming so we keep the genuinely newest events.
 	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	// A compaction rewrite can race a lock-free append, landing the same id on
+	// disk twice; drop the adjacent duplicates the sort just grouped so a restart
+	// can't resurrect a doubled bubble (#8).
+	all = slices.CompactFunc(all, func(a, b Event) bool { return a.ID == b.ID })
 	if len(all) > historySize {
 		all = all[len(all)-historySize:]
 	}

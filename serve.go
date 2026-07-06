@@ -233,38 +233,54 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 }
 
 var (
-	seenMu  sync.Mutex
-	seenIDs []string
+	seenMu   sync.Mutex
+	seenIDs  []string
+	inFlight = map[string]bool{}
 )
 
-// seenClientID reports whether id was already committed as a durable success.
-// It only reads: a repeated id is a real duplicate solely when the *first*
-// attempt succeeded, so recording is deferred to commitClientID (after delivery
-// or mailbox queueing), never here (H1). A blank id is never a duplicate.
-func seenClientID(id string) bool {
+// claimClientID reserves a client_id for delivery under a single lock, closing
+// the TOCTOU window the H1 dedup split reintroduced (#3). It returns true only
+// when id is neither already committed (a completed send) nor currently
+// in-flight, and in that case marks it in-flight: the caller then owns the claim
+// and MUST resolve it once via releaseClientID. A false return is a real
+// duplicate — the first attempt already succeeded, or a racing retry's original
+// delivery is still running — so the caller acks it without delivering, and two
+// racing retries can never both send-keys. A blank id can't be deduped, so it is
+// always claimed and never tracked (its release is a no-op).
+func claimClientID(id string) bool {
 	if id == "" {
-		return false
+		return true
 	}
 	seenMu.Lock()
 	defer seenMu.Unlock()
 	for _, s := range seenIDs {
 		if s == id {
-			return true
+			return false
 		}
 	}
-	return false
+	if inFlight[id] {
+		return false
+	}
+	inFlight[id] = true
+	return true
 }
 
-// commitClientID records id as durably handled (delivered to a live session or
-// queued to a mailbox) so a later retry is acknowledged without redelivery.
-// Because it runs only after success, a failed send leaves no trace and its
-// retry runs for real instead of being swallowed as a "duplicate" (H1).
-func commitClientID(id string) {
+// releaseClientID resolves a claim taken by claimClientID. It clears the
+// in-flight mark either way; when ok it also records id as durably handled
+// (delivered to a live session or queued to a mailbox) so a later retry is
+// acknowledged without redelivery. A failed attempt (ok=false) leaves no trace,
+// so its retry runs for real instead of being swallowed as a "duplicate" —
+// preserving H1's guarantee that an id is committed only after a durable accept.
+func releaseClientID(id string, ok bool) {
 	if id == "" {
 		return
 	}
 	seenMu.Lock()
 	defer seenMu.Unlock()
+	delete(inFlight, id)
+	if !ok {
+		return
+	}
 	for _, s := range seenIDs {
 		if s == id {
 			return // already recorded
@@ -477,10 +493,13 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too-long"})
 		return
 	}
-	// Check up front: only a client_id from a previously *successful* send is a
-	// duplicate. A failed attempt was never committed, so its retry falls through
-	// and runs for real instead of being acked as a no-op (H1).
-	if seenClientID(req.ClientID) {
+	// Reserve the client_id before delivering: a completed send, or a racing
+	// retry whose original delivery is still in flight, is acked as a duplicate
+	// without re-delivering — closing the window where the phone's 10s-timeout
+	// retry and the slow original both reach send-keys (#3). The claim is
+	// released below: committed on a durable accept, dropped on failure so a
+	// genuine retry runs for real (H1).
+	if !claimClientID(req.ClientID) {
 		audit("send-duplicate-dropped", req.Text, id)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "duplicate": true})
 		return
@@ -490,7 +509,9 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 	if c == nil || c.Status != "live" {
 		if c != nil {
 			registry.Queue(c.ID, MailMessage{From: authConfig.UserMention, Via: "phone", Text: req.Text, TS: nowUTC()})
-			commitClientID(req.ClientID) // durably queued: a retry must not re-queue
+			releaseClientID(req.ClientID, true) // durably queued: a retry must not re-queue
+		} else {
+			releaseClientID(req.ClientID, false) // nothing durable happened: allow the retry
 		}
 		audit("send-offline", req.Agent, id)
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
@@ -498,11 +519,12 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	if err := deliverToSession(c, formatInbound(authConfig.UserMention, "phone", req.Text)); err != nil {
+		releaseClientID(req.ClientID, false) // failed: leave no trace so the retry runs (H1)
 		audit("send-failed", err.Error(), id)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	commitClientID(req.ClientID) // delivered: a retry is now a safe duplicate ack
+	releaseClientID(req.ClientID, true) // delivered: a retry is now a safe duplicate ack
 	audit("send", c.Name+": "+req.Text, id)
 	Emit("sent", c.ID, c.Name, req.Text, req.ClientID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -564,32 +586,37 @@ func handleUpload(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-image"})
 		return
 	}
-	// Only a client_id from a previously *successful* upload is a duplicate; a
-	// failed attempt is never committed, so its retry re-runs (H1).
-	if seenClientID(req.ClientID) {
+	// Reserve the client_id (same TOCTOU-closing claim as handleSend, #3): a
+	// completed or still-in-flight upload is acked as a duplicate; the claim is
+	// released below — committed on delivery, dropped on any failure so the retry
+	// re-runs (H1).
+	if !claimClientID(req.ClientID) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "duplicate": true})
 		return
 	}
 	c := registry.Resolve(req.Agent)
 	if c == nil || c.Status != "live" {
+		releaseClientID(req.ClientID, false) // never delivered: allow the retry
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
 		return
 	}
 	pathOnDisk, err := saveAttachment(img)
 	if err != nil {
+		releaseClientID(req.ClientID, false) // nothing durable: allow the retry
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "save-failed"})
 		return
 	}
 	msg := fmt.Sprintf("%s [photo saved at %s — use the Read tool to view it]", strings.TrimSpace(req.Text), pathOnDisk)
 	if err := deliverToSession(c, formatInbound(authConfig.UserMention, "phone", msg)); err != nil {
-		// Delivery failed: don't orphan the just-written attachment, and don't
-		// commit the client_id, so the phone's retry re-attempts instead of the
+		// Delivery failed: don't orphan the just-written attachment, and release
+		// the claim uncommitted so the phone's retry re-attempts instead of the
 		// message (and file) being silently dropped (H1).
 		_ = os.Remove(pathOnDisk)
+		releaseClientID(req.ClientID, false)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	commitClientID(req.ClientID) // delivered: a retry is now a safe duplicate ack
+	releaseClientID(req.ClientID, true) // delivered: a retry is now a safe duplicate ack
 	audit("upload", fmt.Sprintf("%s <- %s (%d bytes)", c.Name, pathOnDisk, len(img)), id)
 	Emit("sent", c.ID, c.Name, strings.TrimSpace(req.Text)+" 📷 photo", req.ClientID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
