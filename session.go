@@ -390,34 +390,143 @@ const maxJSONLLine = 8 * 1024 * 1024
 // fall back to the newest .jsonl in the directory that no *other* live contact
 // is already tailing (never adopt a sibling's conversation — H2).
 func sessionFileFor(c *Contact) string {
-	// THE PANE IS THE AGENT. A managed window runs `claude --resume <id>` as
-	// its pane process, so the command line outranks both the registry pin and
-	// any newest-file guess. This rule exists because a staleness heuristic
-	// once adopted a sibling's shadow transcript in a shared directory and
-	// relayed one agent's words under another's name (the marvin incident,
-	// 2026-07-06) — idle is normal; identity is not inferred from mtimes.
-	if pane := paneSessionID(c); pane != "" {
-		if pane != c.SessionID {
-			registry.SetSession(c.ID, pane) // heal the pin to ground truth
-			audit("session-heal", c.Name+" -> "+pane[:8], "daemon")
-		}
-		return filepath.Join(projectDir(c.Directory), pane+".jsonl")
+	// Identity resolution, in authority order — each rung earned by a failure
+	// tonight: (1) the pane's launch id (`claude --resume <id>` — but it goes
+	// stale when compaction ROLLS the session id), (2) the rollover CHAIN:
+	// message-uuid continuity proves a successor file continues this exact
+	// conversation (content, never mtimes — the marvin incident), (3) the
+	// stored pin, already chain-healed, (4) newest-file only when the pinned
+	// file is MISSING entirely.
+	dir := projectDir(c.Directory)
+	base := paneSessionID(c)
+	if base == "" {
+		base = c.SessionID
 	}
-	if c.SessionID == "" {
+	if base == "" {
 		return currentSessionFile(c.Directory)
 	}
-	pinned := filepath.Join(projectDir(c.Directory), c.SessionID+".jsonl")
-	// No pane to consult (window mid-respawn, foreign host). Only a MISSING
-	// pinned file justifies the newest-file fallback; a quiet file is just an
-	// idle agent.
-	if _, err := os.Stat(pinned); err == nil {
-		return pinned
+	// A prior chain-heal stored a verified descendant; the pane still shows
+	// the launch id forever. Prefer the descendant when it is the fresher file.
+	if c.SessionID != "" && c.SessionID != base && fileNewer(dir, c.SessionID, base) {
+		base = c.SessionID
 	}
-	if alt := currentSessionFile(c.Directory); alt != "" && alt != pinned &&
-		!registry.SessionHeldByOther(sessionIDFromPath(alt), c.ID) {
-		return alt
+	path := filepath.Join(dir, base+".jsonl")
+	// When the resolved file has gone quiet, check (throttled) whether the
+	// session rolled forward under a new id.
+	if info, err := os.Stat(path); err != nil || time.Since(info.ModTime()) > 2*time.Minute {
+		if time.Since(chainChecked[c.ID]) > time.Minute {
+			chainChecked[c.ID] = time.Now()
+			if tip := sessionChainTip(dir, base); tip != base {
+				audit("session-follow", c.Name+" "+base[:8]+" -> "+tip[:8], "daemon")
+				base = tip
+				path = filepath.Join(dir, base+".jsonl")
+			}
+		}
 	}
-	return pinned
+	if base != c.SessionID {
+		registry.SetSession(c.ID, base)
+	}
+	if _, err := os.Stat(path); err != nil {
+		if alt := currentSessionFile(c.Directory); alt != "" && alt != path &&
+			!registry.SessionHeldByOther(sessionIDFromPath(alt), c.ID) {
+			return alt
+		}
+	}
+	return path
+}
+
+// chainChecked throttles rollover-chain scans per contact. Reconcile
+// goroutine only.
+var chainChecked = map[string]time.Time{}
+
+var parentUuidRe = regexp.MustCompile(`"parentUuid":"([0-9a-f-]{36})"`)
+
+// sessionChainTip follows clear/compaction rollovers from id to the current
+// tip. A successor file's earliest parented records reference message uuids
+// that live INSIDE the predecessor — cryptographic-strength continuity.
+func sessionChainTip(dir, id string) string {
+	for range [5]struct{}{} {
+		child := sessionChildOf(dir, id)
+		if child == "" {
+			return id
+		}
+		id = child
+	}
+	return id
+}
+
+// sessionChildOf finds the file that continues session id, if any.
+func sessionChildOf(dir, id string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	cur := filepath.Join(dir, id+".jsonl")
+	for _, e := range entries {
+		cand, ok := strings.CutSuffix(e.Name(), ".jsonl")
+		if !ok || cand == id {
+			continue
+		}
+		f, err := os.Open(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		head := make([]byte, 256*1024)
+		n, _ := io.ReadFull(f, head)
+		f.Close()
+		m := parentUuidRe.FindSubmatch(head[:n])
+		if m == nil {
+			continue
+		}
+		if fileContainsUUID(cur, string(m[1])) {
+			return cand
+		}
+	}
+	return ""
+}
+
+// fileContainsUUID streams (transcripts reach hundreds of MB) looking for the
+// record that owns uuid.
+func fileContainsUUID(path, uuid string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	needle := []byte(`"uuid":"` + uuid + `"`)
+	buf := make([]byte, 1<<20)
+	keep := 0
+	for {
+		n, err := f.Read(buf[keep:])
+		if n > 0 {
+			if bytes.Contains(buf[:keep+n], needle) {
+				return true
+			}
+			k := len(needle) - 1
+			if keep+n > k {
+				copy(buf, buf[keep+n-k:keep+n])
+				keep = k
+			} else {
+				keep += n
+			}
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
+// fileNewer reports whether a's transcript is more recently written than b's.
+func fileNewer(dir, a, b string) bool {
+	ia, ea := os.Stat(filepath.Join(dir, a+".jsonl"))
+	ib, eb := os.Stat(filepath.Join(dir, b+".jsonl"))
+	if ea != nil {
+		return false
+	}
+	if eb != nil {
+		return true
+	}
+	return ia.ModTime().After(ib.ModTime())
 }
 
 // paneSessionID reads the session id straight off the contact's pane: every
