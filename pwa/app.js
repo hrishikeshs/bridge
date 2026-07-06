@@ -90,8 +90,62 @@ function updateFog() {
     '--fog-density', String(fogDensity(new Date().getHours())));
 }
 
-setInterval(updateFog, 30 * 60 * 1000);   // re-check the weather twice an hour
+/* ---------- light (the Golden-Hour palette drift) ----------
+   The default theme is named for a moment of light, so it follows one. Same
+   spirit as the fog above — a month-keyed table and a little arithmetic, no
+   astronomy — but here the palette drifts through five phases across the day.
+   Each phase is a data-phase attribute on <html>; style.css maps it to a small
+   set of hue-token overrides, scoped to the golden-hour theme so the other
+   palettes never drift. 'day' is the anchor: it sets no overrides, so mid-day
+   is exactly the Golden Hour of before. */
+
+// Approximate SF sunrise/sunset by month, as the clock reads them (DST folded
+// in). Off by twenty minutes is fine — this is weather, not an almanac.
+//               Jan   Feb   Mar   Apr   May   Jun   Jul   Aug   Sep   Oct   Nov   Dec
+const SUNRISE = [7.4,  7.0,  7.1,  6.4,  6.0,  5.8,  6.0,  6.4,  6.9,  7.3,  6.9,  7.2];
+const SUNSET  = [17.2, 17.8, 19.0, 19.7, 20.2, 20.5, 20.4, 20.0, 19.3, 18.5, 17.0, 16.9];
+
+// The phase for a moment, keyed off that month's sun. The narrow bands
+// (dawn / golden / dusk) hug sunrise and sunset; day fills the long middle;
+// night is everything left over — the evening and the small hours.
+function solarPhase(date) {
+  const rise = SUNRISE[date.getMonth()];
+  const set  = SUNSET[date.getMonth()];
+  const h = date.getHours() + date.getMinutes() / 60;   // decimal local hour
+  if (h >= rise - 0.75 && h < rise + 1)   return 'dawn';    // 45m before → 1h after sunrise
+  if (h >= set - 1.5   && h < set)        return 'golden';  // last 90m of daylight
+  if (h >= set         && h < set + 0.75) return 'dusk';    // sunset → 45m after
+  if (h >= rise + 1    && h < set - 1.5)  return 'day';     // mid-morning → afternoon (anchor)
+  return 'night';
+}
+
+// Default ON; the settings toggle stores 'off' to opt out. Only an explicit
+// 'off' disables it, so the drift is on for everyone who never opens settings.
+function paletteFollowsSun() {
+  return localStorage.getItem('paletteSun') !== 'off';
+}
+
+// Off → the static day anchor (today's exact look). The attribute is inert
+// under the other themes; the CSS scoping guarantees it.
+function applyPhase() {
+  const phase = paletteFollowsSun() ? solarPhase(new Date()) : 'day';
+  document.documentElement.setAttribute('data-phase', phase);
+}
+
+function setPaletteSun(on) {
+  localStorage.setItem('paletteSun', on ? 'on' : 'off');
+  applyPhase();
+}
+
+// The weather (fog) and the light (palette) both key off the local hour, so
+// they re-check together on one timer, twice an hour.
+setInterval(() => { updateFog(); applyPhase(); }, 30 * 60 * 1000);
 applyWallpaper(currentWallpaper());
+applyPhase();
+// Arm the drift transition only after the first paint, so a phase correction
+// on a slow cold-load lands as a quiet snap (like the theme does) rather than
+// a 2.4s smear; every flip from here on dissolves gently.
+requestAnimationFrame(() => document.documentElement.classList.add('phase-animate'));
 
 const HEALTH_LABELS = { working: 'working', prompt: 'waiting on you', offline: 'offline' };
 const STATE_GLYPH = { sending: '🕐', sent: '✓', failed: '⚠️', queued: '📮' };
@@ -188,6 +242,9 @@ async function init() {
     }, 15000);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
+        // A phone reopened hours later shouldn't still be wearing noon — read
+        // the light for the current time before anything else repaints.
+        applyPhase();
         // Waking from a sleep/background gap: a source that heard nothing for
         // 35s+ may be a zombie whose readyState still lies OPEN — recycle it
         // rather than trusting connectEvents' early-return (H12).
@@ -661,6 +718,7 @@ async function saveMyStatus(text) {
 function openSettings() {
   renderThemeOptions();
   renderWallpaperOptions();
+  renderPaletteSun();
   renderNotifState();
   $('mystatus-input').value = state.myStatus || '';
   $('settings-sheet').classList.remove('hidden');
@@ -684,6 +742,40 @@ function renderWallpaperOptions() {
     row.onclick = () => { setWallpaper(key); renderWallpaperOptions(); };
     box.appendChild(row);
   }
+}
+
+// "Palette follows the sun" — a single on/off switch. The drift only touches
+// the Golden Hour palette, so the control is shown ONLY under that theme (the
+// whole section hides otherwise; the CSS scoping would make it inert there
+// anyway). role="switch" + aria-checked so it reads as a toggle to VoiceOver.
+function renderPaletteSun() {
+  const section = $('palette-sun-section');
+  const box = $('palette-sun-options');
+  const golden = currentTheme() === 'golden-hour';
+  section.classList.toggle('hidden', !golden);
+  box.textContent = '';
+  if (!golden) return;
+
+  const on = paletteFollowsSun();
+  const row = document.createElement('button');
+  row.className = 'sheet-row toggle-row';
+  row.setAttribute('role', 'switch');
+  row.setAttribute('aria-checked', on ? 'true' : 'false');
+
+  const label = document.createElement('span');
+  label.className = 'toggle-label';
+  label.textContent = 'Palette follows the sun';
+
+  const sw = document.createElement('span');
+  sw.className = on ? 'toggle on' : 'toggle';
+  const knob = document.createElement('span');
+  knob.className = 'toggle-knob';
+  sw.appendChild(knob);
+
+  row.appendChild(label);
+  row.appendChild(sw);
+  row.onclick = () => { setPaletteSun(!paletteFollowsSun()); renderPaletteSun(); };
+  box.appendChild(row);
 }
 
 function closeSettings() {
@@ -719,7 +811,8 @@ function renderThemeOptions() {
     row.appendChild(name);
     row.appendChild(strip);
     row.appendChild(check);
-    row.onclick = () => { setTheme(key); renderThemeOptions(); };
+    // Re-render the palette-sun control too: it appears only under Golden Hour.
+    row.onclick = () => { setTheme(key); renderThemeOptions(); renderPaletteSun(); };
     box.appendChild(row);
   }
 }

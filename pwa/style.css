@@ -109,6 +109,60 @@
   --header-dim: #AFC0D4;
 }
 
+/* ---------- Golden-Hour palette drift ----------
+   The default theme follows the real time of day: app.js sets data-phase from
+   the sun (see solarPhase), and each phase overrides a small set of hue-bearing
+   tokens — backgrounds, the accent, the inbound bubble, the day-pill and code
+   tints — never anything structural. Everything is scoped under
+   [data-theme="golden-hour"], so Dusk and International Orange never drift.
+   'day' is deliberately absent: it IS the base :root palette above, so mid-day
+   is pixel-for-pixel the Golden Hour of before — and the toggle's OFF state
+   (which pins data-phase="day") lands right back on it. Headers need no override
+   here: --header-bg is var(--ground), so it drifts with the ground for free.
+   The matching veil / fog / glass scenery tints live with the scenery tokens
+   further down. */
+
+/* dawn — cool, pale, a faint blue-pink cast (45m before → 1h after sunrise) */
+:root[data-theme="golden-hour"][data-phase="dawn"] {
+  --ground: #F4F1F2;
+  --surface: #FFFFFF;
+  --accent: #5B79A0;
+  --in-bg: #E9EEF5;
+  --pill-bg: #ECE7EC;
+  --code-bg: #F2EEF0;
+}
+
+/* golden — warm amber-gold, the theme's namesake; richest warmth (last 90m) */
+:root[data-theme="golden-hour"][data-phase="golden"] {
+  --ground: #FBF0DE;
+  --surface: #FFFDF8;
+  --accent: #B06A3C;
+  --in-bg: #F3E7D6;
+  --pill-bg: #F1E4CE;
+  --code-bg: #F6EBD8;
+}
+
+/* dusk — rose fading toward slate (sunset → 45m after) */
+:root[data-theme="golden-hour"][data-phase="dusk"] {
+  --ground: #F3EBEA;
+  --surface: #FDFBFB;
+  --accent: #6E6E8C;
+  --in-bg: #E7E3EC;
+  --pill-bg: #EBE2E2;
+  --code-bg: #F1EAEA;
+}
+
+/* night — dimmed, muted, slightly darker creams; evening light indoors, not
+   dark mode (the rest of the clock) */
+:root[data-theme="golden-hour"][data-phase="night"] {
+  --ground: #EFE9DB;
+  --surface: #F8F5EE;
+  --accent: #5A6E86;
+  --in-bg: #E3E6EC;
+  --pill-bg: #E8E1D2;
+  --code-bg: #F0EADC;
+}
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body { height: 100%; }
@@ -892,6 +946,31 @@ footer {
 .sheet-row:disabled { opacity: 0.55; }
 .sheet-row:active { background: var(--hairline); }
 
+/* Palette-follows-the-sun switch: an iOS-style toggle sitting on a sheet row.
+   The track is grey (off) / resolved-green (on); the knob slides between. */
+.toggle-row { justify-content: space-between; gap: 12px; }
+.toggle-label { flex: 1; min-width: 0; }
+.toggle {
+  flex: none;
+  position: relative;
+  width: 44px;
+  height: 26px;
+  border-radius: 13px;
+  background: var(--hairline);
+}
+.toggle.on { background: var(--resolved); }
+.toggle-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #FFFFFF;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+.toggle.on .toggle-knob { left: 21px; }
+
 /* My-status editor: a text input plus a clear (✕) button. */
 .mystatus-edit {
   display: flex;
@@ -928,6 +1007,26 @@ footer {
     transition: background-color 150ms ease, color 150ms ease,
                 border-color 150ms ease;
   }
+  /* Golden-Hour palette drift: a phase flip is a gentle ~2.4s dissolve on the
+     major surfaces, not a snap. Only the duration changes — the property list
+     (background / text / border colour) is inherited from the rule above.
+     Solid tokens crossfade; the veil and bubble gradients snap (iOS never
+     interpolates gradient images), exactly as a theme switch does today.
+     Scoped to golden-hour so the static themes keep their quick 150ms feel; the
+     .phase-animate class (added by app.js after first paint) keeps a cold-load
+     phase correction a snap rather than a slow smear. Reduced-motion opts out:
+     this whole block is absent then, so flips snap. */
+  :root[data-theme="golden-hour"].phase-animate body,
+  :root[data-theme="golden-hour"].phase-animate header,
+  :root[data-theme="golden-hour"].phase-animate footer,
+  :root[data-theme="golden-hour"].phase-animate .row,
+  :root[data-theme="golden-hour"].phase-animate .msg,
+  :root[data-theme="golden-hour"].phase-animate .attention {
+    transition-duration: 2.4s;
+  }
+  /* The palette-follows-the-sun switch: track recolour + knob slide. */
+  .toggle { transition: background-color 160ms ease; }
+  .toggle-knob { transition: left 160ms ease; }
   .sheet-panel { animation: sheet-up 200ms ease; }
   @keyframes sheet-up {
     from { transform: translateY(100%); }
@@ -946,6 +1045,15 @@ footer {
 :root { --glass: rgba(255,255,255,0.90); --fog-c: 250,245,236; --veil-c: 250,245,236; --fog-density: 0.7; }
 :root[data-theme="dusk"] { --glass: rgba(29,40,54,0.90); --fog-c: 138,170,201; --veil-c: 20,27,38; }
 :root[data-theme="international-orange"] { --glass: rgba(255,255,255,0.92); --veil-c: 255,253,248; }
+
+/* Golden-Hour drift, scenery half: the veil, fog and list-row glass take on
+   each phase's light (the palette half is near the top of this file). Golden
+   Hour only; tints only — fog DENSITY still follows the marine-layer schedule,
+   untouched. */
+:root[data-theme="golden-hour"][data-phase="dawn"]   { --glass: rgba(252,251,253,0.90); --veil-c: 240,240,246; --fog-c: 242,242,248; }
+:root[data-theme="golden-hour"][data-phase="golden"] { --glass: rgba(255,250,240,0.90); --veil-c: 250,238,218; --fog-c: 250,236,214; }
+:root[data-theme="golden-hour"][data-phase="dusk"]   { --glass: rgba(252,250,251,0.90); --veil-c: 238,228,230; --fog-c: 234,226,232; }
+:root[data-theme="golden-hour"][data-phase="night"]  { --glass: rgba(246,242,233,0.90); --veil-c: 236,230,218; --fog-c: 232,226,214; }
 
 #scenery { display: none; }
 :root[data-wallpaper="airy"][data-view="list"],
