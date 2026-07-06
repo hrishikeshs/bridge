@@ -382,12 +382,6 @@ func currentSessionFile(dir string) string {
 // skipped rather than re-read forever (M11).
 const maxJSONLLine = 8 * 1024 * 1024
 
-// sessionStaleAfter is how long a pinned session file may go without growing
-// before the tail treats it as possibly-dead and looks for a replacement. It is
-// deliberately long: today's `claude --resume` keeps the same id, so a quiet
-// pinned file almost always just means an idle agent, not a forked id.
-const sessionStaleAfter = 30 * time.Minute
-
 // sessionFileFor returns the JSONL to tail for c. With a SessionID it pins on
 // that file — `claude --resume` preserves the id (verified empirically), so two
 // agents rehomed from the same directory never tail each other's conversation
@@ -396,18 +390,59 @@ const sessionStaleAfter = 30 * time.Minute
 // fall back to the newest .jsonl in the directory that no *other* live contact
 // is already tailing (never adopt a sibling's conversation — H2).
 func sessionFileFor(c *Contact) string {
+	// THE PANE IS THE AGENT. A managed window runs `claude --resume <id>` as
+	// its pane process, so the command line outranks both the registry pin and
+	// any newest-file guess. This rule exists because a staleness heuristic
+	// once adopted a sibling's shadow transcript in a shared directory and
+	// relayed one agent's words under another's name (the marvin incident,
+	// 2026-07-06) — idle is normal; identity is not inferred from mtimes.
+	if pane := paneSessionID(c); pane != "" {
+		if pane != c.SessionID {
+			registry.SetSession(c.ID, pane) // heal the pin to ground truth
+			audit("session-heal", c.Name+" -> "+pane[:8], "daemon")
+		}
+		return filepath.Join(projectDir(c.Directory), pane+".jsonl")
+	}
 	if c.SessionID == "" {
 		return currentSessionFile(c.Directory)
 	}
 	pinned := filepath.Join(projectDir(c.Directory), c.SessionID+".jsonl")
-	if info, err := os.Stat(pinned); err == nil && time.Since(info.ModTime()) < sessionStaleAfter {
-		return pinned // present and recently grown: correct on today's Claude Code
+	// No pane to consult (window mid-respawn, foreign host). Only a MISSING
+	// pinned file justifies the newest-file fallback; a quiet file is just an
+	// idle agent.
+	if _, err := os.Stat(pinned); err == nil {
+		return pinned
 	}
 	if alt := currentSessionFile(c.Directory); alt != "" && alt != pinned &&
 		!registry.SessionHeldByOther(sessionIDFromPath(alt), c.ID) {
 		return alt
 	}
 	return pinned
+}
+
+// paneSessionID reads the session id straight off the contact's pane: every
+// managed window runs `claude --resume <id>` as the pane process, so its
+// command line is ground truth for who actually lives there. Returns "" when
+// unavailable (dead window, no @-target, non-claude pane).
+func paneSessionID(c *Contact) string {
+	if !strings.HasPrefix(c.TmuxTarget, "@") {
+		return ""
+	}
+	pid, err := tmux("display-message", "-p", "-t", c.TmuxTarget, "#{pane_pid}")
+	if err != nil {
+		return ""
+	}
+	out, err := exec.Command("ps", "-o", "args=", "-p", strings.TrimSpace(pid)).Output()
+	if err != nil {
+		return ""
+	}
+	f := strings.Fields(string(out))
+	for i, a := range f {
+		if a == "--resume" && i+1 < len(f) {
+			return f[i+1]
+		}
+	}
+	return ""
 }
 
 // skipOversizedLine returns the byte length (including the terminating newline)
