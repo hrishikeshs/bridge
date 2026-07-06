@@ -498,11 +498,17 @@ function lastActivityMs(contact) {
   return ms;
 }
 
-// Strip thinking/response markers and collapse to a single preview line.
+// Strip thinking/response markers and markdown syntax, collapsing to a single
+// preview line — a row preview renders as plain text, so literal **stars** and
+// `backticks` are just noise there (spotted in the field, 2026-07-06).
 function plainPreview(text) {
   return (text || '')
     .replace(/\[thinking\][\s\S]*?(?:\[end-thinking\]|\[\/thinking\]|(?=\[response\])|$)/g, '')
     .replace(/\[response\]/g, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^#+\s+/gm, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
