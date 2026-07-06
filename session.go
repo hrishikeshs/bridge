@@ -190,11 +190,40 @@ func startSessionManager() {
 					flushMailbox(revived)
 				case c.Status == "live" && alive:
 					pollReplies(c)
+					verifyPrompt(c)
 				}
 			}
 			time.Sleep(2 * time.Second)
 		}
 	}()
+}
+
+// promptStrikes counts consecutive reconcile ticks where a hook-attested open
+// prompt was NOT visible on the contact's screen. Only the reconcile goroutine
+// touches it.
+var promptStrikes = map[string]int{}
+
+// verifyPrompt re-checks an open permission prompt against the actual pane. A
+// prompt answered at the desk leaves no hook event behind, so without this the
+// "needs your approval" state goes stale and false urgency spreads across the
+// phone (found live: a night of desk-answered prompts left banners on every
+// thread). Two consecutive misses (~4s) clear it — one miss could just be the
+// dialog still painting.
+func verifyPrompt(c *Contact) {
+	if !c.PromptOpen {
+		delete(promptStrikes, c.ID)
+		return
+	}
+	if looksLikePrompt(capturePrompt(c)) {
+		delete(promptStrikes, c.ID)
+		return
+	}
+	promptStrikes[c.ID]++
+	if promptStrikes[c.ID] >= 2 {
+		delete(promptStrikes, c.ID)
+		registry.SetPrompt(c.ID, false)
+		Emit("attention-clear", c.ID, c.Name, "")
+	}
 }
 
 // pollReplies relays new visible output for one contact. It re-resolves the
