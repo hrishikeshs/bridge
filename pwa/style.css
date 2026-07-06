@@ -886,7 +886,7 @@ footer {
 :root[data-wallpaper="airy"] #scenery,
 :root[data-wallpaper="whisper"] #scenery {
   display: block;
-  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  position: absolute; inset: 0; z-index: 0; pointer-events: none;
   background: url("/wallpaper.jpg") center 30% / cover no-repeat;
 }
 #scenery .veil { position: absolute; inset: 0; }
@@ -918,11 +918,11 @@ footer {
   @keyframes fog-drift-3 { to { transform: translateX(22%); } }
 }
 
-/* Content floats on the weather: glass rows, quiet chrome. The navy header
-   bars of international-orange stay opaque — they are the brand, not ground. */
+/* The list anchors its own scenery; content floats on the weather as glass
+   rows. Threads deliberately have NO wallpaper — words beat weather. The navy
+   header bars of international-orange stay opaque — brand, not ground. */
+#list-view { position: relative; }
+#list-view > header, #list-view > #contact-list, #list-view > #list-empty { position: relative; }
 :root[data-wallpaper="airy"] .row, :root[data-wallpaper="whisper"] .row { background: var(--glass); }
-:root[data-wallpaper="airy"] footer, :root[data-wallpaper="whisper"] footer { background: transparent; }
 :root[data-wallpaper="airy"]:not([data-theme="international-orange"]) .list-header,
-:root[data-wallpaper="whisper"]:not([data-theme="international-orange"]) .list-header,
-:root[data-wallpaper="airy"]:not([data-theme="international-orange"]) .thread-header,
-:root[data-wallpaper="whisper"]:not([data-theme="international-orange"]) .thread-header { background: transparent; }
+:root[data-wallpaper="whisper"]:not([data-theme="international-orange"]) .list-header { background: transparent; }
