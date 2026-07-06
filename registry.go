@@ -380,6 +380,14 @@ const (
 	mailGroupMaxBytes = 6000
 )
 
+// HasMail reports whether a contact has any queued mail awaiting delivery —
+// the cheap gate the reconcile loop checks before attempting a flush.
+func (r *Registry) HasMail(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.mailbox[id]) > 0
+}
+
 // PeekMailboxGroup returns (a copy of) the longest queue prefix that shares
 // one sender and channel, within the group caps — the run flushMailbox will
 // deliver as a single combined line. Empty when the mailbox is empty.

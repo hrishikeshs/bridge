@@ -796,6 +796,17 @@ func flushMailbox(c *Contact) {
 		if len(group) == 0 {
 			return
 		}
+		// THE guard — the one the four criticals converge on (review
+		// 2026-07-06). Never send-keys into a pane that is the pre-Claude bare
+		// shell or is showing a permission dialog (a trailing Enter would
+		// blind-select its highlighted option and the mail would be swallowed).
+		// Leave everything queued and re-arm; the reconcile loop retries every
+		// tick and coalesceRearm covers the fast path — the mailbox is durable,
+		// so a deferral is never a loss.
+		if !paneReadyForDelivery(c) {
+			coalesceRearm(c.ID)
+			return
+		}
 		parts := make([]string, 0, len(group))
 		for _, m := range group {
 			parts = append(parts, m.Text)

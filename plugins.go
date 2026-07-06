@@ -401,16 +401,19 @@ func applyPluginAction(pname string, raw json.RawMessage) {
 			audit("plugin-action-refused", pname+" nudge: unknown contact or empty text", "plugin")
 			return
 		}
-		// Same stamp + control-byte sanitization as phone messages: provenance
-		// is visible in the agent's terminal.
-		line := formatInbound("plugin:"+pname, "plugin", a.Text)
-		if c.Status != "live" || deliverToSession(c, line) != nil {
-			registry.Queue(c.ID, MailMessage{From: "plugin:" + pname, Via: "plugin",
-				Text: a.Text, TS: nowUTC()})
+		// Route through the same hold-and-batch as every other inbound: a nudge
+		// now waits out an open permission dialog (no blind Enter) and can never
+		// overtake queued mail — the ordering invariant the coalescer promises
+		// (review H3). Emitted:true keeps it out of the phone feed: a nudge
+		// prods the agent, it isn't a user-facing message (unchanged behavior).
+		m := MailMessage{From: "plugin:" + pname, Via: "plugin", Text: a.Text, TS: nowUTC(), Emitted: true}
+		if c.Status == "live" {
+			holdInbound(c, m)
+			audit("plugin-action", pname+" nudge -> "+c.Name, "plugin")
+		} else {
+			registry.Queue(c.ID, m)
 			audit("plugin-action", pname+" nudge queued for "+c.Name, "plugin")
-			return
 		}
-		audit("plugin-action", pname+" nudge -> "+c.Name, "plugin")
 	case "notify":
 		if strings.TrimSpace(a.Title) == "" && strings.TrimSpace(a.Body) == "" {
 			audit("plugin-action-refused", pname+" notify: empty", "plugin")

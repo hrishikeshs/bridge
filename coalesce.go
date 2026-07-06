@@ -80,12 +80,11 @@ func coalesceDeliver(id string) {
 	if c == nil || c.Status != "live" {
 		return // stays queued; the revive flush delivers it
 	}
-	if c.PromptOpen {
-		// Enter on an open permission dialog selects the highlighted option —
-		// never type past one. Retry after the prompt resolves.
-		coalesceRearm(id)
-		return
-	}
+	// The prompt guard now lives in flushMailbox (paneReadyForDelivery), which
+	// reads PANE TRUTH rather than the hook-attested PromptOpen flag this used
+	// to check — closing the race where the flag lagged the dialog by up to a
+	// second (review H1/H2). flushMailbox re-arms via coalesceRearm if the pane
+	// isn't ready, so a blocked burst still retries.
 	flushMailbox(c)
 }
 

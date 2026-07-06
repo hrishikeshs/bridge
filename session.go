@@ -189,10 +189,31 @@ func startSessionManager() {
 					}
 					revived := registry.Connect(c.Name, c.Directory, c.SessionID, target)
 					Emit("connected", revived.ID, revived.Name, "")
+					// A window can outlive a daemon restart with a permission
+					// dialog still open; Connect just blindly reset
+					// PromptOpen=false. Re-detect it from the pane so a frozen
+					// prompt is re-surfaced (card + push) instead of silently
+					// cleared — and so flushMailbox refuses to type into it
+					// (review 2026-07-06, criticals C2/C4).
+					if snap := tmuxCapturePane(revived); looksLikePrompt(snap) {
+						registry.SetPrompt(revived.ID, true)
+						Emit("attention", revived.ID, revived.Name, snap)
+						notifyPush(revived.Name+" needs you", firstPromptLine(snap), "attn-"+revived.ID, revived.ID)
+						markAttnPushed(revived.ID)
+					}
 					flushMailbox(revived)
 				case c.Status == "live" && alive:
 					pollReplies(c)
 					verifyPrompt(c)
+					// Universal, self-healing delivery retry: any contact
+					// holding mail gets a flush attempt every tick. flushMailbox
+					// self-guards on pane readiness, so this both delivers
+					// deferred/connect-time mail once Claude is up and retries
+					// after a delivery error — closing the "no re-arm" strand
+					// the coalescer alone left open (review L1/L2, finding 6).
+					if registry.HasMail(c.ID) {
+						flushMailbox(c)
+					}
 				}
 			}
 			time.Sleep(2 * time.Second)
@@ -1075,8 +1096,51 @@ func looksLikePrompt(pane string) bool {
 	hasProceed := strings.Contains(low, "do you want") ||
 		strings.Contains(low, "esc to cancel") ||
 		strings.Contains(low, "no, and tell") ||
-		strings.Contains(low, "yes, and")
+		strings.Contains(low, "yes, and") ||
+		// Real CC dialogs the strict set missed (review H7): the folder-trust
+		// prompt ("Do you trust the files…" / "Enter to confirm · Esc to exit")
+		// and other confirm framings. Broadened so PromptOpen is set — and so
+		// the delivery guard refuses — for the dialogs an agent actually hits.
+		strings.Contains(low, "do you trust") ||
+		strings.Contains(low, "enter to confirm") ||
+		strings.Contains(low, "would you like")
 	return hasSelector && hasOption && hasProceed
+}
+
+// paneShowsDialog is the conservative DELIVERY gate: does the pane's last
+// screenful show the FRAME of an interactive dialog — the ❯ selector plus a
+// line-anchored numbered option — regardless of the specific proceed
+// vocabulary? looksLikePrompt (which raises the attention card) additionally
+// demands proceed vocabulary to avoid false cards from agent prose; delivery
+// refuses on the frame alone, because a trailing Enter would select whatever
+// option is highlighted — trust / text-input / plan dialogs included, even the
+// shapes looksLikePrompt is deliberately too strict to name.
+func paneShowsDialog(pane string) bool {
+	if pane == "" {
+		return false
+	}
+	lines := strings.Split(strings.TrimRight(pane, "\n"), "\n")
+	if len(lines) > 18 {
+		lines = lines[len(lines)-18:]
+	}
+	tail := strings.Join(lines, "\n")
+	return strings.Contains(tail, "❯") && promptOptionRe.MatchString(tail)
+}
+
+// paneReadyForDelivery reports whether it is safe to send-keys into c's pane
+// right now. Two conditions, both learned from the 2026-07-06 review's four
+// critical findings: (1) the pane must be running Claude Code, not the bare
+// shell a fresh `bridge connect` briefly leaves before launchClaude fires —
+// paneSessionID is "" for a shell (no `--resume` in its args); (2) the pane
+// must not be showing a dialog, whose highlighted option a trailing Enter would
+// blind-select. FAIL-SAFE: an unreadable pane (capture/ps hiccup) returns
+// false, so the durable mail waits for the next reconcile tick rather than
+// risking a blind delivery — waiting never loses anything.
+func paneReadyForDelivery(c *Contact) bool {
+	if paneSessionID(c) == "" {
+		return false
+	}
+	return !paneShowsDialog(tmuxCapturePane(c))
 }
 
 // promptOptionRe matches a dialog option at the start of a line ("❯ 1. Yes",
