@@ -808,7 +808,14 @@ func flushMailbox(c *Contact) {
 			return // leave the group (and the rest) queued for the next flush
 		}
 		for _, m := range group {
-			if !m.Emitted {
+			if m.Emitted {
+				continue
+			}
+			// Offline-queued mail emits on delivery: peer messages wear their
+			// author (see handleLocalSend), phone messages remain "sent".
+			if m.Via == "bridge" {
+				Emit("peer", c.ID, m.From, m.Text)
+			} else {
 				Emit("sent", c.ID, c.Name, m.Text)
 			}
 		}
@@ -911,8 +918,13 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 	// Switchboard rides the same hold-and-batch as phone sends: it keeps one
 	// ordered queue per recipient and, critically, never types past an open
 	// permission dialog (the hold refuses to fire while one is up).
+	//
+	// The event is "peer", Name = the SENDER: an agent-to-agent message in the
+	// recipient's thread must wear its author, not render as one of the user's
+	// own bubbles (found live 2026-07-06 — Marvin's status check showed as
+	// "you → vint" on the phone).
 	audit("switchboard", senderName+" -> "+target.Name+": "+req.Text, "local")
-	Emit("sent", target.ID, target.Name, req.Text)
+	Emit("peer", target.ID, senderName, req.Text)
 	holdInbound(target, MailMessage{From: senderName, Via: "bridge", Text: req.Text, TS: nowUTC(), Emitted: true})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

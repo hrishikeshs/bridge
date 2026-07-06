@@ -506,6 +506,17 @@ header {
   border-bottom-left-radius: var(--tail);
 }
 
+/* peer: an agent-to-agent message in this thread — inbound shape, but the
+   accent edge says "another agent wrote this, not you, not this agent" */
+.msg.peer {
+  align-self: flex-start;
+  color: var(--in-ink);
+  background: var(--in-bg);
+  border-bottom-left-radius: var(--tail);
+  border-left: 3px solid var(--accent);
+}
+.msg.peer .who { color: var(--accent); opacity: 0.9; }
+
 .msg.typing {
   align-self: flex-start;
   display: flex;
@@ -979,6 +990,8 @@ footer {
 /* ---- consecutive-bubble grouping (long replies split pleasingly) ---- */
 .msg.grp-mid, .msg.grp-last { margin-top: -6px; }  /* feed gap is 8px; groups sit at 2px */
 .msg.reply.grp-first, .msg.reply.grp-mid,
-.msg.mention.grp-first, .msg.mention.grp-mid { border-bottom-left-radius: var(--radius); }
+.msg.mention.grp-first, .msg.mention.grp-mid,
+.msg.peer.grp-first, .msg.peer.grp-mid { border-bottom-left-radius: var(--radius); }
 .msg.reply.grp-mid, .msg.reply.grp-last,
-.msg.mention.grp-mid, .msg.mention.grp-last { border-top-left-radius: 6px; }
+.msg.mention.grp-mid, .msg.mention.grp-last,
+.msg.peer.grp-mid, .msg.peer.grp-last { border-top-left-radius: 6px; }

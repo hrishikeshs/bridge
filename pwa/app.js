@@ -383,7 +383,7 @@ function unreadCount(contactId) {
   let n = 0;
   for (const e of state.events) {
     if (e.agent === contactId && e.id > seen &&
-        (e.type === 'reply' || e.type === 'mention')) n++;
+        (e.type === 'reply' || e.type === 'mention' || e.type === 'peer')) n++;
   }
   return n;
 }
@@ -704,7 +704,8 @@ function previewFor(contact) {
   if (!item) return { text: contact.directory || 'no messages yet', cls: 'muted' };
   const out = item.type === 'sent' || item.mstate !== undefined;   // event vs outbox echo
   const body = item.image ? '📷 photo' : (plainPreview(item.text) || '📷 photo');
-  return { text: (out ? 'You: ' : '') + body };
+  const prefix = out ? 'You: ' : (item.type === 'peer' ? (item.name || 'agent') + ': ' : '');
+  return { text: prefix + body };
 }
 
 // Newest message-like item touching the contact — a stored reply/mention/sent
@@ -713,7 +714,8 @@ function newestMessage(id) {
   let ev = null;
   for (let i = state.events.length - 1; i >= 0; i--) {
     const e = state.events[i];
-    if (e.agent === id && (e.type === 'reply' || e.type === 'mention' || e.type === 'sent')) {
+    if (e.agent === id && (e.type === 'reply' || e.type === 'mention' ||
+        e.type === 'sent' || e.type === 'peer')) {
       ev = e; break;
     }
   }
@@ -849,6 +851,11 @@ function renderEvent(event, resolution) {
     return replyBubbles(event, 'msg reply', who(event.name || '?'));
   } else if (event.type === 'mention') {
     return replyBubbles(event, 'msg mention', who((event.name || 'contact') + ' · @mention'));
+  } else if (event.type === 'peer') {
+    // Agent-to-agent (switchboard) message in this thread: it wears its
+    // AUTHOR — event.name is the sender, event.agent the thread it landed in.
+    return replyBubbles(event, 'msg peer',
+      who((event.name || 'agent') + ' → ' + (contactName(event.agent) || 'agent')));
   } else if (event.type === 'interrupted') {
     el.className = 'msg system';
     el.textContent = '⏹ interrupted' + (localTime(event.ts) ? ' · ' + localTime(event.ts) : '');
@@ -1607,7 +1614,7 @@ function maybeNotify(event) {
     new Notification(event.name + ' needs your attention', {
       body: (event.text || '').slice(-120),
     });
-  } else if (event.type === 'mention' || event.type === 'reply') {
+  } else if (event.type === 'mention' || event.type === 'reply' || event.type === 'peer') {
     new Notification(event.name || 'bridge', {
       body: (event.text || '').slice(0, 160),
     });
