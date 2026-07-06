@@ -343,6 +343,45 @@ check "my-status set -> 200"                200 "$(code "${DEV_AUTH[@]}" "${J[@]
 STATUS_BODY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/status)
 body_has "my_status surfaced on /api/status" '"my_status":"on the couch"' "$STATUS_BODY"
 
+# --- quoting & reactions (features A + B) ---------------------------------
+# Mint a reactable event WITHOUT a live tmux: /local/send with no `to` is the
+# "agent reaches out to the phone" path, which emits a "reply" in the sender's
+# own thread. The (offline) smoke agent still resolves as a sender, so this is
+# deterministic. Read the new event's id back from /api/history.
+REACT_MINT_BODY="{\"contact\":\"$CNAME\",\"text\":\"a line worth reacting to\"}"
+check "mint reply event (agent reach-out) -> 200" 200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$REACT_MINT_BODY" $BASE/local/send)"
+EVID=$(curl -s "${DEV_AUTH[@]}" "$BASE/api/history?since=0" | python3 -c 'import json,sys
+data = json.load(sys.stdin)
+ids = [e["id"] for e in data.get("events", [])
+       if e.get("type") == "reply" and e.get("text") == "a line worth reacting to"]
+print(ids[-1] if ids else "")' 2>/dev/null)
+EVID="${EVID:-0}"   # fall back to a non-existent id so the bodies stay valid JSON
+if [ "$EVID" != "0" ]; then
+  pass_msg "reply event id read from history ($EVID)"
+else
+  fail_msg "could not read a reply event id from /api/history"
+fi
+
+# Bodies pre-defined (the JSON-in-$(...) gotcha): event_id is a number, emoji is
+# raw UTF-8. 🦄 is outside the whitelist; 👍 is inside it.
+REACT_BADEMOJI_BODY="{\"agent\":\"$CNAME\",\"event_id\":$EVID,\"emoji\":\"🦄\"}"
+REACT_NOEVENT_BODY="{\"agent\":\"$CNAME\",\"event_id\":999999999,\"emoji\":\"👍\"}"
+REACT_OK_BODY="{\"agent\":\"$CNAME\",\"event_id\":$EVID,\"emoji\":\"👍\"}"
+check "react bad emoji -> 400"            400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_BADEMOJI_BODY" $BASE/api/react)"
+check "react unknown event id -> 404"     404 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_NOEVENT_BODY" $BASE/api/react)"
+check "react on a real event -> 200"      200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_OK_BODY" $BASE/api/react)"
+REACT_DUP=$(curl -s "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_OK_BODY" $BASE/api/react)
+body_has "duplicate react -> duplicate:true" '"duplicate":true' "$REACT_DUP"
+
+# A quoted phone send to the OFFLINE smoke agent is durably queued (409): the
+# quote rides inline in the mailbox text and the client_id commits, so the
+# identical retry is a safe 200 duplicate — proving the quote fields were
+# ACCEPTED (not 400-rejected) and the send was durably taken.
+QUOTE_SEND_BODY="{\"agent\":\"$CNAME\",\"text\":\"ship it\",\"client_id\":\"cid-quote-1\",\"quote\":{\"name\":\"marvin\",\"excerpt\":\"the build passed\"}}"
+check "quote-send to offline queued -> 409" 409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$QUOTE_SEND_BODY" $BASE/api/send)"
+QUOTE_DUP=$(curl -s "${DEV_AUTH[@]}" "${J[@]}" -d "$QUOTE_SEND_BODY" $BASE/api/send)
+body_has "quote-send accepted -> 200" '"duplicate":true' "$QUOTE_DUP"
+
 # --- web push -------------------------------------------------------------
 check "push key -> 200"                    200 "$(code "${DEV_AUTH[@]}" $BASE/api/push/key)"
 PUSH_KEY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/push/key | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')

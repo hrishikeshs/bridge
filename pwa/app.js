@@ -96,10 +96,17 @@ applyWallpaper(currentWallpaper());
 const HEALTH_LABELS = { working: 'working', prompt: 'waiting on you', offline: 'offline' };
 const STATE_GLYPH = { sending: '🕐', sent: '✓', failed: '⚠️', queued: '📮' };
 
+// The reaction whitelist — kept byte-identical to the daemon's reactionEmoji
+// (httpapi.go), which 400s anything outside it.
+const REACTIONS = ['👍', '❤️', '😂', '🎉', '👀', '🚀'];
+
 const state = {
   contacts: [],          // roster from /api/status
   events: [],            // chronological event list
   attentions: new Map(), // contact id -> latest unresolved attention event
+  reactions: new Map(),  // target event id -> array of emoji (folded from 'reaction' events)
+  myReactions: new Map(),// target event id -> Set of emoji THIS phone sent this session
+  quote: null,           // {name, excerpt} — the bubble the composer is replying to
   view: 'list',          // 'list' (conversation list) | 'thread' (one contact)
   selected: null,        // contact id of the open thread, or null on the list
   myStatus: '',          // the human's away line, delivered to agents on reach-out
@@ -379,6 +386,14 @@ function ingest(event) {
     state.myStatus = event.text;
     return false;
   }
+  // Reactions are decorations, not thread bubbles: fold the emoji onto the
+  // target event's badge list and stop before the feed (like 'status'). Durable
+  // (Emit), so a reconnect's history replay rebuilds the map here too.
+  if (event.type === 'reaction') {
+    const arr = state.reactions.get(event.target) || [];
+    if (!arr.includes(event.text)) { arr.push(event.text); state.reactions.set(event.target, arr); }
+    return false;
+  }
   state.events.push(event);
   if (event.type === 'attention') {
     state.attentions.set(event.agent, event);
@@ -526,6 +541,8 @@ function openThread(id) {
   updateAttentionBanner();
   renderFeed();
   restoreDraft();
+  state.quote = null;   // a quote is a reply to THIS thread; don't carry it across
+  renderQuoteChip();
 }
 
 /* iMessage behavior: opening the app clears its pile from Notification
@@ -1021,6 +1038,9 @@ function renderEvent(event, resolution) {
   if (event.type === 'sent') {
     el.className = 'msg sent';
     el.appendChild(who('you → ' + (event.name || '?')));
+    if (event.quote_name || event.quote_excerpt) {
+      el.appendChild(quoteInset(event.quote_name, event.quote_excerpt));
+    }
     el.appendChild(richText(event.text));
     appendStamp(el, event.ts);
   } else if (event.type === 'reply') {
@@ -1052,12 +1072,17 @@ function renderEvent(event, resolution) {
    retroactively). */
 function replyBubbles(event, cls, whoEl) {
   const parts = splitPleasing(event.text || '');
+  // Long-press metadata for the action sheet: the whole event is the reaction
+  // target (its id), and the pressed part's own text seeds a quote.
+  const meta = (text) => ({ id: event.id, name: event.name || 'agent', type: event.type, text });
   if (parts.length <= 1) {
     const el = document.createElement('div');
     el.className = cls;
     el.appendChild(whoEl);
     el.appendChild(richText(event.text));
     appendStamp(el, event.ts);
+    attachBubbleActions(el, meta(event.text || ''));
+    appendReactions(el, event.id);
     return el;
   }
   const frag = document.createDocumentFragment();
@@ -1066,7 +1091,10 @@ function replyBubbles(event, cls, whoEl) {
     el.className = cls + (i === 0 ? ' grp-first' : (i === parts.length - 1 ? ' grp-last' : ' grp-mid'));
     if (i === 0) el.appendChild(whoEl);
     el.appendChild(richText(p));
-    if (i === parts.length - 1) appendStamp(el, event.ts);
+    // Reactions decorate the whole message: badge only the last bubble (its
+    // bottom edge is the message's bottom edge).
+    if (i === parts.length - 1) { appendStamp(el, event.ts); appendReactions(el, event.id); }
+    attachBubbleActions(el, meta(p));
     frag.appendChild(el);
   });
   return frag;
@@ -1135,6 +1163,9 @@ function renderPending(msg) {
   badge.textContent = ' ' + (STATE_GLYPH[msg.mstate] || '');
   w.appendChild(badge);
   el.appendChild(w);
+  if (msg.quote && (msg.quote.name || msg.quote.excerpt)) {
+    el.appendChild(quoteInset(msg.quote.name, msg.quote.excerpt));
+  }
   if (msg.image) {
     const thumb = document.createElement('img');
     thumb.className = 'sent-thumb';
@@ -1593,18 +1624,24 @@ function sendMessage() {
   clearAttachment();
   autogrow();
   requestNotifyPermission();
+  // A quote rides on a text send only — the upload path carries none, so a
+  // photo drops any pending quote rather than show an inset the agent won't get.
+  const quote = image ? null : state.quote;
   const msg = {
     clientId: crypto.randomUUID(),
     agent: state.selected,               // always the contact id
     name: contactName(state.selected) || '?',
     text: body,
     image: image || null,
+    quote: quote || null,
     ts: new Date().toISOString(),
     mstate: 'sending',
     inflight: false,
   };
   state.pending.push(msg);
   state.guidance = null;   // whatever this message was, the No has its answer
+  state.quote = null;      // the chip is consumed; the quote now rides on the msg
+  renderQuoteChip();
   savePending();
   renderFeed();
   if (!state.connected) {                // banner is up — don't wait on a dead link
@@ -1617,6 +1654,163 @@ function sendMessage() {
 }
 
 $('send-btn').addEventListener('click', sendMessage);
+
+/* ---------- quoting & reactions ----------
+
+   Long-press (or right-click) a reply/peer/mention bubble to raise a small
+   anchored sheet: Quote (seeds the composer chip) and a reaction row. The
+   daemon carries a quote inline to the agent and echoes reactions back as
+   'reaction' events the feed folds into badges. */
+
+// The quoted bubble as it rides on an outbound message (a 'sent' event's
+// quote_* fields, or a pending echo's msg.quote): author line + excerpt inset.
+function quoteInset(name, excerpt) {
+  const box = document.createElement('div');
+  box.className = 'quote-inset';
+  const n = document.createElement('span');
+  n.className = 'quote-inset-name';
+  n.textContent = name || '';
+  const t = document.createElement('span');
+  t.className = 'quote-inset-text';
+  t.textContent = excerpt || '';
+  box.appendChild(n);
+  box.appendChild(t);
+  return box;
+}
+
+// The reaction badge row for a target bubble, drawn from the folded map. No-op
+// when nothing has reacted to this event id.
+function appendReactions(bubble, id) {
+  const arr = state.reactions.get(id);
+  if (!arr || !arr.length) return;
+  const row = document.createElement('div');
+  row.className = 'reactions';
+  for (const emoji of arr) {
+    const b = document.createElement('span');
+    b.className = 'reaction';
+    b.textContent = emoji;
+    row.appendChild(b);
+  }
+  bubble.appendChild(row);
+}
+
+/* Long-press detection. A 500ms hold that doesn't drift into a scroll raises the
+   sheet; the sheet's own overlay then intercepts the trailing synthetic click,
+   so it can't close the sheet or fire a link under the finger (the backdrop
+   handler ignores clicks in the first 350ms after opening). */
+let lpTimer = null;
+let lpStart = null;
+let actionOpenedAt = 0;
+
+function attachBubbleActions(el, meta) {
+  el.addEventListener('touchstart', (e) => {
+    const t = e.touches && e.touches[0];
+    if (!t) return;
+    lpStart = { x: t.clientX, y: t.clientY };
+    clearTimeout(lpTimer);
+    lpTimer = setTimeout(() => { lpStart = null; openActionSheet(el, meta); }, 500);
+  }, { passive: true });
+  el.addEventListener('touchmove', (e) => {
+    if (!lpStart) return;
+    const t = e.touches && e.touches[0];
+    if (t && Math.hypot(t.clientX - lpStart.x, t.clientY - lpStart.y) > 10) {
+      clearTimeout(lpTimer); lpStart = null;   // it's a scroll, not a press
+    }
+  }, { passive: true });
+  el.addEventListener('touchend', () => { clearTimeout(lpTimer); lpStart = null; }, { passive: true });
+  // Desktop: right-click / trackpad long-press raises the same sheet.
+  el.addEventListener('contextmenu', (e) => { e.preventDefault(); openActionSheet(el, meta); });
+}
+
+function openActionSheet(bubbleEl, meta) {
+  const reactions = $('action-reactions');
+  reactions.innerHTML = '';
+  const mine = state.myReactions.get(meta.id);
+  for (const emoji of REACTIONS) {
+    const already = !!(mine && mine.has(emoji));
+    const b = document.createElement('button');
+    b.className = 'action-reaction' + (already ? ' reacted' : '');
+    b.textContent = emoji;
+    if (already) {
+      b.disabled = true;   // already reacted this session — pressed and inert
+    } else {
+      b.onclick = () => { react(state.selected, meta.id, emoji); closeActionSheet(); };
+    }
+    reactions.appendChild(b);
+  }
+  $('action-quote').onclick = () => { setQuote(meta); closeActionSheet(); };
+  actionOpenedAt = Date.now();
+  positionActionMenu(bubbleEl);
+}
+
+function closeActionSheet() { $('action-sheet').classList.add('hidden'); }
+
+// Anchor the menu near the bubble: prefer just above it, fall below when there's
+// no room, and clamp inside the viewport. CSSOM writes, allowed by the CSP.
+function positionActionMenu(bubbleEl) {
+  const menu = $('action-menu');
+  menu.style.visibility = 'hidden';        // reveal to measure, place, then show
+  $('action-sheet').classList.remove('hidden');
+  const r = bubbleEl.getBoundingClientRect();
+  const mw = menu.offsetWidth, mh = menu.offsetHeight, pad = 8;
+  let top = r.top - mh - pad;
+  if (top < pad) top = r.bottom + pad;
+  top = Math.max(pad, Math.min(top, window.innerHeight - mh - pad));
+  const left = Math.max(pad, Math.min(r.left, window.innerWidth - mw - pad));
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+  menu.style.visibility = 'visible';
+}
+
+// Tap outside the menu (or Esc) dismisses; the 350ms guard swallows the
+// synthetic click that follows the long-press so the sheet doesn't self-close.
+$('action-sheet').addEventListener('click', (e) => {
+  if (e.target !== $('action-sheet')) return;
+  if (Date.now() - actionOpenedAt < 350) return;
+  closeActionSheet();
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeActionSheet(); });
+
+/* Send an emoji reaction. The badge itself arrives via the daemon's echoed
+   'reaction' event over SSE; myReactions only tracks this session's taps for the
+   pressed/disabled state, so it rolls back if the POST doesn't land. */
+async function react(agent, eventId, emoji) {
+  if (!agent) return;
+  const set = state.myReactions.get(eventId) || new Set();
+  if (set.has(emoji)) return;
+  set.add(emoji);
+  state.myReactions.set(eventId, set);
+  const res = await api('/api/react', { agent, event_id: eventId, emoji });
+  if (!res || !res.ok) {
+    set.delete(emoji);
+    if (!set.size) state.myReactions.delete(eventId);
+  }
+}
+
+/* ---------- quote chip ---------- */
+
+// First 80 chars of a bubble, flattened to one line (plainPreview strips
+// thinking/markdown noise); the daemon re-clamps to 80 runes authoritatively.
+function quoteExcerptText(text) {
+  const clean = plainPreview(text) || (text || '').replace(/\s+/g, ' ').trim();
+  return clean.slice(0, 80);
+}
+
+function setQuote(meta) {
+  state.quote = { name: meta.name, excerpt: quoteExcerptText(meta.text) };
+  renderQuoteChip();
+  input.focus();
+}
+
+function renderQuoteChip() {
+  const chip = $('quote-chip');
+  if (!state.quote) { chip.classList.add('hidden'); return; }
+  $('quote-chip-name').textContent = state.quote.name || '';
+  $('quote-chip-text').textContent = state.quote.excerpt || '';
+  chip.classList.remove('hidden');
+}
+
+$('quote-chip-remove').addEventListener('click', () => { state.quote = null; renderQuoteChip(); });
 
 /* ---------- actions ---------- */
 
@@ -1653,6 +1847,9 @@ async function deliver(msg) {
   renderFeed();
   const payload = { agent: msg.agent, text: msg.text, client_id: msg.clientId };
   if (msg.image) payload.image = msg.image;
+  // Quote rides on /api/send only (the upload path ignores it). Sent from
+  // deliver() — not sendMessage — so a queued reply keeps its quote on retry.
+  if (msg.quote && !msg.image) payload.quote = msg.quote;
   const res = await api(msg.image ? '/api/upload' : '/api/send', payload);
   msg.inflight = false;
   if (res && res.ok) {
@@ -1704,7 +1901,7 @@ function savePending() {
     localStorage.setItem('outbox', JSON.stringify(
       state.pending.filter((m) => m.mstate !== 'sent').map((m) => ({
         clientId: m.clientId, agent: m.agent, name: m.name, text: m.text,
-        image: m.image || null, ts: m.ts, mstate: m.mstate,
+        image: m.image || null, quote: m.quote || null, ts: m.ts, mstate: m.mstate,
       }))));
   } catch (e) { /* storage full — best-effort, like the event cache */ }
 }

@@ -228,6 +228,10 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		Agent    string `json:"agent"`
 		Text     string `json:"text"`
 		ClientID string `json:"client_id"`
+		Quote    *struct {
+			Name    string `json:"name"`
+			Excerpt string `json:"excerpt"`
+		} `json:"quote"`
 	}
 	_ = json.Unmarshal(data, &req)
 
@@ -239,6 +243,18 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too-long"})
 		return
 	}
+	// An optional reply-quote. Clamp+sanitize it AUTHORITATIVELY here (the
+	// client's clamp is cosmetic): the excerpt is body-derived and must not be
+	// able to forge a provenance frame (H9). The quote rides INLINE in the
+	// delivered/queued text (decorateQuote) so the mailbox and coalescer need no
+	// schema change; the structured fields travel on the "sent" event for the
+	// phone's inset. Both delivery branches below store the decorated text.
+	var qName, qExcerpt string
+	if req.Quote != nil {
+		qName = sanitizeExcerpt(req.Quote.Name, quoteMaxNameRunes)
+		qExcerpt = sanitizeExcerpt(req.Quote.Excerpt, quoteMaxExcerptRunes)
+	}
+	deliverText := decorateQuote(qName, qExcerpt, req.Text)
 	// Reserve the client_id before delivering: a completed send, or a racing
 	// retry whose original delivery is still in flight, is acked as a duplicate
 	// without re-delivering — closing the window where the phone's 10s-timeout
@@ -254,7 +270,7 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 	c := registry.Resolve(req.Agent)
 	if c == nil || c.Status != "live" {
 		if c != nil {
-			registry.Queue(c.ID, MailMessage{From: authConfig.UserMention, Via: "phone", Text: req.Text, TS: nowUTC()})
+			registry.Queue(c.ID, MailMessage{From: authConfig.UserMention, Via: "phone", Text: deliverText, TS: nowUTC()})
 			releaseClientID(req.ClientID, true) // durably queued: a retry must not re-queue
 			// message.in fires on durable ACCEPT, not send-keys success — a
 			// queued message is in the system (same standard H1 holds the
@@ -273,11 +289,80 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 	// daemon has it"; delivery follows when the burst window closes
 	// (coalesce.go). Emitted:true — the "sent" event below is the one the
 	// thread shows; the flush must not emit a duplicate.
-	holdInbound(c, MailMessage{From: authConfig.UserMention, Via: "phone", Text: req.Text, TS: nowUTC(), Emitted: true})
+	holdInbound(c, MailMessage{From: authConfig.UserMention, Via: "phone", Text: deliverText, TS: nowUTC(), Emitted: true})
 	releaseClientID(req.ClientID, true) // durably queued: a retry is now a safe duplicate ack
 	audit("send", c.Name+": "+req.Text, id)
-	Emit("sent", c.ID, c.Name, req.Text, req.ClientID)
+	// The "sent" event carries the ORIGINAL text plus the structured quote
+	// fields, so the phone renders the quote inset (live + history replay) while
+	// the agent got the (re …) decoration inline above.
+	emitEvent(Event{Type: "sent", Agent: c.ID, Name: c.Name, Text: req.Text, ClientID: req.ClientID, QuoteName: qName, QuoteExcerpt: qExcerpt})
 	dispatchPluginEvent("message.in", c, map[string]any{"text": req.Text, "via": "phone", "queued": false})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// reactionEmoji is the closed set of reactions /api/react accepts — the phone
+// offers exactly these; anything else is a 400.
+var reactionEmoji = map[string]bool{
+	"👍": true, "❤️": true, "😂": true, "🎉": true, "👀": true, "🚀": true,
+}
+
+// reactableType reports whether an event kind can carry a reaction — the inbound
+// agent messages a phone taps back on.
+func reactableType(t string) bool {
+	return t == "reply" || t == "peer" || t == "mention"
+}
+
+// handleReact records a phone's emoji reaction to one agent message. It emits a
+// durable "reaction" event (the phone folds it into a badge on the target
+// bubble) and delivers the feedback inline to the agent so it FEELS the tap-back.
+// Idempotent: the same emoji on the same message from the user re-emits nothing
+// and re-delivers nothing.
+func handleReact(w http.ResponseWriter, r *http.Request, id string) {
+	data, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Agent   string `json:"agent"`
+		EventID int64  `json:"event_id"`
+		Emoji   string `json:"emoji"`
+	}
+	_ = json.Unmarshal(data, &req)
+
+	if !reactionEmoji[req.Emoji] {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-emoji"})
+		return
+	}
+	// The target must be a real, reactable event in THIS agent's thread. Resolve
+	// the handle to its contact id and match it against the stored event's Agent
+	// (the thread it lives in), so a phone can't react across threads or onto a
+	// non-message (an approval card, a status).
+	c := registry.Resolve(req.Agent)
+	target, found := eventByID(req.EventID)
+	if c == nil || !found || target.Agent != c.ID || !reactableType(target.Type) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no-event"})
+		return
+	}
+	// Idempotent: a double-tap (or two phones agreeing) is a quiet 200, no second
+	// event and no second delivery.
+	if reactionExists(req.EventID, authConfig.UserMention, req.Emoji) {
+		audit("react-duplicate", c.Name+" "+req.Emoji, id)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "duplicate": true})
+		return
+	}
+	audit("react", fmt.Sprintf("%s %s: %.60s", c.Name, req.Emoji, target.Text), id)
+	// The durable record the phone folds into a badge (live SSE + history replay).
+	emitEvent(Event{Type: "reaction", Agent: c.ID, Name: authConfig.UserMention, Text: req.Emoji, Target: req.EventID})
+	// Let the agent feel it — a guarded, coalesced delivery (never a bare
+	// send-keys) of a sanitized echo of its own line. Emitted:true so the flush
+	// adds no "sent" bubble; the "reaction" event above is the only record.
+	holdInbound(c, MailMessage{
+		From:    authConfig.UserMention,
+		Via:     "phone",
+		Text:    reactionDelivery(req.Emoji, target.Text),
+		TS:      nowUTC(),
+		Emitted: true,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

@@ -1037,3 +1037,108 @@ footer {
 .msg.reply.grp-mid, .msg.reply.grp-last,
 .msg.mention.grp-mid, .msg.mention.grp-last,
 .msg.peer.grp-mid, .msg.peer.grp-last { border-top-left-radius: 6px; }
+
+/* ---- quoting: the inset on a sent bubble, and the composer chip ---- */
+
+/* The quoted bubble, rendered above the outbound message text. It rides on the
+   saturated sent-bubble fill, so a translucent-white overlay + a currentColor
+   edge reads as "subdued" against every theme's --out-grad. */
+.quote-inset {
+  margin: 0 0 5px;
+  padding: 4px 8px;
+  border-left: 2px solid currentColor;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.16);
+  font-size: 13px;
+  line-height: 1.3;
+}
+.quote-inset-name { display: block; font-size: 11px; font-weight: 600; opacity: 0.85; }
+.quote-inset-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.9;
+}
+
+/* The composer chip: what you're replying to, above the input. */
+#quote-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 12px 0;
+  padding: 6px 10px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+}
+.quote-chip-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+#quote-chip-name { font-size: 11px; font-weight: 600; color: var(--accent); }
+#quote-chip-text {
+  font-size: 13px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#quote-chip-remove {
+  flex: none;
+  width: 26px; height: 26px;
+  font-size: 13px;
+  color: var(--dim);
+  background: none;
+  border: none;
+}
+#quote-chip-remove:active { color: var(--ink); }
+
+/* ---- long-press action popover (quote + react) ---- */
+
+#action-sheet { position: fixed; inset: 0; z-index: 60; }
+#action-menu {
+  position: fixed;                 /* app.js anchors left/top near the bubble */
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
+}
+.action-item {
+  padding: 8px 14px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  text-align: left;
+  background: var(--ground);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+}
+.action-item:active { background: var(--hairline); }
+#action-reactions { display: flex; gap: 4px; }
+.action-reaction {
+  width: 40px; height: 40px;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--ink);
+  background: var(--ground);
+  border: 1px solid var(--hairline);
+  border-radius: 50%;
+}
+.action-reaction:active { background: var(--hairline); }
+/* already reacted this session — pressed and inert */
+.action-reaction.reacted { background: var(--accent); border-color: var(--accent); }
+.action-reaction:disabled { opacity: 0.9; }
+
+/* ---- reaction badges on a target bubble ---- */
+.reactions { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
+.reaction {
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 1px 6px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+}

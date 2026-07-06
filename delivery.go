@@ -136,6 +136,49 @@ func neutralizeFrame(s string) string {
 	return strings.ReplaceAll(s, "⏎", "↵")
 }
 
+// Rune bounds for the body-derived snippets a quote or reaction carries inline
+// to a pane: a reply-quote's author and excerpt, and the echo of a reacted line.
+const (
+	quoteMaxNameRunes    = 40
+	quoteMaxExcerptRunes = 80
+	reactExcerptRunes    = 60
+)
+
+// sanitizeExcerpt makes body-derived text safe to ride inline into a terminal
+// and bounded for storage. It strips control bytes to a single line
+// (stripControl) and defangs the daemon's framing alphabet (neutralizeFrame), so
+// a quoted excerpt can't forge a "[From …]" head or a "⏎" batch boundary (H9),
+// then truncates to maxRunes (never mid-character). stripControl runs first, so a
+// control-obfuscated frame (a NUL buried inside "[From ") can't slip past
+// neutralizeFrame and re-form once the pane drops the NUL.
+func sanitizeExcerpt(s string, maxRunes int) string {
+	s = strings.TrimSpace(neutralizeFrame(stripControl(s)))
+	if r := []rune(s); len(r) > maxRunes {
+		s = strings.TrimSpace(string(r[:maxRunes]))
+	}
+	return s
+}
+
+// decorateQuote prefixes a quoted reply the way it rides inline in the mailbox —
+// `(re <name>: "<excerpt>") <text>` — so the agent sees what is being replied to
+// without any mailbox/coalescer schema change. name and excerpt are already
+// sanitized+clamped by the caller (sanitizeExcerpt); a quote that clamped to
+// nothing leaves the text undecorated.
+func decorateQuote(name, excerpt, text string) string {
+	if name == "" && excerpt == "" {
+		return text
+	}
+	return fmt.Sprintf(`(re %s: "%s") %s`, name, excerpt, text)
+}
+
+// reactionDelivery is the line an emoji reaction rides into the agent's terminal
+// — `reacted <emoji> to "<excerpt>"` — where excerpt is a sanitized, bounded cut
+// of the agent's own reacted message (agent-authored text going back into a
+// pane, so stripControl + neutralizeFrame via sanitizeExcerpt, H9).
+func reactionDelivery(emoji, targetText string) string {
+	return fmt.Sprintf(`reacted %s to "%s"`, emoji, sanitizeExcerpt(targetText, reactExcerptRunes))
+}
+
 // flushMailbox delivers a contact's queued messages in order, combining each
 // run of consecutive messages from one sender+channel into a single delivery
 // line ("msg1 ⏎ msg2 ⏎ msg3") — a burst of phone texts lands as one thought,

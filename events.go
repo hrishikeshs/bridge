@@ -35,6 +35,15 @@ type Event struct {
 	// the PWA can dedup its optimistic local echo by id rather than by text
 	// (M5). Empty (and omitted) for every server-originated event.
 	ClientID string `json:"client_id,omitempty"`
+	// Target is the id of the event a "reaction" decorates (0/omitted on every
+	// other type), so the phone can fold an emoji onto the bubble it points at.
+	Target int64 `json:"target,omitempty"`
+	// QuoteName / QuoteExcerpt ride on a "sent" event that quotes an earlier
+	// bubble: the quoted author and a short, sanitized excerpt of it, rendered as
+	// an inset above the message. Additive and optional, so pre-quote history
+	// still loads unchanged.
+	QuoteName    string `json:"quote_name,omitempty"`
+	QuoteExcerpt string `json:"quote_excerpt,omitempty"`
 }
 
 var (
@@ -89,18 +98,31 @@ func broadcast(frame string) {
 	}
 }
 
-// Emit records a durable event, assigns it the next monotonic id, appends it
-// to the history file, and broadcasts it to SSE clients. It is the single
-// entry point every subsystem uses to speak, and returns the stored event. An
+// Emit is the convenience entry point every subsystem uses to speak: it builds
+// an Event from the common fields and files it via emitEvent (which assigns the
+// id, appends to history and broadcasts), returning the stored event. An
 // optional clientID is echoed on "sent" acknowledgements for phone-echo dedup
 // (M5); server-originated events pass none.
 func Emit(typ, agent, name, text string, clientID ...string) Event {
-	eventsMu.Lock()
-	eventCounter++
-	ev := Event{ID: eventCounter, TS: nowUTC(), Type: typ, Agent: agent, Name: name, Text: text}
+	ev := Event{Type: typ, Agent: agent, Name: name, Text: text}
 	if len(clientID) > 0 {
 		ev.ClientID = clientID[0]
 	}
+	return emitEvent(ev)
+}
+
+// emitEvent files a pre-built event: it stamps the next monotonic id and a UTC
+// timestamp, appends it to the in-memory ring and the durable history file, and
+// broadcasts it to SSE clients. Emit builds the common case; callers that must
+// set an optional field (a "sent" that carries a quote, a "reaction" that
+// carries a Target) construct the Event themselves and file it here, so id
+// assignment, durable append and broadcast keep living in exactly one place. The
+// caller leaves ID and TS zero; both are stamped here under eventsMu.
+func emitEvent(ev Event) Event {
+	eventsMu.Lock()
+	eventCounter++
+	ev.ID = eventCounter
+	ev.TS = nowUTC()
 	events = append([]Event{ev}, events...)
 	if len(events) > historySize {
 		events = events[:historySize]
@@ -161,6 +183,34 @@ func eventsSince(since int64) []Event {
 		}
 	}
 	return out
+}
+
+// eventByID returns the stored event with the given id (and true), or a zero
+// Event and false when it is no longer in the in-memory history — the lookup the
+// react endpoint uses to validate a reaction target.
+func eventByID(id int64) (Event, bool) {
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, ev := range events {
+		if ev.ID == id {
+			return ev, true
+		}
+	}
+	return Event{}, false
+}
+
+// reactionExists reports whether name already reacted with emoji to target — the
+// idempotency check that keeps a re-tapped reaction from re-emitting a duplicate
+// event or re-delivering the feedback to the agent.
+func reactionExists(target int64, name, emoji string) bool {
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, ev := range events {
+		if ev.Type == "reaction" && ev.Target == target && ev.Name == name && ev.Text == emoji {
+			return true
+		}
+	}
+	return false
 }
 
 // historyPath is the durable JSONL chat log.

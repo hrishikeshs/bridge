@@ -198,6 +198,8 @@ func route(w http.ResponseWriter, r *http.Request) {
 		handleHistory(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/send":
 		handleSend(w, r, id)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/react":
+		handleReact(w, r, id)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/approve":
 		handleApprove(w, r, id)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/interrupt":

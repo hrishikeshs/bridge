@@ -79,6 +79,15 @@
           <img id="attach-thumb" alt="">
           <button id="attach-remove">✕</button>
         </div>
+        <!-- Reply quote chip: the bubble being quoted (author + excerpt), sitting
+             above the input until the message is sent or the ✕ dismisses it. -->
+        <div id="quote-chip" class="hidden">
+          <div class="quote-chip-body">
+            <span id="quote-chip-name"></span>
+            <span id="quote-chip-text"></span>
+          </div>
+          <button id="quote-chip-remove" aria-label="Remove quote">✕</button>
+        </div>
         <div id="composer">
           <button id="attach-btn" title="send a photo">📷</button>
           <input id="attach-input" type="file" accept="image/*" class="hidden">
@@ -91,6 +100,16 @@
         </div>
       </footer>
     </section>
+
+    <!-- Long-press action popover: quote a bubble or react to it. Anchored near
+         the pressed bubble by app.js; a tap on the backdrop (this container) or
+         Esc dismisses. The menu holds a Quote action and the reaction row. -->
+    <div id="action-sheet" class="hidden">
+      <div id="action-menu">
+        <button id="action-quote" class="action-item">↩ Quote</button>
+        <div id="action-reactions"></div>
+      </div>
+    </div>
 
     <!-- SETTINGS — slide-up sheet over either view (theme + notifications). -->
     <div id="settings-sheet" class="sheet hidden">
