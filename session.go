@@ -464,15 +464,21 @@ func runConnect(ctx *cliCtx) error {
 	// The calling agent identifies ITSELF: Claude Code exports the session id
 	// into every shell it runs. This makes connect deterministic in shared
 	// project directories — several agents can live in one directory and each
-	// rehomes its own conversation, never a sibling's. The newest-file
-	// heuristic survives only as a fallback for CC versions without the var.
+	// rehomes its own conversation, never a sibling's.
+	//
+	// When the env id is set but its file is NOT under cwd's project dir, the
+	// agent is simply standing in the wrong directory — ERROR AND SAY SO.
+	// Never fall back to newest-file here: that silently registers whichever
+	// stranger's session happens to live in cwd under the caller's name
+	// (learned live — an agent cd'd into the repo to read the docs and spent
+	// four connect attempts accidentally becoming a 4KB scratch session).
+	// The newest-file heuristic survives only for CC versions without the var.
 	sessionID := os.Getenv("CLAUDE_CODE_SESSION_ID")
 	if sessionID != "" {
 		if _, err := os.Stat(filepath.Join(projectDir(cwd), sessionID+".jsonl")); err != nil {
-			sessionID = "" // env names a session that isn't in this directory
+			return fmt.Errorf("your session (%s) does not live under %s — cd to the directory you normally work in (your project dir) and run connect again", sessionID[:8], cwd)
 		}
-	}
-	if sessionID == "" {
+	} else {
 		sessionFile := currentSessionFile(cwd)
 		if sessionFile == "" {
 			return fmt.Errorf("no Claude Code session found for %s — run this from inside a session", cwd)
