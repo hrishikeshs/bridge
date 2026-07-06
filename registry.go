@@ -423,6 +423,25 @@ func (r *Registry) SetHealth(id, health string) {
 	}
 }
 
+// Retire removes an OFFLINE contact — and its mailbox — from the roster.
+// Live contacts are never retirable: a running agent must lose its window
+// before it can lose its registration, or a typo could orphan someone
+// mid-conversation. Matching a name therefore can only ever hit a ghost,
+// even when a live contact shares it. Returns the removed contact, or nil.
+func (r *Registry) Retire(handle string) *Contact {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, c := range r.contacts {
+		if (c.ID == handle || c.Name == handle) && c.Status != "live" {
+			delete(r.contacts, id)
+			delete(r.mailbox, id)
+			r.save()
+			return c.copy()
+		}
+	}
+	return nil
+}
+
 // SetField pins a plugin annotation on a contact. Returns false when the
 // contact is unknown or the per-contact field cap would be exceeded by a new
 // key (updates to existing keys always succeed).

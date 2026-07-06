@@ -41,6 +41,7 @@ pair' (put it on your phone).`,
 		attachCmd(),
 		pairCmd(),
 		sendCmd(),
+		retireCmd(),
 		exposeCmd(),
 		hookCmd(),
 		lockdownCmd(),
@@ -121,6 +122,25 @@ func sendCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&to, "to", "", "deliver to another agent by name instead of the phone")
 	return cmd
+}
+
+// retireCmd removes an offline contact from the daemon's roster.
+func retireCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "retire <name>",
+		Short: "Remove an OFFLINE contact from the roster (ghosts, finished scratch agents)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var resp struct {
+				Name string `json:"name"`
+			}
+			if err := daemonRequest(http.MethodPost, "/local/retire", map[string]string{"contact": args[0]}, &resp); err != nil {
+				return fmt.Errorf("%w (live agents are never retirable — their window must end first)", err)
+			}
+			fmt.Printf("retired %s — removed from the roster\n", resp.Name)
+			return nil
+		},
+	}
 }
 
 // exposeCmd is implemented in session.go; here it is a stub.

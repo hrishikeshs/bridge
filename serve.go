@@ -313,6 +313,28 @@ func formatInbound(from, via, text string) string {
 	return fmt.Sprintf("[From %s (%s)]: %s", from, via, strings.TrimSpace(flat))
 }
 
+// handleLocalRetire removes an OFFLINE contact from the roster (`bridge
+// retire <name>`). Live contacts are refused by Registry.Retire — a running
+// agent must lose its window before it can lose its registration — so a
+// shared name can only ever match the ghost, never the living.
+func handleLocalRetire(w http.ResponseWriter, r *http.Request) {
+	data, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Contact string `json:"contact"`
+	}
+	_ = json.Unmarshal(data, &req)
+	c := registry.Retire(strings.TrimSpace(req.Contact))
+	if c == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not-found-or-live"})
+		return
+	}
+	audit("retire", c.Name+" ("+c.ID[:8]+")", "local")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": c.Name})
+}
+
 // cspPolicy is the strict Content-Security-Policy served with the app shell and
 // every static asset (M7). Same-origin only, no inline/eval script or style,
 // the page cannot be framed and cannot set a <base>. It is the second line of
@@ -687,6 +709,8 @@ func handleLocal(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"contacts": cs})
 	case r.Method == http.MethodPost && r.URL.Path == "/local/pair":
 		writeJSON(w, http.StatusOK, map[string]string{"code": issuePairingCode()})
+	case r.Method == http.MethodPost && r.URL.Path == "/local/retire":
+		handleLocalRetire(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/local/lockdown":
 		revokeAllDevices()
 		audit("lockdown", "revoke-all + shutdown", "local")

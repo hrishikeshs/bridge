@@ -395,6 +395,15 @@ else
   echo "skip - audit log not reachable"
 fi
 
+# --- retire: ghosts get funerals, the living are protected ----------------
+check "retire unknown -> 404"              404 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d '{"contact":"nobody-here"}' $BASE/local/retire)"
+check "retire offline contact -> 200"      200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d '{"contact":"twin-2"}' $BASE/local/retire)"
+CONTACTS_BODY=$(curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts)
+case "$CONTACTS_BODY" in
+  *'"name":"twin-2"'*) fail_msg "retired contact still on roster" ;;
+  *)                   pass_msg "retired contact gone from roster" ;;
+esac
+
 # --- lockdown (LAST: it stops the daemon) ---------------------------------
 check "lockdown -> 200"                    200 "$(code "${LOCAL_AUTH[@]}" -X POST $BASE/local/lockdown)"
 gone=n
