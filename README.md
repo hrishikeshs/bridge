@@ -21,6 +21,15 @@ terminal, and `bridge pair` to put it on your phone. From then on you're
 texting your crew — from anywhere on your tailnet, with **nobody between your
 thumb and your agent.**
 
+<p align="center">
+  <img src="assets/screen-list.jpg" width="255" alt="The conversation list — Golden Hour theme, the Golden Gate under drifting fog">
+  <img src="assets/screen-approve.jpg" width="255" alt="A real Claude Code permission prompt with Yes / No keys, approved from the couch">
+  <img src="assets/screen-thread.jpg" width="255" alt="A thread — rendered markdown on solid ground">
+</p>
+<p align="center"><sub><i>Real screenshots, unstaged: the buddy list, a live permission card, a thread.
+The fog is real weather — its density follows San Francisco's marine-layer
+schedule by local time.</i></sub></p>
+
 ## How it works
 
 ```
@@ -41,10 +50,25 @@ thumb and your agent.**
   from the session's own output (visible text only; thinking and tool
   internals never leave the machine). Typing indicators are real activity,
   not theater.
-- **Approve permissions from your phone.** A permission prompt raises a
-  tappable card with the actual dialog; approve or deny from the couch.
-  Triggered by Claude Code's Notification hook — a stable contract, not
-  screen-scraping.
+- **Approve permissions from your phone.** A permission prompt rings your
+  phone (Web Push — works with the app closed) and raises a card with the
+  actual dialog: **Yes / Always / No**. "No" is never just no — it points the
+  composer at the conversation so your next message tells the agent what to
+  do differently. Answered cards collapse into a quiet "✓ Approved from
+  phone". Triggered by Claude Code's Notification hook — a stable contract,
+  not screen-scraping.
+- **A real messenger, not a dashboard.** An iMessage-class conversation list
+  (avatars, previews, unread badges, honest timestamps), rendered markdown in
+  bubbles, day pills, typing indicators driven by real activity, photo
+  messages your agents literally look at — and three themes (Golden Hour,
+  Dusk, International Orange) under a settings sheet, with the Golden Gate
+  under drifting fog as the backdrop.
+- **Extensible by anyone's agent.** A plugin is ONE self-describing
+  executable in `~/.bridge/plugins/` — events arrive on stdin, actions leave
+  on stdout, everything audited. Ship a behavior for your crew in ~40 lines
+  of bash: see [docs/plugins.md](docs/plugins.md) and the
+  [memory-keeper example](examples/plugins/). Delivery stays core; opinions
+  are plugins.
 - **A switchboard, not just a bridge.** Agents registered with the same
   daemon can message *each other* (`bridge send --to wren`). Your crew,
   networked — over the same wire your phone rides.
