@@ -816,21 +816,94 @@ function renderEvent(event, resolution) {
     el.appendChild(richText(event.text));
     appendStamp(el, event.ts);
   } else if (event.type === 'reply') {
-    el.className = 'msg reply';
-    el.appendChild(who(event.name || '?'));
-    el.appendChild(richText(event.text));
-    appendStamp(el, event.ts);
+    return replyBubbles(event, 'msg reply', who(event.name || '?'));
   } else if (event.type === 'mention') {
-    el.className = 'msg mention';
-    el.appendChild(who((event.name || 'contact') + ' · @mention'));
-    el.appendChild(richText(event.text));
-    appendStamp(el, event.ts);
+    return replyBubbles(event, 'msg mention', who((event.name || 'contact') + ' · @mention'));
   } else {
     el.className = 'msg system';
     el.textContent = (event.name || '') + ' · ' + event.type +
       (event.text ? ' · ' + event.text : '');
   }
   return el;
+}
+
+/* Agents write essays; phones deserve conversation. A long reply renders as
+   several consecutive bubbles split at pleasing boundaries — paragraphs,
+   never inside code fences or [thinking] blocks — and iMessage-grouped:
+   tight spacing, who-line only on the first, timestamp only on the last.
+   Render-time only: one event on the wire stays one event, so history,
+   pushes and dedup are untouched (and old walls of text improve
+   retroactively). */
+function replyBubbles(event, cls, whoEl) {
+  const parts = splitPleasing(event.text || '');
+  if (parts.length <= 1) {
+    const el = document.createElement('div');
+    el.className = cls;
+    el.appendChild(whoEl);
+    el.appendChild(richText(event.text));
+    appendStamp(el, event.ts);
+    return el;
+  }
+  const frag = document.createDocumentFragment();
+  parts.forEach((p, i) => {
+    const el = document.createElement('div');
+    el.className = cls + (i === 0 ? ' grp-first' : (i === parts.length - 1 ? ' grp-last' : ' grp-mid'));
+    if (i === 0) el.appendChild(whoEl);
+    el.appendChild(richText(p));
+    if (i === parts.length - 1) appendStamp(el, event.ts);
+    frag.appendChild(el);
+  });
+  return frag;
+}
+
+const BUBBLE_TARGET = 550;  // chars a bubble aims for
+const BUBBLE_MAX = 900;     // a text (or lone paragraph) beyond this gets split
+
+function splitPleasing(text) {
+  if (!text || text.length <= BUBBLE_MAX) return [text];
+  // Atomic units never split: [thinking] blocks and fenced code.
+  const units = [];
+  const atomicRe = /(\[thinking\][\s\S]*?(?:\[end[- ]?thinking\]|\[\/thinking\]|$)|```[\s\S]*?(?:```|$))/g;
+  let last = 0, m;
+  while ((m = atomicRe.exec(text)) !== null) {
+    if (m.index > last) units.push(...text.slice(last, m.index).split(/\n{2,}/));
+    units.push(m[1]);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) units.push(...text.slice(last).split(/\n{2,}/));
+  const clean = units.map((u) => u.trim()).filter(Boolean);
+
+  // Pack paragraphs toward the target. A list stays glued to the short
+  // intro that ends with ":"; a giant lone paragraph splits at sentences.
+  const bubbles = [];
+  let cur = '';
+  for (const u of clean) {
+    const atomic = /^(```|\[thinking\])/.test(u);
+    if (u.length > BUBBLE_MAX && !atomic) {
+      if (cur) { bubbles.push(cur); cur = ''; }
+      bubbles.push(...sentencePack(u));
+      continue;
+    }
+    const isList = /^([-*•]|\d+[.)])\s/.test(u);
+    const fits = cur && cur.length + u.length + 2 <= BUBBLE_TARGET;
+    const glued = cur && isList && /:\s*$/.test(cur);
+    if (fits || glued) cur += '\n\n' + u;
+    else { if (cur) bubbles.push(cur); cur = u; }
+  }
+  if (cur) bubbles.push(cur);
+  return bubbles.length ? bubbles : [text];
+}
+
+function sentencePack(par) {
+  const parts = par.split(/(?<=[.!?…])\s+/);
+  const out = [];
+  let cur = '';
+  for (const s of parts) {
+    if (cur && cur.length + s.length + 1 > BUBBLE_TARGET) { out.push(cur); cur = s; }
+    else cur = cur ? cur + ' ' + s : s;
+  }
+  if (cur) out.push(cur);
+  return out;
 }
 
 /* Local echo for an outgoing message. Its delivery state (sending / sent /

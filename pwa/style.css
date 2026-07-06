@@ -962,3 +962,10 @@ footer {
   padding: 1px 5px;
   border-radius: 5px;
 }
+
+/* ---- consecutive-bubble grouping (long replies split pleasingly) ---- */
+.msg.grp-mid, .msg.grp-last { margin-top: -6px; }  /* feed gap is 8px; groups sit at 2px */
+.msg.reply.grp-first, .msg.reply.grp-mid,
+.msg.mention.grp-first, .msg.mention.grp-mid { border-bottom-left-radius: var(--radius); }
+.msg.reply.grp-mid, .msg.reply.grp-last,
+.msg.mention.grp-mid, .msg.mention.grp-last { border-top-left-radius: 6px; }
