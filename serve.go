@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -92,6 +93,15 @@ func writeLockfile(port int, token string) error {
 	return writeFilePrivate(lockfilePath(), data)
 }
 
+// removeOwnLockfile deletes the lockfile only when it still carries our token —
+// so a daemon that took over after us keeps its lockfile intact (review H4).
+func removeOwnLockfile(token string) {
+	if lf, err := readLockfile(); err == nil && lf.Token != token {
+		return // someone else owns it now; leave it
+	}
+	_ = os.Remove(lockfilePath())
+}
+
 // readLockfile reads the running daemon's port and local token.
 func readLockfile() (lockfile, error) {
 	var lf lockfile
@@ -116,11 +126,25 @@ func runServe(port int) error {
 
 	daemonStartUnix = timeNowUnix() // exposed on /api/status; anchors the wake watchdog
 
+	// Bind the port BEFORE claiming the lockfile (review H4). If another daemon
+	// already owns the port, fail here having touched nothing — so a stray
+	// second `bridge serve` (or a KeepAlive relaunch racing a manual start)
+	// can't overwrite the live daemon's local-trust token, and its deferred
+	// cleanup can't delete the live lockfile out from under it.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return fmt.Errorf("could not bind 127.0.0.1:%d (bridge already running?): %w", port, err)
+	}
+
 	localToken = randomHex(32)
 	if err := writeLockfile(port, localToken); err != nil {
+		ln.Close()
 		return err
 	}
-	defer os.Remove(lockfilePath())
+	// Remove the lockfile on exit only if it is still OURS. A daemon that
+	// started after us owns the lockfile now; deleting it would blind every
+	// CLI/hook caller (they'd present a token no daemon knows).
+	defer removeOwnLockfile(localToken)
 
 	startHeartbeat()
 	startSessionManager() // assigned in session.go: tail loops + liveness
@@ -130,10 +154,7 @@ func runServe(port int) error {
 	loadPushSubs()
 	initPlugins() // hook runtime: docs/plugins.md
 
-	srv := &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
-		Handler: http.HandlerFunc(route),
-	}
+	srv := &http.Server{Handler: http.HandlerFunc(route)}
 
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -148,7 +169,7 @@ func runServe(port int) error {
 	}()
 
 	fmt.Printf("bridge daemon on http://127.0.0.1:%d\n", port)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil

@@ -45,6 +45,7 @@ pair' (put it on your phone).`,
 		exposeCmd(),
 		hookCmd(),
 		lockdownCmd(),
+		installDaemonCmd(),
 	)
 	return root
 }
