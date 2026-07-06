@@ -128,8 +128,18 @@ offline semantics. The phone sees the traffic in the relevant threads.
 4. Approve endpoint: whitelisted keys, hook-attested prompt state only.
 5. Every request audited (`~/.bridge/audit.log`); bodies size-capped;
    `bridge lockdown` kills the server and revokes every device.
-6. Agents still face Claude Code's own permission system — the bridge
-   extends the human loop, never removes it.
+6. Agents still face Claude Code's own permission system. For an **honest**
+   agent, the bridge *extends* the human loop — you approve from your phone —
+   it doesn't replace it.
+7. **What the bridge does NOT do: contain a compromised agent.** Managed
+   agents run as the *same UNIX user* as the daemon, so a prompt-injected
+   agent can read its own device token from `~/.bridge/` and `POST
+   /api/approve` to answer its own permission prompt — no human. The 0600
+   file perms stop *other users*, not the very process they host. So the
+   human-in-the-loop guarantee holds exactly as far as the agent is
+   trustworthy. Real containment (running agents under a separate uid, or an
+   out-of-band approve confirmation) is out of scope for v1 — **don't rely on
+   the bridge to sandbox an agent you don't already trust.**
 
 ## 8. Explicitly out (v1)
 

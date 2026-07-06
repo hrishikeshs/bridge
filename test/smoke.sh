@@ -91,7 +91,7 @@ CNAME="smoke-agent"
 BAD_CODE_BODY='{"code":"000000"}'
 GHOST_BODY='{"agent":"ghost-nobody","text":"anyone home?"}'
 EMPTY_BODY='{"agent":"ghost-nobody","text":"   "}'
-DUP_BODY="{\"agent\":\"ghost-dup\",\"text\":\"dup test\",\"client_id\":\"cid-smoke-1\"}"
+DUP_BODY="{\"agent\":\"$CNAME\",\"text\":\"dup test\",\"client_id\":\"cid-smoke-1\"}"
 CONNECT_BODY="{\"name\":\"$CNAME\",\"directory\":\"/private/tmp/smoke-bridge\",\"session_id\":\"sess-smoke\",\"tmux_target\":\"bridge-smoke-nonexistent:0\"}"
 APPROVE_BADKEY='{"agent":"ghost-nobody","key":"q"}'
 APPROVE_OFFLINE='{"agent":"ghost-nobody","key":"1"}'
@@ -153,8 +153,14 @@ check "local/contacts needs local token"  401 "$(code $BASE/local/contacts)"
 # --- send: offline, idempotency, validation -------------------------------
 check "send to unknown contact -> 409"    409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$GHOST_BODY" $BASE/api/send)"
 check "empty send rejected -> 400"        400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$EMPTY_BODY" $BASE/api/send)"
-# First send records the client_id (returns 409 since the agent is offline);
-# the retry with the SAME client_id must be acked as a duplicate, not resent.
+# H1: a client_id commits only after a *durable* accept (delivered, or mailboxed
+# for a known-offline contact); a failed/unknown send no longer falsely dedups.
+# Wait for the reconcile loop to retire the dead-tmux contact to offline, so the
+# first send is queued (durable — commits the id) and the retry is a true dup.
+for _ in $(seq 40); do
+  curl -s "${DEV_AUTH[@]}" $BASE/api/status | grep -q '"offline"' && break
+  sleep 0.25
+done
 curl -s -o /dev/null "${DEV_AUTH[@]}" "${J[@]}" -d "$DUP_BODY" $BASE/api/send
 DUP_RESP=$(curl -s "${DEV_AUTH[@]}" "${J[@]}" -d "$DUP_BODY" $BASE/api/send)
 body_has "duplicate client_id acked"      '"duplicate":true' "$DUP_RESP"

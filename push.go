@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 
@@ -60,6 +62,58 @@ func savePushSubs() {
 	_ = writeFilePrivate(subsPath(), data)
 }
 
+// clearPushSubs drops every stored push subscription and persists the empty
+// set. Called on lockdown (revokeAllDevices) so a revoked or lost phone stops
+// receiving pushes. savePushSubs takes pushMu itself, so release it first.
+func clearPushSubs() {
+	pushMu.Lock()
+	pushSubs = map[string]*webpush.Subscription{}
+	pushMu.Unlock()
+	savePushSubs()
+}
+
+// validPushEndpoint guards handlePushSubscribe against SSRF: a paired device
+// could otherwise register an arbitrary Endpoint that sendPush would then POST
+// to (and log the response of). We require https and reject anything that
+// isn't a plausible public push host — raw IP literals and any name that
+// resolves into a loopback/private/link-local range. This is deliberately a
+// range check rather than a brittle origin allowlist so legitimate Apple /
+// FCM / Mozilla / WNS hosts keep working without maintenance.
+func validPushEndpoint(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	// Real push services are DNS names, never raw IPs — reject IP literals
+	// (the most direct SSRF vector).
+	if net.ParseIP(host) != nil {
+		return false
+	}
+	// A host that fails to resolve is not an SSRF vector — sendPush simply can't
+	// connect. Only a host that *resolves into* an internal range is dangerous,
+	// so reject on that, not on a lookup miss (which would also break subscribes
+	// on offline / DNS-flaky networks).
+	if ips, err := net.LookupIP(host); err == nil {
+		for _, ip := range ips {
+			if isInternalIP(ip) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isInternalIP reports whether ip belongs to a range a public push service
+// should never live in.
+func isInternalIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
+}
+
 // handlePushKey returns the VAPID public key the client needs to subscribe.
 func handlePushKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"key": vapid.Public})
@@ -74,6 +128,10 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	var sub webpush.Subscription
 	if json.Unmarshal(data, &sub) != nil || sub.Endpoint == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-subscription"})
+		return
+	}
+	if !validPushEndpoint(sub.Endpoint) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-endpoint"})
 		return
 	}
 	token := requestToken(r)

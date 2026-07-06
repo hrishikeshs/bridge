@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -29,6 +30,10 @@ type Event struct {
 	Agent string `json:"agent"`
 	Name  string `json:"name"`
 	Text  string `json:"text"`
+	// ClientID echoes the phone's client_id back on a "sent" acknowledgement so
+	// the PWA can dedup its optimistic local echo by id rather than by text
+	// (M5). Empty (and omitted) for every server-originated event.
+	ClientID string `json:"client_id,omitempty"`
 }
 
 var (
@@ -36,6 +41,9 @@ var (
 	events         []Event // newest first, capped at historySize
 	eventCounter   int64
 	historyAppends int
+	// historyWriteMu serializes history-file writes performed outside eventsMu,
+	// so a lock-free append can't interleave with a compaction rewrite (M9).
+	historyWriteMu sync.Mutex
 )
 
 // sseClient is one connected /api/events subscriber; frames are queued on ch.
@@ -82,21 +90,46 @@ func broadcast(frame string) {
 
 // Emit records a durable event, assigns it the next monotonic id, appends it
 // to the history file, and broadcasts it to SSE clients. It is the single
-// entry point every subsystem uses to speak, and returns the stored event.
-func Emit(typ, agent, name, text string) Event {
+// entry point every subsystem uses to speak, and returns the stored event. An
+// optional clientID is echoed on "sent" acknowledgements for phone-echo dedup
+// (M5); server-originated events pass none.
+func Emit(typ, agent, name, text string, clientID ...string) Event {
 	eventsMu.Lock()
 	eventCounter++
 	ev := Event{ID: eventCounter, TS: nowUTC(), Type: typ, Agent: agent, Name: name, Text: text}
+	if len(clientID) > 0 {
+		ev.ClientID = clientID[0]
+	}
 	events = append([]Event{ev}, events...)
 	if len(events) > historySize {
 		events = events[:historySize]
 	}
-	appendHistory(ev)
 	historyAppends++
 	if historyAppends > 2*historySize {
+		// Compaction rewrites the whole file from the in-memory ring, so it needs
+		// a consistent snapshot and must not interleave with a lock-free append.
+		// It stays under eventsMu (rare: ~once per 2*historySize events); taking
+		// historyWriteMu keeps its atomic rename from clobbering an append that
+		// already released eventsMu and is mid-flight.
+		historyWriteMu.Lock()
 		compactHistoryLocked()
+		historyWriteMu.Unlock()
+		eventsMu.Unlock()
+		broadcast(frameFor(ev))
+		return ev
 	}
 	eventsMu.Unlock()
+
+	// M9: append the one new line to disk *outside* eventsMu, so a slow or full
+	// disk can never stall readers (eventsSince) or other emitters on the lock.
+	// The id and the in-memory ring (the source of truth for live delivery) are
+	// already fixed above under eventsMu; only the disk write moves out.
+	// historyWriteMu serializes this append against a compaction rewrite. Disk
+	// order among simultaneous appends may not match id order, but loadHistory
+	// sorts by id on restart, so recovery order stays correct.
+	historyWriteMu.Lock()
+	appendHistory(ev)
+	historyWriteMu.Unlock()
 
 	broadcast(frameFor(ev))
 	return ev
@@ -132,8 +165,10 @@ func eventsSince(since int64) []Event {
 // historyPath is the durable JSONL chat log.
 func historyPath() string { return bridgePath("history.jsonl") }
 
-// appendHistory writes ev as one JSON line to the history file. Caller holds
-// eventsMu. Best-effort: losing history must never break serving.
+// appendHistory writes ev as one JSON line to the history file. It touches no
+// shared in-memory state and runs outside eventsMu; callers hold historyWriteMu
+// to serialize it against a compaction rewrite. Best-effort: losing history must
+// never break serving.
 func appendHistory(ev Event) {
 	if ensureBridgeDir() != nil {
 		return
@@ -175,7 +210,8 @@ func loadHistory() {
 	}
 	defer f.Close()
 
-	var all []Event // oldest first, as written
+	var all []Event // as written; sorted by id below
+	corrupt := false
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for sc.Scan() {
@@ -184,10 +220,19 @@ func loadHistory() {
 			continue
 		}
 		var ev Event
-		if json.Unmarshal(line, &ev) == nil && ev.ID != 0 {
-			all = append(all, ev)
+		if json.Unmarshal(line, &ev) != nil || ev.ID == 0 {
+			corrupt = true // an unparseable / id-less line: don't clobber the file
+			continue
 		}
+		all = append(all, ev)
 	}
+	if sc.Err() != nil {
+		corrupt = true // truncated or oversized line: the log didn't read cleanly
+	}
+
+	// Disk order isn't guaranteed to match id order (M9 appends outside the lock),
+	// so sort by id before trimming so we keep the genuinely newest events.
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
 	if len(all) > historySize {
 		all = all[len(all)-historySize:]
 	}
@@ -197,6 +242,16 @@ func loadHistory() {
 		if ev.ID > eventCounter {
 			eventCounter = ev.ID
 		}
+	}
+
+	if corrupt {
+		// The on-disk log had unparseable content. Preserve it as .corrupt so a
+		// later append or compaction can't silently overwrite and lose it, then
+		// rewrite a clean history.jsonl from the events we salvaged (M3). Renaming
+		// an open file is fine on this platform; the deferred Close still applies.
+		_ = os.Rename(historyPath(), historyPath()+".corrupt")
+		compactHistoryLocked()
+		return
 	}
 	if fi, err := os.Stat(historyPath()); err == nil && fi.Size() > historyMaxBytes {
 		compactHistoryLocked()

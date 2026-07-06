@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,9 +52,28 @@ func tmux(args ...string) (string, error) {
 	return out.String(), err
 }
 
-// tmuxAlive reports whether TARGET ("bridge:<name>") names a live window.
-// has-session validates only the session, so we check the window list.
+// tmuxAlive reports whether TARGET names a live window. TARGET is normally a
+// window id ("@N"), which is immune to tmux's target grammar — a numeric or
+// relative window *name* can never misroute to it (C2). A legacy "bridge:<name>"
+// target, written by daemons before the window-id migration, is resolved by
+// window name so on-disk contacts keep working until they next reconnect.
 func tmuxAlive(target string) bool {
+	if target == "" {
+		return false
+	}
+	if strings.HasPrefix(target, "@") {
+		// Window ids are unique server-wide; check membership directly.
+		out, err := tmux("list-windows", "-a", "-F", "#{window_id}")
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.TrimSpace(line) == target {
+				return true
+			}
+		}
+		return false
+	}
 	sess, win, found := strings.Cut(target, ":")
 	if !found {
 		_, err := tmux("has-session", "-t", target)
@@ -69,6 +89,23 @@ func tmuxAlive(target string) bool {
 		}
 	}
 	return false
+}
+
+// tmuxWindowID returns the window id ("@N") of the window named NAME in the
+// shared "bridge" session, or "" if there is none. Used to capture the routing
+// target at creation and to migrate a legacy name-based target on revive.
+func tmuxWindowID(name string) string {
+	out, err := tmux("list-windows", "-t", "bridge", "-F", "#{window_id} #{window_name}")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		id, wname, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if ok && wname == name {
+			return id
+		}
+	}
+	return ""
 }
 
 // tmuxDeliver types TEXT into the agent's terminal as one literal line and
@@ -140,10 +177,17 @@ func startSessionManager() {
 					delete(tails, c.ID)
 				case c.Status != "live" && alive:
 					// Its window outlived a daemon restart: revive it so a
-					// restart never orphans a running agent.
-					registry.Connect(c.Name, c.Directory, c.SessionID, c.TmuxTarget)
-					Emit("connected", c.ID, c.Name, "")
-					flushMailbox(&Contact{ID: c.ID, Name: c.Name, TmuxTarget: c.TmuxTarget})
+					// restart never orphans a running agent. Migrate a legacy
+					// name-based target to the grammar-immune window id here.
+					target := c.TmuxTarget
+					if !strings.HasPrefix(target, "@") {
+						if id := tmuxWindowID(c.Name); id != "" {
+							target = id
+						}
+					}
+					revived := registry.Connect(c.Name, c.Directory, c.SessionID, target)
+					Emit("connected", revived.ID, revived.Name, "")
+					flushMailbox(revived)
 				case c.Status == "live" && alive:
 					pollReplies(c)
 				}
@@ -157,7 +201,7 @@ func startSessionManager() {
 // session JSONL each pass (the path changes on --resume) and, on a switch,
 // starts at end-of-file so replayed history is not re-sent to the phone.
 func pollReplies(c *Contact) {
-	path := currentSessionFile(c.Directory)
+	path := sessionFileFor(c)
 	if path == "" {
 		return
 	}
@@ -183,15 +227,34 @@ func pollReplies(c *Contact) {
 	if _, err := f.Seek(st.offset, 0); err != nil {
 		return
 	}
+	// Read a fixed [offset,size) window so a line still being appended can't be
+	// half-consumed: LimitReader pins the region, letting us distinguish a
+	// newline-terminated line (safe to advance past) from a trailing partial one
+	// (re-read whole next poll — M12).
+	region := size - st.offset
 	var consumed int64
 	var texts []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	sc := bufio.NewScanner(io.LimitReader(f, region))
+	sc.Buffer(make([]byte, 0, 1024*1024), maxJSONLLine)
 	for sc.Scan() {
 		line := sc.Bytes()
-		consumed += int64(len(line)) + 1 // +1 for the newline
+		end := consumed + int64(len(line))
+		if end >= region {
+			// The token runs to the end of the region with no newline after it:
+			// a partial line still being written. Leave it for the next poll.
+			break
+		}
+		consumed = end + 1 // token + its stripped newline
 		if t := assistantText(line); t != "" {
 			texts = append(texts, t)
+		}
+	}
+	if err := sc.Err(); err == bufio.ErrTooLong {
+		// A single JSONL line exceeded the scanner cap (e.g. a giant tool
+		// result). Step past it instead of re-reading it forever (M11); if it
+		// isn't newline-terminated yet, wait and retry on the next poll.
+		if skip := skipOversizedLine(path, st.offset+consumed); skip > 0 {
+			consumed += skip
 		}
 	}
 	st.offset += consumed
@@ -200,8 +263,8 @@ func pollReplies(c *Contact) {
 		for _, t := range texts {
 			Emit("reply", c.ID, c.Name, t)
 		}
-	} else {
-		// File grew but produced no visible text: the agent is thinking or
+	} else if consumed > 0 {
+		// File advanced but produced no visible text: the agent is thinking or
 		// running tools — i.e. working.
 		registry.SetHealth(c.ID, "working")
 		EmitTyping(c.ID, c.Name)
@@ -284,6 +347,42 @@ func currentSessionFile(dir string) string {
 	return newest
 }
 
+// maxJSONLLine bounds how large a single session-JSONL line the tail will
+// buffer, so a giant tool result can't blow up memory; a line past it is
+// skipped rather than re-read forever (M11).
+const maxJSONLLine = 8 * 1024 * 1024
+
+// sessionFileFor returns the JSONL to tail for c: its own session file when it
+// has a SessionID, so two agents rehomed from the same directory never tail
+// each other's conversation (H2). It falls back to the newest .jsonl in the
+// directory only before any session id is known.
+func sessionFileFor(c *Contact) string {
+	if c.SessionID != "" {
+		return filepath.Join(projectDir(c.Directory), c.SessionID+".jsonl")
+	}
+	return currentSessionFile(c.Directory)
+}
+
+// skipOversizedLine returns the byte length (including the terminating newline)
+// of the single line beginning at OFFSET, or 0 if that line is not yet
+// newline-terminated. Used to step the tail past a JSONL line too large for the
+// scanner buffer instead of wedging on it.
+func skipOversizedLine(path string, offset int64) int64 {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, 0); err != nil {
+		return 0
+	}
+	line, err := bufio.NewReader(f).ReadBytes('\n')
+	if err != nil {
+		return 0 // no terminating newline yet: wait for the writer to finish it
+	}
+	return int64(len(line))
+}
+
 func sessionIDFromPath(path string) string {
 	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
 }
@@ -307,13 +406,22 @@ type cliCtx struct {
 	to   string // --to (send)
 }
 
+// nameConnectRe validates a user-supplied --name: it must start with a letter
+// and then contain only letters, digits, '-' and '_' (max 31 chars). This
+// rejects all-digit, relative ('+'/'-'), whitespace and special names that tmux
+// would otherwise misresolve via its target grammar (C2).
+var nameConnectRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,30}$`)
+
 // runConnect rehomes the calling agent: it finds this session's conversation,
 // spawns a daemon-managed tmux running `claude --resume` on it, registers the
-// contact, installs the Notification hook, and prints the handoff.
+// contact, installs the Notification hook, and prints the handoff. --name is
+// optional; when omitted an adjective-animal address is generated. The daemon
+// owns final naming (uniqueness among live contacts), so we create the window,
+// register, then rename the window if the daemon suffixed the name.
 func runConnect(ctx *cliCtx) error {
 	name := ctx.name
-	if name == "" {
-		return fmt.Errorf("bridge connect needs --name <address>")
+	if name != "" && !nameConnectRe.MatchString(name) {
+		return fmt.Errorf("invalid --name %q: start with a letter, then letters/digits/-/_ (max 31 chars); numeric, relative (+/-), whitespace and special names are rejected", name)
 	}
 	if err := ensureDaemon(); err != nil {
 		return err
@@ -327,25 +435,18 @@ func runConnect(ctx *cliCtx) error {
 		return fmt.Errorf("no Claude Code session found for %s — run this from inside a session", cwd)
 	}
 	sessionID := sessionIDFromPath(sessionFile)
-	target := "bridge:" + name
-
-	if !tmuxAlive(target) {
-		// All agents live as windows in one shared "bridge" session, so a
-		// single `bridge attach` groups them under one terminal window with a
-		// tab (window) each. Isolation is per-window: send-keys/capture-pane
-		// target one window and never leak across.
-		var err error
-		if _, e := tmux("has-session", "-t", "bridge"); e != nil {
-			_, err = tmux("new-session", "-d", "-s", "bridge", "-n", name, "-c", cwd,
-				"-e", "BRIDGE_CONTACT="+name, "claude", "--resume", sessionID)
-		} else {
-			_, err = tmux("new-window", "-t", "bridge", "-n", name, "-c", cwd,
-				"-e", "BRIDGE_CONTACT="+name, "claude", "--resume", sessionID)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to rehome into tmux (is tmux installed?): %w", err)
-		}
+	if name == "" {
+		name = generateName(liveContactNames())
 	}
+
+	// Create (or reuse) this agent's window in the shared "bridge" session and
+	// capture its window id (@N) as the routing target — immune to tmux's target
+	// grammar, so a numeric/relative name can never misroute a message (C2).
+	target, err := ensureWindow(name, cwd, sessionID)
+	if err != nil {
+		return err
+	}
+
 	var reg struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
@@ -355,6 +456,13 @@ func runConnect(ctx *cliCtx) error {
 		"session_id": sessionID, "tmux_target": target,
 	}, &reg); err != nil {
 		return err
+	}
+	// The daemon guarantees uniqueness among live contacts; if it suffixed the
+	// name to dodge a collision, rename the window to the final address so
+	// `bridge attach` and the roster match what the phone will use.
+	if reg.Name != "" && reg.Name != name {
+		_, _ = tmux("rename-window", "-t", target, reg.Name)
+		name = reg.Name
 	}
 	if err := installHook(); err != nil {
 		fmt.Printf("(note: could not install the permission hook: %v)\n", err)
@@ -373,6 +481,54 @@ Type at your desk, text from the couch — same me, same conversation.
 This window is now a retired copy — quit it whenever; I'm no longer in it.
 `, name)
 	return nil
+}
+
+// ensureWindow makes sure the agent has a window in the shared "bridge" tmux
+// session running `claude --resume`, and returns its window id ("@N"). Reusing
+// an existing same-named window keeps reconnects idempotent. All agents share
+// one session so `bridge attach` groups them as tabs; isolation is per window,
+// and the returned @N is the grammar-immune routing target.
+func ensureWindow(name, cwd, sessionID string) (string, error) {
+	if id := tmuxWindowID(name); id != "" {
+		return id, nil
+	}
+	var out string
+	var err error
+	if _, e := tmux("has-session", "-t", "bridge"); e != nil {
+		out, err = tmux("new-session", "-d", "-s", "bridge", "-n", name, "-c", cwd,
+			"-P", "-F", "#{window_id}",
+			"-e", "BRIDGE_CONTACT="+name, "claude", "--resume", sessionID)
+	} else {
+		out, err = tmux("new-window", "-t", "bridge", "-n", name, "-c", cwd,
+			"-P", "-F", "#{window_id}",
+			"-e", "BRIDGE_CONTACT="+name, "claude", "--resume", sessionID)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to rehome into tmux (is tmux installed?): %w", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// liveContactNames fetches the daemon roster and returns the set of names in
+// use, so CLI-side auto-naming avoids obvious collisions before it even asks the
+// daemon. The daemon still enforces true uniqueness among live contacts; this is
+// only a best-effort first pass.
+func liveContactNames() map[string]bool {
+	taken := map[string]bool{}
+	var resp struct {
+		Contacts []struct {
+			Name string `json:"name"`
+		} `json:"contacts"`
+	}
+	if err := daemonRequest("GET", "/local/contacts", nil, &resp); err != nil {
+		return taken
+	}
+	for _, c := range resp.Contacts {
+		if c.Name != "" {
+			taken[c.Name] = true
+		}
+	}
+	return taken
 }
 
 // runAttach hands the terminal to the grouped "bridge" tmux session — all
@@ -487,7 +643,12 @@ func installHook() error {
 	path := filepath.Join(home, ".claude", "settings.json")
 	settings := map[string]any{}
 	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &settings)
+		if err := json.Unmarshal(data, &settings); err != nil {
+			// Never overwrite settings we can't parse: a single stray comma
+			// would otherwise cost the user their permissions, env, model and
+			// any other hooks (M1). Abort, leaving the file untouched.
+			return fmt.Errorf("refusing to edit unparseable %s: %w", path, err)
+		}
 	}
 	exe, _ := os.Executable()
 	hooks, _ := settings["hooks"].(map[string]any)

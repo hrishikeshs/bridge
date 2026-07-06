@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // PWA is the embedded progressive web app served to phones. The pwa/ tree is
@@ -236,10 +237,11 @@ var (
 	seenIDs []string
 )
 
-// duplicateClientID records id and reports whether it was already seen.
-// Retrying a send is always safe: a repeated id is acknowledged, never
-// redelivered.
-func duplicateClientID(id string) bool {
+// seenClientID reports whether id was already committed as a durable success.
+// It only reads: a repeated id is a real duplicate solely when the *first*
+// attempt succeeded, so recording is deferred to commitClientID (after delivery
+// or mailbox queueing), never here (H1). A blank id is never a duplicate.
+func seenClientID(id string) bool {
 	if id == "" {
 		return false
 	}
@@ -250,19 +252,56 @@ func duplicateClientID(id string) bool {
 			return true
 		}
 	}
+	return false
+}
+
+// commitClientID records id as durably handled (delivered to a live session or
+// queued to a mailbox) so a later retry is acknowledged without redelivery.
+// Because it runs only after success, a failed send leaves no trace and its
+// retry runs for real instead of being swallowed as a "duplicate" (H1).
+func commitClientID(id string) {
+	if id == "" {
+		return
+	}
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	for _, s := range seenIDs {
+		if s == id {
+			return // already recorded
+		}
+	}
 	seenIDs = append([]string{id}, seenIDs...)
 	if len(seenIDs) > clientIDRing {
 		seenIDs = seenIDs[:clientIDRing]
 	}
-	return false
 }
 
 // formatInbound builds the prefix a delivered message wears in the agent's
-// terminal, collapsing newlines so it lands as a single send-keys line.
+// terminal, collapsing whitespace so it lands as a single send-keys line and
+// stripping control bytes. newline/CR/tab become a single space; every other
+// non-printable rune (ESC, arrow/cursor sequences, other C0/C1 controls, format
+// characters) is dropped so a peer message can't drive the recipient agent's TUI
+// (L4). Printable characters, including non-ASCII graphics, pass through.
 func formatInbound(from, via, text string) string {
-	flat := strings.TrimSpace(strings.NewReplacer("\n", " ", "\r", " ").Replace(text))
-	return fmt.Sprintf("[From %s (%s)]: %s", from, via, flat)
+	flat := strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		}
+		if !unicode.IsPrint(r) {
+			return -1 // drop
+		}
+		return r
+	}, text)
+	return fmt.Sprintf("[From %s (%s)]: %s", from, via, strings.TrimSpace(flat))
 }
+
+// cspPolicy is the strict Content-Security-Policy served with the app shell and
+// every static asset (M7). Same-origin only, no inline/eval script or style,
+// images may additionally be data: URIs (attachment previews), the page cannot be
+// framed and cannot set a <base>. It is the second line of defense if agent output
+// ever reaches an innerHTML sink.
+const cspPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 
 var staticTypes = map[string]string{
 	".html":        "text/html; charset=utf-8",
@@ -302,6 +341,7 @@ func serveStatic(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Security-Policy", cspPolicy)
 	_, _ = w.Write(data)
 }
 
@@ -437,7 +477,10 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too-long"})
 		return
 	}
-	if duplicateClientID(req.ClientID) {
+	// Check up front: only a client_id from a previously *successful* send is a
+	// duplicate. A failed attempt was never committed, so its retry falls through
+	// and runs for real instead of being acked as a no-op (H1).
+	if seenClientID(req.ClientID) {
 		audit("send-duplicate-dropped", req.Text, id)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "duplicate": true})
 		return
@@ -447,6 +490,7 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 	if c == nil || c.Status != "live" {
 		if c != nil {
 			registry.Queue(c.ID, MailMessage{From: authConfig.UserMention, Via: "phone", Text: req.Text, TS: nowUTC()})
+			commitClientID(req.ClientID) // durably queued: a retry must not re-queue
 		}
 		audit("send-offline", req.Agent, id)
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
@@ -458,8 +502,9 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	commitClientID(req.ClientID) // delivered: a retry is now a safe duplicate ack
 	audit("send", c.Name+": "+req.Text, id)
-	Emit("sent", c.ID, c.Name, req.Text)
+	Emit("sent", c.ID, c.Name, req.Text, req.ClientID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -519,7 +564,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-image"})
 		return
 	}
-	if duplicateClientID(req.ClientID) {
+	// Only a client_id from a previously *successful* upload is a duplicate; a
+	// failed attempt is never committed, so its retry re-runs (H1).
+	if seenClientID(req.ClientID) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "duplicate": true})
 		return
 	}
@@ -535,11 +582,16 @@ func handleUpload(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	msg := fmt.Sprintf("%s [photo saved at %s — use the Read tool to view it]", strings.TrimSpace(req.Text), pathOnDisk)
 	if err := deliverToSession(c, formatInbound(authConfig.UserMention, "phone", msg)); err != nil {
+		// Delivery failed: don't orphan the just-written attachment, and don't
+		// commit the client_id, so the phone's retry re-attempts instead of the
+		// message (and file) being silently dropped (H1).
+		_ = os.Remove(pathOnDisk)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	commitClientID(req.ClientID) // delivered: a retry is now a safe duplicate ack
 	audit("upload", fmt.Sprintf("%s <- %s (%d bytes)", c.Name, pathOnDisk, len(img)), id)
-	Emit("sent", c.ID, c.Name, strings.TrimSpace(req.Text)+" 📷 photo")
+	Emit("sent", c.ID, c.Name, strings.TrimSpace(req.Text)+" 📷 photo", req.ClientID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -631,21 +683,22 @@ func handleLocalConnect(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"id": c.ID, "name": c.Name})
 }
 
-// flushMailbox delivers a revived contact's queued messages in order, stopping
-// and requeuing the remainder at the first delivery failure.
+// flushMailbox delivers a revived contact's queued messages in order. It defers
+// removal to registry.FlushMailbox, which drops each message only after this
+// callback reports it delivered and persists after each one — so a crash mid-drain
+// redelivers at most the undelivered tail instead of losing the whole batch (M6).
 func flushMailbox(c *Contact) {
-	msgs := registry.TakeMailbox(c.ID)
-	for i, m := range msgs {
+	registry.FlushMailbox(c.ID, func(m MailMessage) error {
 		text := m.Text
 		if m.From != "" {
 			text = formatInbound(m.From, m.Via, m.Text)
 		}
 		if err := deliverToSession(c, text); err != nil {
-			registry.Requeue(c.ID, msgs[i:])
-			return
+			return err
 		}
 		Emit("sent", c.ID, c.Name, m.Text)
-	}
+		return nil
+	})
 }
 
 // handleLocalEvent processes a Notification-hook POST {session_id, message,

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,8 +15,14 @@ import (
 	"time"
 )
 
-// pairingTTL is how long a printed pairing code stays redeemable.
-const pairingTTL = 10 * time.Minute
+// pairingTTL is how long a printed pairing code stays redeemable. Kept short
+// (matches the documented/PWA value) to shrink the brute-force window.
+const pairingTTL = 2 * time.Minute
+
+// maxPairingFails is how many wrong guesses a live pairing code tolerates
+// before it is invalidated and must be re-issued. This attempt-cap — not the
+// digit count — is what defeats the brute-force (C1).
+const maxPairingFails = 5
 
 // bridgeDir returns the ~/.bridge configuration directory.
 func bridgeDir() string {
@@ -27,8 +34,12 @@ func bridgeDir() string {
 }
 
 // ensureBridgeDir creates ~/.bridge with owner-only permissions if absent.
+// MkdirAll won't tighten a pre-existing directory, so chmod unconditionally.
 func ensureBridgeDir() error {
-	return os.MkdirAll(bridgeDir(), 0o700)
+	if err := os.MkdirAll(bridgeDir(), 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(bridgeDir(), 0o700)
 }
 
 // bridgePath joins name onto the bridge configuration directory.
@@ -36,16 +47,29 @@ func bridgePath(name string) string {
 	return filepath.Join(bridgeDir(), name)
 }
 
-// writeFilePrivate writes data to path with 0600 permissions, creating the
-// ~/.bridge directory first. Secrets and history never touch a wider mode.
+// writeFilePrivate atomically writes data to path with 0600 permissions,
+// creating the ~/.bridge directory first. Secrets and history never touch a
+// wider mode. The write goes to a sibling temp file then os.Rename's over the
+// target, so a crash mid-write can never leave a truncated file (M3).
 func writeFilePrivate(path string, data []byte) error {
 	if err := ensureBridgeDir(); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Chmod(path, 0o600)
+	// WriteFile only honours the mode when creating; force 0600 in case the
+	// temp file pre-existed with a wider mode.
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // randomHex returns n cryptographically random bytes as a hex string.
@@ -144,21 +168,43 @@ func saveTokens() {
 }
 
 var (
-	pairingMu   sync.Mutex
-	pairingCode string
-	pairingExp  time.Time
+	pairingMu    sync.Mutex
+	pairingCode  string
+	pairingExp   time.Time
+	pairingFails int // wrong guesses against the current code; guarded by pairingMu
 )
 
-// issuePairingCode mints a single-use, six-digit code valid for ten minutes.
+// pairingDigits returns a uniform six-digit value in [0, 1000000) with no
+// modulo bias (reject-sampling the biased tail) and panics if crypto/rand
+// fails — matching randomHex's posture so an RNG failure can never silently
+// yield a guessable 000000.
+func pairingDigits() int {
+	const mod = 1000000
+	// Largest multiple of mod that fits in 24 bits; values >= this would bias
+	// the low end, so resample them away.
+	const limit = (1 << 24) - ((1 << 24) % mod)
+	for {
+		b := make([]byte, 3)
+		if _, err := rand.Read(b); err != nil {
+			panic("bridge: crypto/rand unavailable: " + err.Error())
+		}
+		n := int(b[0])<<16 | int(b[1])<<8 | int(b[2])
+		if n < limit {
+			return n % mod
+		}
+	}
+}
+
+// issuePairingCode mints a single-use, six-digit code valid for pairingTTL.
 // It is returned only to the on-machine caller (bridge pair); the code is the
 // second factor precisely because it is displayed nowhere the network reaches.
+// Issuing a fresh code resets the failed-attempt counter.
 func issuePairingCode() string {
-	b := make([]byte, 3)
-	_, _ = rand.Read(b)
-	n := (int(b[0])<<16 | int(b[1])<<8 | int(b[2])) % 1000000
+	n := pairingDigits()
 	pairingMu.Lock()
 	pairingCode = fmt.Sprintf("%06d", n)
 	pairingExp = time.Now().Add(pairingTTL)
+	pairingFails = 0
 	code := pairingCode
 	pairingMu.Unlock()
 	audit("pair-code-issued", "", "local")
@@ -166,14 +212,29 @@ func issuePairingCode() string {
 }
 
 // tryPair redeems code for device, returning a fresh device token or "".
-// A successful redemption consumes the code (single use).
+// A successful redemption consumes the code (single use). Each wrong guess
+// against a live code is counted, and after maxPairingFails the code is
+// invalidated so it must be re-issued — this defeats the brute-force (C1).
 func tryPair(code, device string) string {
 	pairingMu.Lock()
-	if pairingCode == "" || code == "" || code != pairingCode || time.Now().After(pairingExp) {
+	// No live/unexpired code to redeem.
+	if pairingCode == "" || time.Now().After(pairingExp) {
+		pairingMu.Unlock()
+		return ""
+	}
+	// Constant-time comparison (L3). ConstantTimeCompare returns 0 on any
+	// length or content mismatch, so an empty guess fails here too.
+	if subtle.ConstantTimeCompare([]byte(code), []byte(pairingCode)) != 1 {
+		pairingFails++
+		if pairingFails >= maxPairingFails {
+			pairingCode = "" // too many wrong guesses; force a re-issue
+			audit("pair-code-locked", "", "local")
+		}
 		pairingMu.Unlock()
 		return ""
 	}
 	pairingCode = "" // single use
+	pairingFails = 0
 	pairingMu.Unlock()
 
 	if device == "" {
@@ -198,12 +259,15 @@ func tokenValid(token string) bool {
 	return ok
 }
 
-// revokeAllDevices deletes every paired device token.
+// revokeAllDevices deletes every paired device token and drops every push
+// subscription. A locked-down or lost phone must stop both authenticating and
+// receiving pushes (whose bodies carry agent command lines) — M2.
 func revokeAllDevices() {
 	tokensMu.Lock()
 	tokens = map[string]deviceToken{}
 	saveTokens()
 	tokensMu.Unlock()
+	clearPushSubs()
 	audit("revoke-all", "", "local")
 }
 

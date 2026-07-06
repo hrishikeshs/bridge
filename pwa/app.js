@@ -44,6 +44,12 @@ setInterval(() => {                 // expire stale typing bubbles
 async function init() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
+    // Notification tap (app already open): the SW posts the contact to open.
+    // Validate it against the live roster before selecting — never trust a
+    // value from outside to pick the target agent.
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'open-contact') selectContactIfValid(e.data.contact);
+    });
   }
   const res = await fetch('/api/status').catch(() => null);
   if (!res) return showOffline();          // unreachable: show cached feed
@@ -52,6 +58,11 @@ async function init() {
   state.contacts = data.contacts || [];
   setConnected(true);
   showApp();
+  // Cold-open from a notification tap: /?contact=<id>. Validate against the
+  // roster we just loaded before honouring it — a crafted id must not select
+  // an unintended or nonexistent target.
+  const deepLink = new URLSearchParams(location.search).get('contact');
+  if (deepLink) selectContactIfValid(deepLink);
   await loadHistory();
   connectEvents();
   setInterval(refreshStatus, 30000);
@@ -171,7 +182,7 @@ function connectEvents() {
     // Drop the local echo only once the server's own 'sent' event has been
     // accepted for render — otherwise a deduped event would remove the echo
     // and leave no bubble at all.
-    if (added && event.type === 'sent') dropPendingEcho(event.agent, event.text);
+    if (added && event.type === 'sent') dropPendingEcho(event.agent, event.text, event.client_id);
     cacheEvents();
     renderFeed();
     renderTabs();
@@ -295,6 +306,13 @@ function selectContact(id) {
   renderTabs();
   renderFeed();
   restoreDraft();
+}
+
+// Select a contact only if the id is actually in the current roster. Used for
+// notification deep-links (SW message + ?contact=) so an unknown or crafted id
+// is ignored rather than selecting an unintended target.
+function selectContactIfValid(id) {
+  if (id && state.contacts.some((c) => c.id === id)) selectContact(id);
 }
 
 function chip(cls, text) {
@@ -765,11 +783,18 @@ function flushOutbox() {
 
 /* The server broadcasts its own "sent" event for each accepted message;
    drop the matching local echo so the thread shows one bubble, not two.
+   Match on the server-echoed client_id first — text-matching can splice out
+   the wrong queued message when two share the same text ("yes"/"go"). Fall
+   back to text only when no client_id is present (older server / no match).
    Uploads arrive with a " 📷 photo" suffix the echo doesn't have. */
-function dropPendingEcho(agent, text) {
-  const bare = (text || '').replace(/\s*📷 photo$/, '').trim();
-  const i = state.pending.findIndex((m) =>
-    m.agent === agent && (m.text === (text || '') || m.text.trim() === bare));
+function dropPendingEcho(agent, text, clientId) {
+  let i = -1;
+  if (clientId) i = state.pending.findIndex((m) => m.clientId === clientId);
+  if (i === -1) {
+    const bare = (text || '').replace(/\s*📷 photo$/, '').trim();
+    i = state.pending.findIndex((m) =>
+      m.agent === agent && (m.text === (text || '') || m.text.trim() === bare));
+  }
   if (i !== -1) { state.pending.splice(i, 1); savePending(); }
 }
 
@@ -797,6 +822,10 @@ async function approve(agent, key) {
 }
 
 /* ---------- notifications (best-effort; no-op where unsupported) ---------- */
+
+// Trace push setup/errors without breaking the flow. Was called but never
+// defined, so every push error path (incl. the catch) threw a ReferenceError.
+const pushDebug = (m) => console.debug('[push]', m);
 
 // Show the enable-notifications button whenever push is supported but not yet
 // granted+subscribed. iOS requires the permission prompt to come from a tap.
@@ -839,13 +868,14 @@ async function enablePush() {
         userVisibleOnly: true,
         applicationServerKey: urlB64ToUint8Array(key),
       });
-    } else {
     }
-    const r = await fetch('/api/push/subscribe', {
+    const subRes = await fetch('/api/push/subscribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(sub),
     });
+    if (!subRes.ok) { pushDebug('subscribe failed ' + subRes.status); return; }
+    pushDebug('subscribed');
   } catch (e) { pushDebug('ERROR ' + (e && e.message ? e.message : e)); }
 }
 
