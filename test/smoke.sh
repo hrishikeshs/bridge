@@ -92,10 +92,25 @@ BAD_CODE_BODY='{"code":"000000"}'
 GHOST_BODY='{"agent":"ghost-nobody","text":"anyone home?"}'
 EMPTY_BODY='{"agent":"ghost-nobody","text":"   "}'
 DUP_BODY="{\"agent\":\"$CNAME\",\"text\":\"dup test\",\"client_id\":\"cid-smoke-1\"}"
-CONNECT_BODY="{\"name\":\"$CNAME\",\"directory\":\"/private/tmp/smoke-bridge\",\"session_id\":\"sess-smoke\",\"tmux_target\":\"bridge-smoke-nonexistent:0\"}"
+# tmux_target is a window id ("@N") — the grammar-immune routing key the daemon now
+# requires for new registrations. @999 is a nonexistent window, so the contact is
+# retired to offline by the reconcile loop (exercises the offline path below).
+CONNECT_BODY="{\"name\":\"$CNAME\",\"directory\":\"/private/tmp/smoke-bridge\",\"session_id\":\"sess-smoke\",\"tmux_target\":\"@999\"}"
+# C2 daemon-side hardening fixtures: a numeric name (tmux would misresolve it as a
+# window index) and a legacy name-based target (send-keys to a window index) must
+# both be neutralized at the registry choke point, not just by the CLI.
+NUM_CONNECT_BODY="{\"name\":\"1\",\"directory\":\"/private/tmp/smoke-bridge\",\"session_id\":\"sess-num\",\"tmux_target\":\"@998\"}"
+BADTGT_BODY="{\"name\":\"legit-name\",\"directory\":\"/private/tmp/smoke-bridge\",\"session_id\":\"sess-bt\",\"tmux_target\":\"bridge:1\"}"
+DUP1_BODY="{\"name\":\"twin\",\"directory\":\"/private/tmp/smoke-a\",\"session_id\":\"sess-twa\",\"tmux_target\":\"@990\"}"
+DUP2_BODY="{\"name\":\"twin\",\"directory\":\"/private/tmp/smoke-b\",\"session_id\":\"sess-twb\",\"tmux_target\":\"@991\"}"
 APPROVE_BADKEY='{"agent":"ghost-nobody","key":"q"}'
 APPROVE_OFFLINE='{"agent":"ghost-nobody","key":"1"}'
-SUB_BODY='{"endpoint":"https://push.example.com/smoke-endpoint-xyz","keys":{"p256dh":"BFakeKeyForSmokeTestingPurposesOnly","auth":"ZmFrZWF1dGg"}}'
+# push.example.com does not resolve; subscribe-time validation fails CLOSED on a
+# lookup miss (#7), so this endpoint must be refused — deterministic offline too.
+SUB_UNRESOLVABLE='{"endpoint":"https://push.example.com/smoke-endpoint-xyz","keys":{"p256dh":"BFakeKeyForSmokeTestingPurposesOnly","auth":"ZmFrZWF1dGg"}}'
+# The real production push host — resolves to public IPs, so it exercises the
+# accept path. Gated on DNS actually working so the suite stays green offline.
+SUB_APPLE='{"endpoint":"https://web.push.apple.com/smoke-endpoint-xyz","keys":{"p256dh":"BFakeKeyForSmokeTestingPurposesOnly","auth":"ZmFrZWF1dGg"}}'
 SUB_BAD='{"endpoint":"","keys":{"p256dh":"x","auth":"y"}}'
 
 # --- static + perimeter ---------------------------------------------------
@@ -150,6 +165,35 @@ CONTACTS_BODY=$(curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts)
 body_has "local/contacts lists the contact" "\"name\":\"$CNAME\"" "$CONTACTS_BODY"
 check "local/contacts needs local token"  401 "$(code $BASE/local/contacts)"
 
+# --- C2: daemon-side name/target sanitization (finding #1) ----------------
+# A rollback binary or stale client speaks this exact /local/connect protocol, so
+# the choke point (registry.Connect), not just the CLI, must refuse a numeric name
+# — tmux resolves "1" as a window *index*, misrouting messages to another agent.
+NUM_RESP=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$NUM_CONNECT_BODY" $BASE/local/connect)
+case "$NUM_RESP" in
+  *'"name":"1"'*) fail_msg "numeric name '1' accepted daemon-side (C2 regression)" ;;
+  *)              pass_msg "numeric name refused daemon-side (sanitized to a safe address)" ;;
+esac
+CONTACTS_BODY=$(curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts)
+case "$CONTACTS_BODY" in
+  *'"name":"1"'*) fail_msg "roster exposes a contact named '1'" ;;
+  *)              pass_msg "roster never exposes a numeric-named contact" ;;
+esac
+# A legacy name-based target ("bridge:1") could send-keys to a window index; only a
+# "@N" window id is grammar-immune. The daemon accepts the (valid) name but blanks
+# the target, so the contact is present yet unroutable until it reconnects.
+check "legacy target accepted, name kept" 200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$BADTGT_BODY" $BASE/local/connect)"
+CONTACTS_BODY=$(curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts)
+body_has "legacy target neutralized to empty" '"tmux_target":""' "$CONTACTS_BODY"
+
+# --- collision suffix yields a distinct address (finding #2) --------------
+# Two agents in different directories choosing the same name must not collide: the
+# second is suffixed so each stays addressable (and, when live, gets its own
+# window). Registered back-to-back while the first is still live.
+curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$DUP1_BODY" $BASE/local/connect
+DUP2_RESP=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$DUP2_BODY" $BASE/local/connect)
+body_has "collision suffix yields distinct name" '"name":"twin-2"' "$DUP2_RESP"
+
 # --- send: offline, idempotency, validation -------------------------------
 check "send to unknown contact -> 409"    409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$GHOST_BODY" $BASE/api/send)"
 check "empty send rejected -> 400"        400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$EMPTY_BODY" $BASE/api/send)"
@@ -177,8 +221,15 @@ if [ "${#PUSH_KEY}" -ge 80 ]; then
 else
   fail_msg "VAPID key too short (len ${#PUSH_KEY}): '$PUSH_KEY'"
 fi
-check "push subscribe -> 200"              200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$SUB_BODY" $BASE/api/push/subscribe)"
+check "push subscribe unresolvable host -> 400 (fail closed)" 400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$SUB_UNRESOLVABLE" $BASE/api/push/subscribe)"
 check "push subscribe no endpoint -> 400"  400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$SUB_BAD" $BASE/api/push/subscribe)"
+# Accept path needs real DNS (subscribe-time validation resolves the host); skip
+# rather than fail when the network is down.
+if nslookup -timeout=3 web.push.apple.com >/dev/null 2>&1; then
+  check "push subscribe real host -> 200"  200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$SUB_APPLE" $BASE/api/push/subscribe)"
+else
+  echo "skip - push subscribe real host (no DNS)"
+fi
 
 # --- lockdown (LAST: it stops the daemon) ---------------------------------
 check "lockdown -> 200"                    200 "$(code "${LOCAL_AUTH[@]}" -X POST $BASE/local/lockdown)"
