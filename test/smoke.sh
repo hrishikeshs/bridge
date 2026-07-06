@@ -230,6 +230,9 @@ check "status with token -> 200"          200 "$(code "${DEV_AUTH[@]}" $BASE/api
 STATUS_BODY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/status)
 body_has "status returns contacts array"  '"contacts"'         "$STATUS_BODY"
 body_has "status returns version"         '"version":"0.1.0"'  "$STATUS_BODY"
+# round 4: presence clocks for the phone (now + daemon start time)
+body_has "status returns server clock"    '"now":'             "$STATUS_BODY"
+body_has "status returns daemon start"    '"started":'         "$STATUS_BODY"
 
 # --- register a fake contact via the local API ----------------------------
 check "local/connect registers contact"   200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$CONNECT_BODY" $BASE/local/connect)"

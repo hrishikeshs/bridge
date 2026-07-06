@@ -19,9 +19,10 @@ type Contact struct {
 	Directory  string `json:"directory"`   // the agent's working directory
 	SessionID  string `json:"session_id"`  // Claude Code conversation id; `claude --resume` PRESERVES it (verified empirically), so it is stable across resume — the tail pins on it, falling back to the newest .jsonl only if it goes missing/stale (see sessionFileFor)
 	TmuxTarget string `json:"tmux_target"` // tmux window id ("@N") hosting the agent; legacy rows may hold "bridge:<name>"
-	Status     string `json:"status"`      // "live" | "offline"
-	Health     string `json:"health"`      // "ok" | "working" | "prompt" | "offline"
-	PromptOpen bool   `json:"prompt_open"` // a permission prompt is hook-attested open
+	Status     string `json:"status"`       // "live" | "offline"
+	Health     string `json:"health"`       // "ok" | "working" | "prompt" | "offline"
+	PromptOpen bool   `json:"prompt_open"`  // a permission prompt is hook-attested open
+	PromptSince int64 `json:"prompt_since"` // unix seconds the current prompt opened; 0 when none (drives frozen-agent escalation)
 
 	// Fields are plugin-set key/value annotations (docs/plugins.md set-field):
 	// expertise tags, last-memory-save stamps, whatever a plugin wants to pin
@@ -312,6 +313,14 @@ func (r *Registry) SetPrompt(id string, open bool) {
 	c, ok := r.contacts[id]
 	if !ok {
 		return
+	}
+	// Stamp the moment a prompt opens (and clear it when it closes) so the
+	// frozen-agent watchdog can age it. Don't restamp an already-open prompt —
+	// re-attestation of the same dialog must not reset its clock.
+	if open && !c.PromptOpen {
+		c.PromptSince = timeNowUnix()
+	} else if !open {
+		c.PromptSince = 0
 	}
 	c.PromptOpen = open
 	switch {

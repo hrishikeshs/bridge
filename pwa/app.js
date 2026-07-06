@@ -109,6 +109,10 @@ const state = {
   connected: false,      // SSE open / last request reached the bridge
   pending: [],           // local echoes + outbox (see loadPending)
   guidance: null,        // {agent, until} — a No was tapped; next message is the "do this instead"
+  lastContact: null,     // ms of the last successful reach to the daemon (presence truth)
+  serverStarted: null,   // daemon start unix (a change = it restarted)
+  seenWake: 0,           // newest wake_to the phone has already surfaced
+  wakeNote: null,        // {from,to,until} — transient "Mac was asleep X–Y" banner
 };
 
 /* Outbox: unsent/undelivered messages, persisted so they survive an app
@@ -145,6 +149,7 @@ async function init() {
   if (res.status === 401) return showPairing();
   const data = await res.json();
   state.contacts = data.contacts || [];
+  noteServerClocks(data);
   setConnected(true);
   showApp();
   await loadHistory();
@@ -231,6 +236,7 @@ async function refreshStatus() {
   const data = await res.json();
   const wasOffline = new Map(state.contacts.map((c) => [c.id, c.status === 'offline']));
   state.contacts = data.contacts || [];
+  noteServerClocks(data);
   setConnected(true);
   // A contact that just came back to life can receive its queued messages.
   const revived = state.contacts.some(
@@ -285,6 +291,7 @@ function connectEvents() {
     scheduleReconnect();
   };
   source.onmessage = (msg) => {
+    state.lastContact = Date.now();   // any frame proves the Mac is reachable
     const event = JSON.parse(msg.data);
     if (event.type === 'typing') {          // transient: never stored
       state.typing.set(event.agent, Date.now() + 6000);
@@ -356,13 +363,57 @@ function updateAttentionBanner() {
   }
 }
 
+/* Record the daemon's clocks from a /api/status payload (round 4 presence
+   truth). Marks the reach time, notices a restart (started changed), and
+   surfaces a fresh sleep window once as a transient banner. */
+function noteServerClocks(data) {
+  if (!data) return;
+  state.lastContact = Date.now();
+  if (data.started) {
+    if (state.serverStarted && data.started !== state.serverStarted) {
+      // The daemon restarted since we last looked — reset the SSE cursor so we
+      // re-sync from history rather than assuming continuity.
+      state.serverStarted = data.started;
+    } else if (!state.serverStarted) {
+      state.serverStarted = data.started;
+    }
+  }
+  if (data.wake_to && data.wake_to > state.seenWake) {
+    state.seenWake = data.wake_to;
+    // Don't cry wolf on the very first load (no prior contact to have missed).
+    if (state.lastContact && state.wakeSeenOnce) {
+      state.wakeNote = { from: data.wake_from, to: data.wake_to, until: Date.now() + 8000 };
+      setTimeout(() => { state.wakeNote = null; updateBanner(); }, 8200);
+    }
+  }
+  state.wakeSeenOnce = true;
+}
+
+// "HH:MM" in the phone's locale from a unix-seconds timestamp.
+function clockUnix(sec) {
+  const d = new Date((sec || 0) * 1000);
+  return isNaN(d) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 function updateBanner() {
   const banner = $('conn-banner');
+  const wn = state.wakeNote;
+  if (wn && wn.until > Date.now()) {
+    // Just reconnected after the Mac slept — say so, briefly, over any state.
+    banner.textContent = '😴 Mac was asleep ' + clockUnix(wn.from) + '–' + clockUnix(wn.to) + ' — back now';
+    banner.className = 'banner';
+    return;
+  }
   if (state.connected) {
     banner.className = 'banner hidden';
   } else if (!navigator.onLine) {
     banner.textContent = '📴 You’re offline';
     banner.className = 'banner offline';
+  } else if (state.lastContact) {
+    // Reachability, not just "unreachable": name when we last had the Mac, so a
+    // sleeping/asleep laptop reads as a gap since HH:MM rather than a dead app.
+    banner.textContent = '⚠️ Mac unreachable since ' + clockUnix(state.lastContact / 1000) + ' — retrying…';
+    banner.className = 'banner';
   } else {
     banner.textContent = '⚠️ Mac unreachable — retrying…';
     banner.className = 'banner';

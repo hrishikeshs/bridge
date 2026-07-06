@@ -167,7 +167,16 @@ var tails = map[string]*tailState{}
 // ended. Called once from runServe.
 func startSessionManager() {
 	go func() {
+		lastTick := time.Now()
 		for {
+			// Wall-clock watchdog: a pass starting far later than the ~2s
+			// cadence means the process was frozen — the Mac slept. Tell the
+			// phone and force an identity re-resolve (mtimes are now stale).
+			now := time.Now()
+			if now.Sub(lastTick) > sleepGapThreshold {
+				noteWakeGap(lastTick, now)
+			}
+			lastTick = now
 			for _, c := range registry.Roster() {
 				alive := c.TmuxTarget != "" && tmuxAlive(c.TmuxTarget)
 				switch {
@@ -214,6 +223,9 @@ func startSessionManager() {
 					if registry.HasMail(c.ID) {
 						flushMailbox(c)
 					}
+					// Re-ring the phone for a prompt left open too long while
+					// the user is away (round 4 — the frozen-agent case).
+					escalateFrozenPrompt(c)
 				}
 			}
 			time.Sleep(2 * time.Second)

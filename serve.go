@@ -113,6 +113,8 @@ func runServe(port int) error {
 	loadRegistry()
 	loadHistory()
 
+	daemonStartUnix = timeNowUnix() // exposed on /api/status; anchors the wake watchdog
+
 	localToken = randomHex(32)
 	if err := writeLockfile(port, localToken); err != nil {
 		return err
@@ -441,7 +443,22 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, c := range registry.Roster() {
 		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Fields})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"contacts": items, "version": version})
+	// Clocks for phone-side presence truth (round 4): the phone compares `now`
+	// to its own clock and its last-contact timestamp to distinguish "my
+	// network is down" from "Mac unreachable"; `started` reveals a daemon
+	// restart; `wake_from`/`wake_to` surface the most recent sleep window so a
+	// reconnecting phone can say "Mac was asleep 10:02–12:55" instead of a bare
+	// "unreachable".
+	resp := map[string]any{
+		"contacts": items,
+		"version":  version,
+		"now":      timeNowUnix(),
+		"started":  daemonStartUnix,
+	}
+	if from, to := wakeGap(); to != 0 {
+		resp["wake_from"], resp["wake_to"] = from, to
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleHistory returns stored events newer than ?since=N.
