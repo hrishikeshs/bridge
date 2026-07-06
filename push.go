@@ -221,6 +221,10 @@ type pushPayload struct {
 	Body    string `json:"body"`
 	Tag     string `json:"tag,omitempty"`
 	Contact string `json:"contact,omitempty"` // deep-link target on tap
+	// Seq orders same-tag pushes: Web Push has no delivery-order guarantee, so
+	// the service worker drops any push older than what the tag already shows —
+	// a stale "✓ handled" can no longer replace a fresh "needs you" (round 2).
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // sendPush delivers one notification to every subscribed device. Dead
@@ -273,8 +277,10 @@ func sendPush(p pushPayload) (int, error) {
 }
 
 var (
-	pushLast   = map[string]int64{} // tag -> last-sent unix seconds (debounce)
-	pushLastMu sync.Mutex
+	pushSeqMu   sync.Mutex
+	pushLast    = map[string]int64{}  // tag -> last-sent unix seconds (debounce)
+	pushLastKey = map[string]string{} // tag -> title\x00body of the last send
+	pushSeq     = map[string]int64{}  // tag -> monotonic sequence (sw drops stale)
 )
 
 // attnPushed remembers which contacts have a "needs you" push sitting on the
@@ -308,29 +314,48 @@ func clearAttnPush(id, name string) {
 	if !outstanding {
 		return
 	}
+	tag := "attn-" + id
+	pushSeqMu.Lock()
+	pushSeq[tag]++
+	seq := pushSeq[tag]
+	// A resolution resets the debounce: whatever rings next on this tag is by
+	// definition a new demand, never a repeat of the one just cleared.
+	delete(pushLast, tag)
+	delete(pushLastKey, tag)
+	pushSeqMu.Unlock()
 	go sendPush(pushPayload{
 		Title:   "✓ " + name,
 		Body:    "handled — nothing needed",
-		Tag:     "attn-" + id,
+		Tag:     tag,
 		Contact: id,
+		Seq:     seq,
 	})
 }
 
 // notifyPush fires a phone notification for a high-signal event, off the
 // request path (async) and debounced per tag so a burst can't spam the lock
-// screen. This is the async loop: an agent reaches you when it needs you.
+// screen. The debounce only suppresses an IDENTICAL repeat inside the window:
+// a state transition — different prompt text, a fresh demand right after a ✓ —
+// always rings through (the old time-only debounce swallowed a real prompt
+// raised seconds after its predecessor resolved; review round 2).
 func notifyPush(title, body, tag, contact string) {
-	pushLastMu.Lock()
+	body = truncateRunes(body, 160)
+	key := title + "\x00" + body
+	pushSeqMu.Lock()
 	now := nowUnix()
-	if tag != "" && now-pushLast[tag] < 3 {
-		pushLastMu.Unlock()
+	if tag != "" && now-pushLast[tag] < 3 && pushLastKey[tag] == key {
+		pushSeqMu.Unlock()
 		return
 	}
+	var seq int64
 	if tag != "" {
 		pushLast[tag] = now
+		pushLastKey[tag] = key
+		pushSeq[tag]++
+		seq = pushSeq[tag]
 	}
-	pushLastMu.Unlock()
-	go sendPush(pushPayload{Title: title, Body: truncateRunes(body, 160), Tag: tag, Contact: contact})
+	pushSeqMu.Unlock()
+	go sendPush(pushPayload{Title: title, Body: body, Tag: tag, Contact: contact, Seq: seq})
 }
 
 func truncateRunes(s string, n int) string {

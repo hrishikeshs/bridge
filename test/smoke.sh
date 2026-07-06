@@ -297,6 +297,33 @@ check "interrupt offline agent -> 409"    409 "$(code "${DEV_AUTH[@]}" "${J[@]}"
 check "approve rejects bad key -> 400"    400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$APPROVE_BADKEY" $BASE/api/approve)"
 check "approve on offline agent -> 400"   400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$APPROVE_OFFLINE" $BASE/api/approve)"
 
+# --- round 2: switchboard honesty, sender identity, hook parking -----------
+# H9: the local/send "contact" field becomes the provenance frame's From in
+# the recipient's terminal — an unregistered string there is identity forgery.
+check "local/send unknown sender -> 400"  400 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d '{"contact":"nobody-here","text":"hi"}' $BASE/local/send)"
+# Switchboard: a missing recipient is an error, but an OFFLINE recipient is a
+# durably-queued SUCCESS — the old 409 read as failure, so senders retried
+# and the recipient woke up to duplicates.
+SB_GHOST_BODY="{\"contact\":\"$CNAME\",\"text\":\"hi\",\"to\":\"ghost-nobody\"}"
+check "switchboard unknown recipient -> 404" 404 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$SB_GHOST_BODY" $BASE/local/send)"
+# Wait for 'twin' (dead @990 target) to strike out to offline first, so the
+# send below exercises the queued path, not live delivery.
+for _ in $(seq 60); do
+  TWIN_STATUS=$(curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts | python3 -c 'import json,sys
+data = json.load(sys.stdin)
+for c in (data.get("contacts") if isinstance(data, dict) else data) or []:
+    if c.get("name") == "twin": print(c.get("status",""))' 2>/dev/null)
+  [ "$TWIN_STATUS" = "offline" ] && break
+  sleep 0.25
+done
+SB_RESP=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "{\"contact\":\"$CNAME\",\"text\":\"queued hello\",\"to\":\"twin\"}" $BASE/local/send)
+body_has "switchboard offline recipient queued -> queued:true" '"queued":true' "$SB_RESP"
+# H8: a hook event whose session id no contact claims is PARKED for the
+# reconcile loop to chain-resolve — a session roll's one-and-only hook
+# delivery must never be dropped on the floor.
+HOOK_RESP=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d '{"session_id":"00000000-0000-4000-8000-00000000d00d","message":"x","kind":"notification"}' $BASE/local/event)
+body_has "unclaimed hook event parked (H8)" '"parked":true' "$HOOK_RESP"
+
 # --- web push -------------------------------------------------------------
 check "push key -> 200"                    200 "$(code "${DEV_AUTH[@]}" $BASE/api/push/key)"
 PUSH_KEY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/push/key | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')

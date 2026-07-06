@@ -339,6 +339,18 @@ func formatInbound(from, via, text string) string {
 	return fmt.Sprintf("[From %s (%s)]: %s", from, via, strings.TrimSpace(flat))
 }
 
+// neutralizeFrame rewrites the daemon's framing alphabet out of a message
+// body: "[From " heads become "['From " and the "⏎" batch separator becomes
+// "↵". After this, the one line an agent receives can only carry
+// daemon-authored provenance and message boundaries — a body cannot forge a
+// second sender or splice a fake message into a coalesced batch (H9). The
+// rewrite is visible but gentle: quoted frames stay readable, they just stop
+// matching the daemon's exact format.
+func neutralizeFrame(s string) string {
+	s = strings.ReplaceAll(s, "[From ", "['From ")
+	return strings.ReplaceAll(s, "⏎", "↵")
+}
+
 // handleLocalRetire removes an OFFLINE contact from the roster (`bridge
 // retire <name>`). Live contacts are refused by Registry.Retire — a running
 // agent must lose its window before it can lose its registration — so a
@@ -848,7 +860,9 @@ func flushMailbox(c *Contact) {
 		}
 		parts := make([]string, 0, len(group))
 		for _, m := range group {
-			parts = append(parts, m.Text)
+			// Neutralize per part, before the join: only the daemon may write
+			// a "[From …]" head or a "⏎" boundary into the delivered line (H9).
+			parts = append(parts, neutralizeFrame(m.Text))
 		}
 		text := strings.Join(parts, " ⏎ ")
 		if group[0].From != "" {
@@ -890,18 +904,32 @@ func handleLocalEvent(w http.ResponseWriter, r *http.Request) {
 
 	c := registry.BySession(req.SessionID)
 	if c == nil {
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "ignored": true})
+		// No contact claims this session id. For a bridge-managed agent this
+		// is the signature of a session roll (/clear, auto-compaction) the
+		// daemon hasn't adopted yet — and the hook fires exactly ONCE per
+		// event, so dropping it here would lose the prompt permanently (H8).
+		// Park it: the reconcile loop nudges the chain scan and retries until
+		// the roll is adopted or the event expires. (Most misses are OTHER
+		// Claude sessions on this machine — the hook install is global — and
+		// those simply age out.)
+		parkHookEvent(req.SessionID)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "parked": true})
 		return
 	}
-	// The Notification hook fires for both permission prompts and routine
-	// idle/waiting notifications. Don't trust the notification kind alone —
-	// gate the attention card on the terminal actually showing a permission
-	// dialog right now. An idle notification, or a screen with no prompt,
-	// clears any open prompt instead of raising a false card.
-	//
-	// The dialog may still be painting when the hook fires, so retry the
-	// capture briefly until it looks like a prompt rather than grabbing a
-	// stale frame.
+	applyHookEvent(c)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// applyHookEvent reconciles a contact's attention state with its pane after a
+// Notification-hook event. The hook fires for both permission prompts and
+// routine idle/waiting notifications; don't trust the notification kind alone —
+// gate the attention card on the terminal actually showing a permission dialog
+// right now. An idle notification, or a screen with no prompt, clears any open
+// prompt instead of raising a false card.
+//
+// The dialog may still be painting when the hook fires, so the capture retries
+// briefly until it looks like a prompt rather than grabbing a stale frame.
+func applyHookEvent(c *Contact) {
 	snapshot := capturePrompt(c)
 	for i := 0; i < 5 && !looksLikePrompt(snapshot); i++ {
 		time.Sleep(150 * time.Millisecond)
@@ -920,7 +948,85 @@ func handleLocalEvent(w http.ResponseWriter, r *http.Request) {
 			clearAttnPush(c.ID, c.Name)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// pendingHooks parks hook events whose session id resolved to no contact (H8).
+// Guarded by pendingHookMu; drained by the reconcile goroutine.
+type hookEvent struct {
+	sessionID string
+	at        time.Time
+	nudged    bool
+}
+
+var (
+	pendingHookMu sync.Mutex
+	pendingHooks  []hookEvent
+)
+
+const (
+	maxPendingHooks   = 32
+	pendingHookMaxAge = 60 * time.Second
+)
+
+// parkHookEvent queues an unresolvable hook event for retry, one entry per
+// session id (re-applying reads the CURRENT pane, so the latest state wins).
+func parkHookEvent(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	pendingHookMu.Lock()
+	defer pendingHookMu.Unlock()
+	for _, ev := range pendingHooks {
+		if ev.sessionID == sessionID {
+			return
+		}
+	}
+	if len(pendingHooks) >= maxPendingHooks {
+		pendingHooks = pendingHooks[1:]
+	}
+	pendingHooks = append(pendingHooks, hookEvent{sessionID: sessionID, at: time.Now()})
+}
+
+// drainPendingHooks retries parked hook events. Reconcile goroutine only (it
+// writes chainForce). For each parked id: once a contact claims it, apply the
+// event against the live pane; until then, nudge every live contact whose
+// project dir holds that session file, so sessionFileFor re-scans its rollover
+// chain on this very pass instead of after the two-minute quiet window — the
+// gap that used to swallow the one hook delivery a roll ever gets.
+func drainPendingHooks() {
+	pendingHookMu.Lock()
+	events := append([]hookEvent(nil), pendingHooks...)
+	pendingHookMu.Unlock()
+	if len(events) == 0 {
+		return
+	}
+	keep := events[:0]
+	for _, ev := range events {
+		if time.Since(ev.at) > pendingHookMaxAge {
+			continue // an uninstrumented session's hook; let it age out
+		}
+		if c := registry.BySession(ev.sessionID); c != nil {
+			applyHookEvent(c)
+			continue
+		}
+		if !ev.nudged {
+			file := ev.sessionID + ".jsonl"
+			for _, c := range registry.Roster() {
+				if c.Status != "live" {
+					continue
+				}
+				if _, err := os.Stat(filepath.Join(projectDir(c.Directory), file)); err == nil {
+					chainForce[c.ID] = true
+				}
+			}
+			ev.nudged = true
+		}
+		keep = append(keep, ev)
+	}
+	pendingHookMu.Lock()
+	// New events may have parked while we worked; keep those arrivals too.
+	pendingHooks = append(append([]hookEvent(nil), keep...), pendingHooks[len(events):]...)
+	pendingHookMu.Unlock()
 }
 
 // handleLocalSend handles an agent-composed outbound message. Without "to" the
@@ -943,10 +1049,15 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	senderName, senderID := req.Contact, ""
-	if s := registry.Resolve(req.Contact); s != nil {
-		senderName, senderID = s.Name, s.ID
+	// The sender must resolve to a registered contact: senderName becomes the
+	// "From" in the recipient's provenance frame and the byline on the phone,
+	// so relaying an arbitrary string here is an identity-forgery vector (H9).
+	s := registry.Resolve(req.Contact)
+	if s == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown sender"})
+		return
 	}
+	senderName, senderID := s.Name, s.ID
 
 	if req.To == "" {
 		audit("agent-send", senderName+": "+req.Text, "local")
@@ -958,11 +1069,17 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := registry.Resolve(req.To)
-	if target == nil || target.Status != "live" {
-		if target != nil {
-			registry.Queue(target.ID, MailMessage{From: senderName, Via: "bridge", Text: req.Text, TS: nowUTC()})
-		}
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
+	if target == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such agent"})
+		return
+	}
+	if target.Status != "live" {
+		// Durably queued IS success — the daemon delivers it on revival. The
+		// old 409 here read as failure, so well-behaved senders retried and
+		// the recipient woke up to duplicates (review round 2).
+		registry.Queue(target.ID, MailMessage{From: senderName, Via: "bridge", Text: req.Text, TS: nowUTC()})
+		audit("switchboard-queued", senderName+" -> "+target.Name+": "+req.Text, "local")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 		return
 	}
 	// Switchboard rides the same hold-and-batch as phone sends: it keeps one

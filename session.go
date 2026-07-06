@@ -112,7 +112,11 @@ func tmuxWindowID(name string) string {
 // presses Enter. TEXT arrives already prefixed and newline-flattened.
 func tmuxDeliver(c *Contact, text string) error {
 	if !tmuxAlive(c.TmuxTarget) {
-		registry.SetOffline(c.ID)
+		// Don't mark offline here: one failed tmux exec reads exactly like a
+		// dead window, and a single-strike flap used to reset the reply tail
+		// to EOF (H6). The reconcile loop owns liveness — it retires a contact
+		// only after consecutive dead ticks; this delivery just fails safely
+		// and the mail stays queued.
 		return fmt.Errorf("session %s is not running", c.Name)
 	}
 	if _, err := tmux("send-keys", "-t", c.TmuxTarget, "-l", "--", text); err != nil {
@@ -228,15 +232,29 @@ func startSessionManager() {
 				noteWakeGap(lastTick, now)
 			}
 			lastTick = now
-			for _, c := range registry.Roster() {
+			drainPendingHooks()
+			roster := registry.Roster()
+			for _, c := range roster {
 				alive := c.TmuxTarget != "" && tmuxAlive(c.TmuxTarget)
+				if alive {
+					delete(aliveStrikes, c.ID)
+				}
 				switch {
 				case c.Status == "live" && !alive:
-					// Its tmux window ended: retire it.
+					// A failed tmux exec reads exactly like a dead window, so
+					// one bad tick must not retire the contact: a flap used to
+					// destroy the tail state and skip the relay to EOF, eating
+					// every in-gap reply (H6). Two consecutive dead ticks
+					// (~4s) make it real. The tail entry is KEPT either way —
+					// a revival resumes the relay mid-stream.
+					aliveStrikes[c.ID]++
+					if aliveStrikes[c.ID] < 2 {
+						break
+					}
+					delete(aliveStrikes, c.ID)
 					registry.SetOffline(c.ID)
 					Emit("attention-clear", c.ID, c.Name, "")
 					clearAttnPush(c.ID, c.Name)
-					delete(tails, c.ID)
 				case c.Status != "live" && alive:
 					// Its window outlived a daemon restart: revive it so a
 					// restart never orphans a running agent. Migrate a legacy
@@ -279,6 +297,20 @@ func startSessionManager() {
 					escalateFrozenPrompt(c)
 				}
 			}
+			// Tail state now outlives an offline transition (H6), so prune it
+			// only when the contact left the roster entirely (retired).
+			if len(tails) > 0 {
+				known := make(map[string]bool, len(roster))
+				for _, c := range roster {
+					known[c.ID] = true
+				}
+				for id := range tails {
+					if !known[id] {
+						delete(tails, id)
+						tailsDirty = true
+					}
+				}
+			}
 			if tailsDirty { // persist advanced offsets once per pass (4b)
 				saveTails()
 				tailsDirty = false
@@ -287,6 +319,11 @@ func startSessionManager() {
 		}
 	}()
 }
+
+// aliveStrikes counts consecutive reconcile ticks where a live contact's tmux
+// check failed — retirement needs two, so a transient exec error can't flap a
+// contact offline and back (H6). Reconcile goroutine only.
+var aliveStrikes = map[string]int{}
 
 // promptStrikes counts consecutive reconcile ticks where a hook-attested open
 // prompt was NOT visible on the contact's screen. Only the reconcile goroutine
@@ -551,9 +588,17 @@ func sessionFileFor(c *Contact) string {
 	}
 	path := filepath.Join(dir, base+".jsonl")
 	// When the resolved file has gone quiet, check (throttled) whether the
-	// session rolled forward under a new id.
-	if info, err := os.Stat(path); err != nil || time.Since(info.ModTime()) > 2*time.Minute {
-		if time.Since(chainChecked[c.ID]) > time.Minute {
+	// session rolled forward under a new id. A chainForce nudge (a hook event
+	// arrived for a session id nobody claims — the roll just happened, H8)
+	// bypasses both the two-minute quiet requirement and the once-a-minute
+	// throttle so the adoption lands on this very pass.
+	force := chainForce[c.ID]
+	if force {
+		delete(chainForce, c.ID)
+	}
+	info, statErr := os.Stat(path)
+	if force || statErr != nil || time.Since(info.ModTime()) > 2*time.Minute {
+		if force || time.Since(chainChecked[c.ID]) > time.Minute {
 			chainChecked[c.ID] = time.Now()
 			if tip := sessionChainTip(dir, base); tip != base {
 				audit("session-follow", c.Name+" "+base[:8]+" -> "+tip[:8], "daemon")
@@ -577,6 +622,12 @@ func sessionFileFor(c *Contact) string {
 // chainChecked throttles rollover-chain scans per contact. Reconcile
 // goroutine only.
 var chainChecked = map[string]time.Time{}
+
+// chainForce marks contacts whose rollover chain must be re-scanned on the
+// very next resolve, bypassing sessionFileFor's throttles. Set by
+// drainPendingHooks when a hook event names a session id no contact claims
+// yet (H8). Reconcile goroutine only.
+var chainForce = map[string]bool{}
 
 // lastResolve caches resolveLaunchVsPin verdicts per contact so the content
 // scans (transcripts reach hundreds of MB) stay off the 2s poll path.
@@ -1042,7 +1093,16 @@ func runSend(ctx *cliCtx) error {
 	if ctx.to != "" {
 		body["to"] = ctx.to
 	}
-	return daemonRequest("POST", "/local/send", body, nil)
+	var resp struct {
+		Queued bool `json:"queued"`
+	}
+	if err := daemonRequest("POST", "/local/send", body, &resp); err != nil {
+		return err
+	}
+	if resp.Queued {
+		fmt.Printf("queued — %s is offline right now; the daemon delivers it when they're back\n", ctx.to)
+	}
+	return nil
 }
 
 // runHook is the Claude Code Notification-hook shim: it reads the hook JSON on

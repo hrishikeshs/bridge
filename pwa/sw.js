@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE = 'bridge-v23';
+const CACHE = 'bridge-v24';
 const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest',
                '/wallpaper.jpg',
                '/icons/icon-192.png', '/icons/icon-512.png'];
@@ -49,13 +49,25 @@ self.addEventListener('push', (e) => {
     const parsed = e.data.json();
     d = (parsed && typeof parsed === 'object') ? parsed : {};
   } catch (_) { if (e.data) d.body = e.data.text(); }
-  e.waitUntil(self.registration.showNotification(d.title || 'bridge', {
-    body: d.body || '',
-    tag: d.tag || undefined,
-    icon: '/icons/icon-192.png',
-    badge: '/icons/icon-192.png',
-    data: { contact: d.contact || '' },   // deep-link target on tap
-  }));
+  const tag = d.tag || undefined;
+  const seq = Number(d.seq) || 0;
+  e.waitUntil((async () => {
+    // Web Push has no ordering guarantee: a same-tag push REPLACES what's on
+    // screen, so a stale "✓ handled" arriving late would erase a fresh "needs
+    // you". The daemon stamps a per-tag sequence; never show a push older
+    // than the notification already displayed for its tag.
+    if (tag && seq) {
+      const existing = await self.registration.getNotifications({ tag });
+      if (existing.some((n) => n.data && Number(n.data.seq) > seq)) return;
+    }
+    await self.registration.showNotification(d.title || 'bridge', {
+      body: d.body || '',
+      tag,
+      icon: '/icons/icon-192.png',
+      badge: '/icons/icon-192.png',
+      data: { contact: d.contact || '', seq },   // deep-link target on tap + ordering
+    });
+  })());
 });
 
 self.addEventListener('notificationclick', (e) => {

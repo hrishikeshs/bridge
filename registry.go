@@ -346,17 +346,37 @@ func (r *Registry) SetOffline(id string) {
 	r.save()
 }
 
-// Queue appends a message to a contact's offline mailbox, dropping the oldest
-// messages beyond maxMailbox so the queue (and its on-disk footprint) is bounded.
+// Queue appends a message to a contact's offline mailbox. The queue is
+// bounded at maxMailbox; past the cap, the flooder pays first — the oldest
+// message from the SAME sender is evicted before anyone else's, so a peer
+// hammering an offline contact can't push out the user's own words. Every
+// eviction is audited (outside the lock): each queued message was already
+// acked to its sender as accepted, so a silent drop is a quiet lie (review
+// round 2).
 func (r *Registry) Queue(id string, m MailMessage) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	q := append(r.mailbox[id], m)
+	var dropped *MailMessage
 	if len(q) > maxMailbox {
-		q = append([]MailMessage(nil), q[len(q)-maxMailbox:]...)
+		cut := 0 // fallback: oldest overall
+		for i, old := range q[:len(q)-1] {
+			if old.From == m.From {
+				cut = i
+				break
+			}
+		}
+		d := q[cut]
+		dropped = &d
+		q = append(q[:cut], q[cut+1:]...)
 	}
 	r.mailbox[id] = q
 	r.save()
+	r.mu.Unlock()
+	if dropped != nil {
+		audit("mailbox-overflow",
+			fmt.Sprintf("dropped %s -> %.8s (cap %d): %.80s", dropped.From, id, maxMailbox, dropped.Text),
+			"daemon")
+	}
 }
 
 // BeginFlush claims the (single) flush slot for a mailbox; a false return
