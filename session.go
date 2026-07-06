@@ -175,6 +175,7 @@ func startSessionManager() {
 					// Its tmux window ended: retire it.
 					registry.SetOffline(c.ID)
 					Emit("attention-clear", c.ID, c.Name, "")
+					clearAttnPush(c.ID, c.Name)
 					delete(tails, c.ID)
 				case c.Status != "live" && alive:
 					// Its window outlived a daemon restart: revive it so a
@@ -224,6 +225,7 @@ func verifyPrompt(c *Contact) {
 		delete(promptStrikes, c.ID)
 		registry.SetPrompt(c.ID, false)
 		Emit("attention-clear", c.ID, c.Name, "")
+		clearAttnPush(c.ID, c.Name)
 	}
 }
 

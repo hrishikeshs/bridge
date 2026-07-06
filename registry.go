@@ -39,13 +39,17 @@ func (c *Contact) copy() *Contact {
 	return &cp
 }
 
-// MailMessage is an inbound message queued for a contact that was offline when
-// it was sent, delivered when the contact next connects or revives.
+// MailMessage is an inbound message queued for a contact — offline mail, or a
+// live message briefly held for coalescing (coalesce.go) — delivered when the
+// contact connects, revives, or its hold timer fires.
 type MailMessage struct {
 	From string `json:"from"` // sender's address (bare name)
 	Via  string `json:"via"`  // channel it arrived on ("phone" | "bridge")
 	Text string `json:"text"`
 	TS   string `json:"ts"`
+	// Emitted marks a message whose "sent" event was already emitted at accept
+	// time (the live/coalescing path), so the flush must not emit it again.
+	Emitted bool `json:"emitted,omitempty"`
 }
 
 // Registry is the daemon's roster of contacts plus a per-contact mailbox for
@@ -346,64 +350,82 @@ func (r *Registry) Queue(id string, m MailMessage) {
 	r.save()
 }
 
-// FlushMailbox delivers queued messages one at a time, removing (and persisting)
-// each only after deliver returns nil. Stops at the first delivery error, leaving
-// the remaining messages queued. Safe against crash-mid-flush (no delete-then-lose):
-// a message leaves disk only after its delivery succeeded, so a crash between
-// deliver and save at worst redelivers the last message (deliveries are idempotent
-// enough for that). Concurrent flushes of the same id are coalesced to one.
-func (r *Registry) FlushMailbox(id string, deliver func(MailMessage) error) {
+// BeginFlush claims the (single) flush slot for a mailbox; a false return
+// means another flush is already draining it and the caller must not start a
+// second one. Pair every true return with EndFlush.
+func (r *Registry) BeginFlush(id string) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.flushing == nil {
 		r.flushing = map[string]bool{}
 	}
 	if r.flushing[id] {
-		r.mu.Unlock()
-		return // another flush is already draining this mailbox
+		return false
 	}
 	r.flushing[id] = true
+	return true
+}
+
+// EndFlush releases the flush slot claimed by BeginFlush.
+func (r *Registry) EndFlush(id string) {
+	r.mu.Lock()
+	delete(r.flushing, id)
 	r.mu.Unlock()
-	defer func() {
-		r.mu.Lock()
-		delete(r.flushing, id)
-		r.mu.Unlock()
-	}()
+}
 
-	for {
-		r.mu.Lock()
-		q := r.mailbox[id]
-		if len(q) == 0 {
-			r.mu.Unlock()
-			return
-		}
-		m := q[0]
-		r.mu.Unlock()
+// Group caps for PeekMailboxGroup: a combined delivery stays a readable,
+// send-keys-safe single line.
+const (
+	mailGroupMaxMsgs  = 8
+	mailGroupMaxBytes = 6000
+)
 
-		if err := deliver(m); err != nil {
-			return // leave m and the rest queued for the next flush
-		}
-
-		// Delivered: remove that exact message and persist before moving on. The
-		// head may have shifted while the lock was released — a concurrent Queue at
-		// the maxMailbox cap drops the oldest — so re-find m by value instead of
-		// assuming it is still q[0], which would discard a never-delivered message
-		// (#5). If m was itself the one the cap dropped, it is already gone and
-		// there is nothing to remove.
-		r.mu.Lock()
-		if q := r.mailbox[id]; len(q) > 0 {
-			for i := range q {
-				if q[i] == m {
-					r.mailbox[id] = append(q[:i:i], q[i+1:]...)
-					break
-				}
-			}
-			if len(r.mailbox[id]) == 0 {
-				delete(r.mailbox, id)
-			}
-		}
-		r.save()
-		r.mu.Unlock()
+// PeekMailboxGroup returns (a copy of) the longest queue prefix that shares
+// one sender and channel, within the group caps — the run flushMailbox will
+// deliver as a single combined line. Empty when the mailbox is empty.
+func (r *Registry) PeekMailboxGroup(id string) []MailMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	q := r.mailbox[id]
+	if len(q) == 0 {
+		return nil
 	}
+	out := []MailMessage{q[0]}
+	total := len(q[0].Text)
+	for _, m := range q[1:] {
+		if m.From != q[0].From || m.Via != q[0].Via {
+			break
+		}
+		if len(out) >= mailGroupMaxMsgs || total+len(m.Text) > mailGroupMaxBytes {
+			break
+		}
+		out = append(out, m)
+		total += len(m.Text)
+	}
+	return out
+}
+
+// DropMailbox removes the given delivered messages and persists. Each is
+// re-found by value rather than assumed to still head the queue — a concurrent
+// Queue at the maxMailbox cap may have shifted or dropped it (#5). Crash
+// between delivery and this call at worst redelivers one group (at-least-once,
+// same contract the per-message flush had).
+func (r *Registry) DropMailbox(id string, delivered []MailMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, m := range delivered {
+		q := r.mailbox[id]
+		for i := range q {
+			if q[i] == m {
+				r.mailbox[id] = append(q[:i:i], q[i+1:]...)
+				break
+			}
+		}
+	}
+	if len(r.mailbox[id]) == 0 {
+		delete(r.mailbox, id)
+	}
+	r.save()
 }
 
 // SetHealth updates a live contact's health indicator (e.g. "working" while

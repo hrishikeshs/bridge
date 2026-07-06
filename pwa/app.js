@@ -158,11 +158,13 @@ async function init() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       refreshStatus(); connectEvents(); flushOutbox();
+      clearDeliveredNotifications();   // you're looking at the app now
       // Returning to the foreground on an open thread clears its unread.
       if (state.view === 'thread' && state.selected) markSeen(state.selected);
       renderList();
     }
   });
+  clearDeliveredNotifications();
   window.addEventListener('online', () => { connectEvents(); flushOutbox(); });
   window.addEventListener('offline', () => setConnected(false));
   updatePushButton();          // iOS only prompts on a tap, so offer a button
@@ -411,10 +413,24 @@ function openThread(id) {
   $('thread-view').classList.remove('hidden');
   $('list-view').classList.add('hidden');
   if (!document.hidden) markSeen(id);
+  clearDeliveredNotifications();
   updateThreadHeader();
   updateAttentionBanner();
   renderFeed();
   restoreDraft();
+}
+
+/* iMessage behavior: opening the app clears its pile from Notification
+   Center — everything a delivered banner said is richer in-app anyway. iOS
+   never withdraws delivered notifications itself, so stale "needs your
+   attention" banners otherwise outlive their prompts (field report,
+   2026-07-06). Best-effort: notification support may be absent entirely. */
+async function clearDeliveredNotifications() {
+  try {
+    if (!('serviceWorker' in navigator)) return;
+    const reg = await navigator.serviceWorker.ready;
+    (await reg.getNotifications()).forEach((n) => n.close());
+  } catch (e) { /* unsupported or not yet registered — nothing to clear */ }
 }
 
 // Enter a thread and push it onto history, so back pops to the list.
@@ -455,6 +471,17 @@ function selectContactIfValid(id) {
 }
 
 $('back-btn').addEventListener('click', () => history.back());
+
+/* Interrupt: one tap → the daemon sends the agent a bare Escape (stop
+   mid-thought). Held burst messages are then delivered immediately, so
+   "stop — do this instead" arrives in the right order. */
+$('stop-btn').addEventListener('click', async () => {
+  if (!state.selected) return;
+  const btn = $('stop-btn');
+  btn.disabled = true;
+  await api('/api/interrupt', { agent: state.selected });
+  btn.disabled = false;
+});
 
 /* ---------- settings sheet ---------- */
 
@@ -729,6 +756,9 @@ function updateThreadHeader() {
   const c = state.contacts.find((x) => x.id === state.selected);
   $('thread-name').textContent = (c && c.name) || 'contact';
   $('thread-status').textContent = threadStatusText(c);
+  // Interrupt is offered whenever the contact is live — health lags the
+  // roster refresh, and "stop mid-thought" can't wait for it to catch up.
+  $('stop-btn').classList.toggle('hidden', !c || c.status === 'offline');
 }
 
 function threadStatusText(contact) {
@@ -819,6 +849,9 @@ function renderEvent(event, resolution) {
     return replyBubbles(event, 'msg reply', who(event.name || '?'));
   } else if (event.type === 'mention') {
     return replyBubbles(event, 'msg mention', who((event.name || 'contact') + ' · @mention'));
+  } else if (event.type === 'interrupted') {
+    el.className = 'msg system';
+    el.textContent = '⏹ interrupted' + (localTime(event.ts) ? ' · ' + localTime(event.ts) : '');
   } else {
     el.className = 'msg system';
     el.textContent = (event.name || '') + ' · ' + event.type +

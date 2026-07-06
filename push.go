@@ -193,10 +193,25 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	token := requestToken(r)
 	pushMu.Lock()
+	// One endpoint, one subscription. The same physical phone re-paired under a
+	// new device token would otherwise hold TWO entries for one Apple endpoint —
+	// every event then rings it twice (found live, 2026-07-06). The endpoint is
+	// the device-side identity; the newest token owns it.
+	changed := pushSubs[token] == nil || pushSubs[token].Endpoint != sub.Endpoint
+	for t, s := range pushSubs {
+		if t != token && s.Endpoint == sub.Endpoint {
+			delete(pushSubs, t)
+			changed = true
+		}
+	}
 	pushSubs[token] = &sub
 	pushMu.Unlock()
 	savePushSubs()
-	audit("push-subscribed", sub.Endpoint, "-")
+	// The PWA re-POSTs its subscription idempotently (every send, every open);
+	// audit only real changes so the log stays a signal.
+	if changed {
+		audit("push-subscribed", sub.Endpoint, "-")
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -261,6 +276,45 @@ var (
 	pushLast   = map[string]int64{} // tag -> last-sent unix seconds (debounce)
 	pushLastMu sync.Mutex
 )
+
+// attnPushed remembers which contacts have a "needs you" push sitting on the
+// lock screen right now. iOS never withdraws a delivered notification by
+// itself, so a prompt answered at the desk (or from the app) leaves a stale
+// demand pinned to the phone — the "attention prompts are not auto dismissed"
+// field report (2026-07-06).
+var (
+	attnPushedMu sync.Mutex
+	attnPushed   = map[string]bool{}
+)
+
+// markAttnPushed records that an attention push went out for a contact.
+func markAttnPushed(id string) {
+	attnPushedMu.Lock()
+	attnPushed[id] = true
+	attnPushedMu.Unlock()
+}
+
+// clearAttnPush replaces a contact's outstanding "needs you" notification with
+// a same-tag ✓ — Notification Center swaps the content in place (no re-alert
+// without renotify), so the lock screen stops demanding attention the moment
+// the prompt is resolved. Sent only when an attention push is actually
+// outstanding, and directly via sendPush: the per-tag debounce in notifyPush
+// would swallow a resolution arriving seconds after its prompt.
+func clearAttnPush(id, name string) {
+	attnPushedMu.Lock()
+	outstanding := attnPushed[id]
+	delete(attnPushed, id)
+	attnPushedMu.Unlock()
+	if !outstanding {
+		return
+	}
+	go sendPush(pushPayload{
+		Title:   "✓ " + name,
+		Body:    "handled — nothing needed",
+		Tag:     "attn-" + id,
+		Contact: id,
+	})
+}
 
 // notifyPush fires a phone notification for a high-signal event, off the
 // request path (async) and debounced per tag so a burst can't spam the lock

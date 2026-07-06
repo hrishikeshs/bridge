@@ -415,6 +415,19 @@ header {
   white-space: nowrap;
 }
 
+/* interrupt (stop mid-thought) — quiet header control, loud meaning */
+#stop-btn {
+  flex: none;
+  font-size: 19px;
+  line-height: 1;
+  color: var(--header-dim);
+  background: none;
+  border: none;
+  padding: 4px 6px;
+}
+#stop-btn:active { color: var(--attn); }
+#stop-btn:disabled { opacity: 0.4; }
+
 /* ---- feed ---- */
 
 #feed {

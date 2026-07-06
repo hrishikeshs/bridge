@@ -197,6 +197,8 @@ func route(w http.ResponseWriter, r *http.Request) {
 		handleSend(w, r, id)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/approve":
 		handleApprove(w, r, id)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/interrupt":
+		handleInterrupt(w, r, id)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/upload":
 		handleUpload(w, r, id)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/push/key":
@@ -551,16 +553,48 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	if err := deliverToSession(c, formatInbound(authConfig.UserMention, "phone", req.Text)); err != nil {
-		releaseClientID(req.ClientID, false) // failed: leave no trace so the retry runs (H1)
-		audit("send-failed", err.Error(), id)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	releaseClientID(req.ClientID, true) // delivered: a retry is now a safe duplicate ack
+	// Live contact: hold-and-batch instead of immediate send-keys. The message
+	// is durably queued (mailbox) before the ack, so "ok" still means "the
+	// daemon has it"; delivery follows when the burst window closes
+	// (coalesce.go). Emitted:true — the "sent" event below is the one the
+	// thread shows; the flush must not emit a duplicate.
+	holdInbound(c, MailMessage{From: authConfig.UserMention, Via: "phone", Text: req.Text, TS: nowUTC(), Emitted: true})
+	releaseClientID(req.ClientID, true) // durably queued: a retry is now a safe duplicate ack
 	audit("send", c.Name+": "+req.Text, id)
 	Emit("sent", c.ID, c.Name, req.Text, req.ClientID)
 	dispatchPluginEvent("message.in", c, map[string]any{"text": req.Text, "via": "phone", "queued": false})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleInterrupt delivers a bare Escape to a live contact — stop mid-thought,
+// from the phone (field request, 2026-07-06: rejecting permission prompts was
+// the only interrupt available). Unlike approve, this is honored with or
+// without an open prompt: Escape aborts a running turn, and on an open dialog
+// it is the dialog's own cancel. Any held burst is then delivered immediately —
+// the agent just went idle and should hear what was waiting.
+func handleInterrupt(w http.ResponseWriter, r *http.Request, id string) {
+	data, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Agent string `json:"agent"`
+	}
+	_ = json.Unmarshal(data, &req)
+
+	c := registry.Resolve(req.Agent)
+	if c == nil || c.Status != "live" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
+		return
+	}
+	if err := sendKey(c, "esc"); err != nil {
+		audit("interrupt-failed", err.Error(), id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	audit("interrupt", c.Name, id)
+	Emit("interrupted", c.ID, c.Name, "")
+	go coalesceDeliver(c.ID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -597,6 +631,9 @@ func handleApprove(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	audit("approve", c.Name+" <- "+req.Key, id)
 	Emit("approved", c.ID, c.Name, req.Key)
+	// The lock-screen "needs you" notification is now stale; replace it with a
+	// same-tag ✓ so it can't sit there demanding attention it already got.
+	clearAttnPush(c.ID, c.Name)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -641,16 +678,10 @@ func handleUpload(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	msg := fmt.Sprintf("%s [photo saved at %s — use the Read tool to view it]", strings.TrimSpace(req.Text), pathOnDisk)
-	if err := deliverToSession(c, formatInbound(authConfig.UserMention, "phone", msg)); err != nil {
-		// Delivery failed: don't orphan the just-written attachment, and release
-		// the claim uncommitted so the phone's retry re-attempts instead of the
-		// message (and file) being silently dropped (H1).
-		_ = os.Remove(pathOnDisk)
-		releaseClientID(req.ClientID, false)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	releaseClientID(req.ClientID, true) // delivered: a retry is now a safe duplicate ack
+	// Same hold-and-batch as handleSend, so a photo can never overtake the
+	// held texts that were sent before it (ordering lives in one queue).
+	holdInbound(c, MailMessage{From: authConfig.UserMention, Via: "phone", Text: msg, TS: nowUTC(), Emitted: true})
+	releaseClientID(req.ClientID, true) // durably queued: a retry is now a safe duplicate ack
 	audit("upload", fmt.Sprintf("%s <- %s (%d bytes)", c.Name, pathOnDisk, len(img)), id)
 	Emit("sent", c.ID, c.Name, strings.TrimSpace(req.Text)+" 📷 photo", req.ClientID)
 	dispatchPluginEvent("message.in", c, map[string]any{"text": msg, "via": "phone", "queued": false})
@@ -748,22 +779,41 @@ func handleLocalConnect(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"id": c.ID, "name": c.Name})
 }
 
-// flushMailbox delivers a revived contact's queued messages in order. It defers
-// removal to registry.FlushMailbox, which drops each message only after this
-// callback reports it delivered and persists after each one — so a crash mid-drain
-// redelivers at most the undelivered tail instead of losing the whole batch (M6).
+// flushMailbox delivers a contact's queued messages in order, combining each
+// run of consecutive messages from one sender+channel into a single delivery
+// line ("msg1 ⏎ msg2 ⏎ msg3") — a burst of phone texts lands as one thought,
+// not three turn-starting fragments (the coalescing UX, coalesce.go). Groups
+// are removed from disk only after their delivery succeeds, so a crash
+// mid-drain redelivers at most one group instead of losing the batch (M6,
+// group-granular). Concurrent flushes of one mailbox coalesce to one.
 func flushMailbox(c *Contact) {
-	registry.FlushMailbox(c.ID, func(m MailMessage) error {
-		text := m.Text
-		if m.From != "" {
-			text = formatInbound(m.From, m.Via, m.Text)
+	if !registry.BeginFlush(c.ID) {
+		return
+	}
+	defer registry.EndFlush(c.ID)
+	for {
+		group := registry.PeekMailboxGroup(c.ID)
+		if len(group) == 0 {
+			return
+		}
+		parts := make([]string, 0, len(group))
+		for _, m := range group {
+			parts = append(parts, m.Text)
+		}
+		text := strings.Join(parts, " ⏎ ")
+		if group[0].From != "" {
+			text = formatInbound(group[0].From, group[0].Via, text)
 		}
 		if err := deliverToSession(c, text); err != nil {
-			return err
+			return // leave the group (and the rest) queued for the next flush
 		}
-		Emit("sent", c.ID, c.Name, m.Text)
-		return nil
-	})
+		for _, m := range group {
+			if !m.Emitted {
+				Emit("sent", c.ID, c.Name, m.Text)
+			}
+		}
+		registry.DropMailbox(c.ID, group)
+	}
 }
 
 // handleLocalEvent processes a Notification-hook POST {session_id, message,
@@ -804,11 +854,13 @@ func handleLocalEvent(w http.ResponseWriter, r *http.Request) {
 		registry.SetPrompt(c.ID, true)
 		Emit("attention", c.ID, c.Name, snapshot)
 		notifyPush(c.Name+" needs you", firstPromptLine(snapshot), "attn-"+c.ID, c.ID)
+		markAttnPushed(c.ID)
 		dispatchPluginEvent("permission.prompt", c, map[string]any{"prompt": firstPromptLine(snapshot)})
 	} else {
 		if c.PromptOpen {
 			registry.SetPrompt(c.ID, false)
 			Emit("attention-clear", c.ID, c.Name, "")
+			clearAttnPush(c.ID, c.Name)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -856,11 +908,11 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
 		return
 	}
-	if err := deliverToSession(target, formatInbound(senderName, "bridge", req.Text)); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
+	// Switchboard rides the same hold-and-batch as phone sends: it keeps one
+	// ordered queue per recipient and, critically, never types past an open
+	// permission dialog (the hold refuses to fire while one is up).
 	audit("switchboard", senderName+" -> "+target.Name+": "+req.Text, "local")
 	Emit("sent", target.ID, target.Name, req.Text)
+	holdInbound(target, MailMessage{From: senderName, Via: "bridge", Text: req.Text, TS: nowUTC(), Emitted: true})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

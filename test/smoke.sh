@@ -283,6 +283,13 @@ curl -s -o /dev/null "${DEV_AUTH[@]}" "${J[@]}" -d "$DUP_BODY" $BASE/api/send
 DUP_RESP=$(curl -s "${DEV_AUTH[@]}" "${J[@]}" -d "$DUP_BODY" $BASE/api/send)
 body_has "duplicate client_id acked"      '"duplicate":true' "$DUP_RESP"
 
+# --- interrupt: stop mid-thought (Escape) ----------------------------------
+# Honored only for LIVE contacts; smoke-agent is offline by now (dead @999),
+# and a ghost resolves to nothing — both must refuse, never blind-key.
+check "interrupt unknown agent -> 409"    409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d '{"agent":"ghost-nobody"}' $BASE/api/interrupt)"
+INTERRUPT_OFFLINE="{\"agent\":\"$CNAME\"}"
+check "interrupt offline agent -> 409"    409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$INTERRUPT_OFFLINE" $BASE/api/interrupt)"
+
 # --- approve gating -------------------------------------------------------
 check "approve rejects bad key -> 400"    400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$APPROVE_BADKEY" $BASE/api/approve)"
 check "approve on offline agent -> 400"   400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$APPROVE_OFFLINE" $BASE/api/approve)"
