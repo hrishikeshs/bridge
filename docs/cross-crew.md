@@ -61,6 +61,33 @@ The journey that got here (all three stops mattered):
 - The magnus-bridge repo keeps its history — the trust layer bridge inherited
   was born there, twice Professor-reviewed.
 
+## The generalization (Hrishi's bedtime brainwave, same night)
+
+Nothing above is Magnus-specific. It is a **host-adapter contract**, and
+Emacs is merely its first instance:
+
+1. **Register** your agents: `POST /local/connect` (exists today).
+2. **Deliver** inbound text: one executable in `~/.bridge/deliverers/`
+   (message JSON on stdin → inject into your buffer/terminal/pane;
+   exit 0 = delivered). Same trust posture as plugins.
+3. **Attention** (optional): `POST /local/attention` when your host sees a
+   permission prompt — cards, push, Yes/Always/No all follow.
+4. **Replies cost nothing, anywhere.** Claude Code writes its session JSONL
+   no matter what hosts it; bridge tails files, not terminals.
+
+So: **Emacs, VS Code, Zed, Neovim, anything** — if it can run Claude Code
+and execute one script, its agents can text your phone. Sketches:
+- *Neovim*: the deliverer is nearly a one-liner —
+  `nvim --server "$SOCK" --remote-send` into the terminal buffer.
+- *VS Code / Zed*: a ~20-line extension; `terminal.sendText` is the whole
+  delivery problem.
+- *tmux*: already built in — it is just the host adapter bridge happens to
+  ship with (and manage) itself.
+
+This fell out for free because of the day-one bet: build only on Claude
+Code's ungated primitives (`--resume`, session JSONL, hooks). Reading is
+universal; only writing is host-specific; and writing is one exec.
+
 ## The first packet
 
 When the unified wire carries its first message, it goes **Vint →
