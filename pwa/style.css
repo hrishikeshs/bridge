@@ -883,21 +883,34 @@ footer {
 :root[data-theme="international-orange"] { --glass: rgba(255,255,255,0.92); --veil-c: 255,253,248; }
 
 #scenery { display: none; }
+:root[data-wallpaper="airy"][data-view="list"],
+:root[data-wallpaper="whisper"][data-view="list"] {
+  /* The root canvas is the ONE surface iOS paints edge-to-edge without
+     exception — under the status bar, behind the home indicator, even
+     during rubber-banding. The document never scrolls (inner lists do),
+     so html is exactly viewport-sized and cover fits the screen. */
+  background: url("/wallpaper.jpg") center 30% / cover no-repeat;
+}
+:root[data-wallpaper="airy"][data-view="list"] body,
+:root[data-wallpaper="whisper"][data-view="list"] body {
+  /* body carries the veil; the canvas photo shows through it. */
+  background: var(--veil-grad);
+}
 :root[data-wallpaper="airy"][data-view="list"] #scenery,
 :root[data-wallpaper="whisper"][data-view="list"] #scenery {
   display: block;
   position: fixed; inset: 0; z-index: 0; pointer-events: none;
-  background: url("/wallpaper.jpg") center 30% / cover no-repeat;
 }
 #scenery .veil { position: absolute; inset: 0; }
-:root[data-wallpaper="airy"] #scenery .veil {
-  background: linear-gradient(180deg,
+:root[data-wallpaper="airy"] {
+  --veil-grad: linear-gradient(180deg,
     rgba(var(--veil-c), 0.88) 0%, rgba(var(--veil-c), 0.74) 34%, rgba(var(--veil-c), 0.44) 100%);
 }
-:root[data-wallpaper="whisper"] #scenery .veil {
-  background: linear-gradient(180deg,
+:root[data-wallpaper="whisper"] {
+  --veil-grad: linear-gradient(180deg,
     rgba(var(--veil-c), 0.76) 0%, rgba(var(--veil-c), 0.57) 34%, rgba(var(--veil-c), 0.24) 100%);
 }
+#scenery .veil { display: none; }
 
 #scenery .fog {
   position: absolute; border-radius: 50%; filter: blur(16px);
