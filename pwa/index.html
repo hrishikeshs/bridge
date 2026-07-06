@@ -27,31 +27,53 @@
   </div>
 
   <div id="app" class="hidden">
-    <header>
-      <span class="title">bridge</span>
-      <span id="conn-dot" class="dot" title="connection"></span>
-    </header>
+    <!-- Shared strips (sit under the notch, above whichever view is showing). -->
     <div id="conn-banner" class="banner hidden"></div>
-    <button id="attn-banner" class="hidden"></button>
     <button id="enable-push" class="hidden">🔔 Tap to enable notifications</button>
-    <nav id="contact-tabs"></nav>
-    <main id="feed"></main>
-    <footer>
-      <div id="attach-preview" class="hidden">
-        <img id="attach-thumb" alt="">
-        <button id="attach-remove">✕</button>
+
+    <!-- LIST VIEW — the conversation list; the home screen. -->
+    <section id="list-view">
+      <header class="list-header">
+        <span class="title">bridge</span>
+        <span id="conn-dot" class="dot" title="connection"></span>
+        <button id="settings-btn" title="notifications">⚙</button>
+      </header>
+      <div id="contact-list"></div>
+      <div id="list-empty" class="hidden">
+        <p class="empty-title">No conversations yet</p>
+        <p>Tell your Claude:<br><em>“use bridge so we can text”</em></p>
       </div>
-      <div id="composer">
-        <button id="attach-btn" title="send a photo">📷</button>
-        <input id="attach-input" type="file" accept="image/*" class="hidden">
-        <!-- The focus dance in app.js suppresses iOS's keyboard accessory
-             bar (single-focusable-element rule). Autocorrect and QuickType
-             stay on by user preference. -->
-        <textarea id="msg-input" rows="1" placeholder="Message a contact…"
-                  autocomplete="off" inputmode="text"></textarea>
-        <button id="send-btn">↑</button>
-      </div>
-    </footer>
+    </section>
+
+    <!-- THREAD VIEW — one conversation (the existing chat UI, re-homed). -->
+    <section id="thread-view" class="hidden">
+      <header class="thread-header">
+        <button id="back-btn" aria-label="Back to conversations">‹</button>
+        <div class="thread-id">
+          <span id="thread-name"></span>
+          <span id="thread-status" class="thread-status"></span>
+        </div>
+        <span id="conn-dot2" class="dot" title="connection"></span>
+      </header>
+      <button id="attn-banner" class="hidden"></button>
+      <main id="feed"></main>
+      <footer>
+        <div id="attach-preview" class="hidden">
+          <img id="attach-thumb" alt="">
+          <button id="attach-remove">✕</button>
+        </div>
+        <div id="composer">
+          <button id="attach-btn" title="send a photo">📷</button>
+          <input id="attach-input" type="file" accept="image/*" class="hidden">
+          <!-- The focus dance in app.js suppresses iOS's keyboard accessory
+               bar (single-focusable-element rule). Autocorrect and QuickType
+               stay on by user preference. -->
+          <textarea id="msg-input" rows="1" placeholder="Message a contact…"
+                    autocomplete="off" inputmode="text"></textarea>
+          <button id="send-btn">↑</button>
+        </div>
+      </footer>
+    </section>
   </div>
 
   <script src="/app.js"></script>

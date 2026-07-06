@@ -5,7 +5,6 @@
 
 const $ = (id) => document.getElementById(id);
 
-const HEALTH_GLYPHS = { ok: '●', working: '◐', prompt: '◉', offline: '○' };
 const HEALTH_LABELS = { working: 'working', prompt: 'waiting on you', offline: 'offline' };
 const STATE_GLYPH = { sending: '🕐', sent: '✓', failed: '⚠️', queued: '📮' };
 
@@ -13,7 +12,8 @@ const state = {
   contacts: [],          // roster from /api/status
   events: [],            // chronological event list
   attentions: new Map(), // contact id -> latest unresolved attention event
-  selected: 'all',
+  view: 'list',          // 'list' (conversation list) | 'thread' (one contact)
+  selected: null,        // contact id of the open thread, or null on the list
   lastEventId: 0,
   lastSeen: JSON.parse(localStorage.getItem('lastSeen') || '{}'),
   source: null,          // EventSource
@@ -36,7 +36,7 @@ setInterval(() => {                 // expire stale typing bubbles
   for (const [id, until] of state.typing) {
     if (until < now) { state.typing.delete(id); changed = true; }
   }
-  if (changed) renderFeed();
+  if (changed) { renderFeed(); renderList(); }
 }, 2000);
 
 /* ---------- bootstrap ---------- */
@@ -58,16 +58,21 @@ async function init() {
   state.contacts = data.contacts || [];
   setConnected(true);
   showApp();
-  // Cold-open from a notification tap: /?contact=<id>. Validate against the
-  // roster we just loaded before honouring it — a crafted id must not select
-  // an unintended or nonexistent target.
-  const deepLink = new URLSearchParams(location.search).get('contact');
-  if (deepLink) selectContactIfValid(deepLink);
   await loadHistory();
+  // With the roster and history loaded, land on the view named by the URL:
+  // the list, or — cold-open from a notification tap (/?contact=<id> or
+  // #/c/<id>) — straight into that contact's thread. restoreView validates
+  // the id against the roster (a crafted id must not select a real target).
+  restoreView();
   connectEvents();
   setInterval(refreshStatus, 30000);
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) { refreshStatus(); connectEvents(); flushOutbox(); }
+    if (!document.hidden) {
+      refreshStatus(); connectEvents(); flushOutbox();
+      // Returning to the foreground on an open thread clears its unread.
+      if (state.view === 'thread' && state.selected) markSeen(state.selected);
+      renderList();
+    }
   });
   window.addEventListener('online', () => { connectEvents(); flushOutbox(); });
   window.addEventListener('offline', () => setConnected(false));
@@ -104,8 +109,7 @@ function showPairing() {
 function showApp() {
   $('pair-screen').classList.add('hidden');
   $('app').classList.remove('hidden');
-  renderTabs();
-  renderFeed();
+  showList();   // default view; init()/restoreView() may then open a thread
 }
 
 /* ---------- pairing ---------- */
@@ -141,7 +145,9 @@ async function refreshStatus() {
   const revived = state.contacts.some(
     (c) => c.status !== 'offline' && wasOffline.get(c.id));
   if (revived) flushOutbox();
-  renderTabs();
+  renderList();
+  if (state.view === 'thread') updateThreadHeader();
+  updateAttentionBanner();
 }
 
 async function loadHistory() {
@@ -176,6 +182,7 @@ function connectEvents() {
     if (event.type === 'typing') {          // transient: never stored
       state.typing.set(event.agent, Date.now() + 6000);
       renderFeed();
+      renderList();          // surface "typing…" in the contact's row preview
       return;
     }
     const added = ingest(event);
@@ -185,7 +192,9 @@ function connectEvents() {
     if (added && event.type === 'sent') dropPendingEcho(event.agent, event.text, event.client_id);
     cacheEvents();
     renderFeed();
-    renderTabs();
+    renderList();
+    if (state.view === 'thread') updateThreadHeader();
+    updateAttentionBanner();
     maybeNotify(event);
   };
 }
@@ -213,7 +222,8 @@ function ingest(event) {
 
 function setConnected(on) {
   state.connected = !!on;
-  $('conn-dot').classList.toggle('on', !!on);
+  // Both view headers carry a connection dot; keep them in lockstep.
+  document.querySelectorAll('.dot').forEach((d) => d.classList.toggle('on', !!on));
   updateBanner();
 }
 
@@ -222,6 +232,9 @@ function setConnected(on) {
 function updateAttentionBanner() {
   const el = $('attn-banner');
   if (!el) return;
+  // The banner lives in the thread view; on the list, the row accent + preview
+  // override carry the same signal, so keep it hidden there.
+  if (state.view !== 'thread') { el.classList.add('hidden'); return; }
   // the first unresolved attention that isn't the contact you're looking at
   let target = null;
   for (const [id, ev] of state.attentions) {
@@ -230,7 +243,7 @@ function updateAttentionBanner() {
   if (target) {
     el.textContent = '🔔 ' + (target.name || 'an agent') + ' needs your approval →';
     el.classList.remove('hidden');
-    el.onclick = () => selectContact(target.id);
+    el.onclick = () => navigateToThread(target.id);
   } else {
     el.classList.add('hidden');
   }
@@ -254,98 +267,294 @@ function markSeen(contactId) {
   localStorage.setItem('lastSeen', JSON.stringify(state.lastSeen));
 }
 
-function hasUnread(contactId) {
+// Unread = agent replies/mentions newer than the stored cursor. Outbound and
+// self events never count. This reads the SAME lastSeen cursor the old boolean
+// used (a per-contact event id), so existing devices need no migration — the
+// old hasUnread was just this count > 0.
+function unreadCount(contactId) {
   const seen = state.lastSeen[contactId] || 0;
-  return state.events.some((e) =>
-    e.agent === contactId && e.id > seen && e.type !== 'sent');
+  let n = 0;
+  for (const e of state.events) {
+    if (e.agent === contactId && e.id > seen &&
+        (e.type === 'reply' || e.type === 'mention')) n++;
+  }
+  return n;
 }
 
-/* ---------- tabs ---------- */
+/* ---------- navigation: list ↔ thread ----------
 
-function renderTabs() {
-  updateAttentionBanner();
-  const tabs = $('contact-tabs');
-  tabs.innerHTML = '';
-  tabs.appendChild(makeTab('all', 'All', null, null));
-  // Server orders live contacts first, offline contacts last — preserve it.
-  for (const contact of state.contacts) {
-    tabs.appendChild(makeTab(contact.id, contact.name, contact.health, contact.status));
-  }
+   Two screens, iMessage-style. history.pushState/popstate drives it so the
+   platform back gesture (iOS swipe-back, Android back button) just works:
+   the list sits at #/, a thread at #/c/<contactId>. openThread/showList do
+   the DOM swap; navigateToThread pushes history; routeFromLocation replays
+   the URL (refresh, back/forward). */
+
+function showList() {
+  state.view = 'list';
+  state.selected = null;
+  $('list-view').classList.remove('hidden');
+  $('thread-view').classList.add('hidden');
+  renderList();
+  updateAttentionBanner();   // hidden on the list — rows carry the signal
 }
 
-function makeTab(id, label, health, status) {
-  const el = document.createElement('button');
-  const offline = status === 'offline';
-  el.className = 'tab' + (state.selected === id ? ' active' : '') +
-    (offline ? ' offline' : '');
-  el.textContent = label;
-  if (offline) {
-    // Contact with chat history but no live session: readable, sends queue.
-    el.appendChild(chip('offline-label', 'offline'));
-  } else if (health) {
-    const dot = document.createElement('span');
-    dot.className = 'h ' + health;
-    dot.textContent = HEALTH_GLYPHS[health] || '·';
-    dot.title = HEALTH_LABELS[health] || health;
-    el.prepend(dot);
-  }
-  if (state.attentions.has(id)) {
-    el.appendChild(chip('bang', '!'));
-  } else if (id !== 'all' && hasUnread(id)) {
-    el.appendChild(chip('unread', ''));
-  }
-  el.onclick = () => selectContact(id);
-  return el;
-}
-
-// Select a contact's thread (from a tab tap, a deep-link, or the attention
-// banner) and refresh the view.
-function selectContact(id) {
+function openThread(id) {
+  state.view = 'thread';
   state.selected = id;
-  if (id !== 'all') markSeen(id);
-  renderTabs();
+  $('thread-view').classList.remove('hidden');
+  $('list-view').classList.add('hidden');
+  if (!document.hidden) markSeen(id);
+  updateThreadHeader();
+  updateAttentionBanner();
   renderFeed();
   restoreDraft();
 }
 
-// Select a contact only if the id is actually in the current roster. Used for
-// notification deep-links (SW message + ?contact=) so an unknown or crafted id
-// is ignored rather than selecting an unintended target.
-function selectContactIfValid(id) {
-  if (id && state.contacts.some((c) => c.id === id)) selectContact(id);
+// Enter a thread and push it onto history, so back pops to the list.
+function navigateToThread(id) {
+  if (state.view === 'thread' && state.selected === id) { openThread(id); return; }
+  history.pushState({ view: 'thread', id }, '', '#/c/' + encodeURIComponent(id));
+  openThread(id);
 }
 
-function chip(cls, text) {
-  const el = document.createElement('span');
-  el.className = cls;
-  el.textContent = text;
-  return el;
+// Land on the view named by the URL — used by back/forward (popstate).
+function routeFromLocation() {
+  const m = (location.hash || '').match(/^#\/c\/(.+)$/);
+  const id = m ? decodeURIComponent(m[1]) : null;
+  if (id && state.contacts.some((c) => c.id === id)) openThread(id);
+  else showList();
+}
+
+// Establish the history baseline once the roster is known: a list entry always
+// sits under any thread, so back (button or swipe) returns to the list rather
+// than leaving the app — even on a cold-open deep-link straight to a thread.
+// The id (from #/c/<id> or the legacy ?contact= param) is honoured only if it
+// is in the live roster.
+function restoreView() {
+  const m = (location.hash || '').match(/^#\/c\/(.+)$/);
+  const param = new URLSearchParams(location.search).get('contact');
+  const id = m ? decodeURIComponent(m[1]) : param;
+  history.replaceState({ view: 'list' }, '', '#/');
+  if (id && state.contacts.some((c) => c.id === id)) navigateToThread(id);
+  else showList();
+}
+
+window.addEventListener('popstate', routeFromLocation);
+
+// Notification deep-link (SW postMessage, app already open). Validate the id
+// against the roster so an unknown/crafted value can't select a real target.
+function selectContactIfValid(id) {
+  if (id && state.contacts.some((c) => c.id === id)) navigateToThread(id);
+}
+
+$('back-btn').addEventListener('click', () => history.back());
+
+// Settings entry point. The only setting today is notifications: the gear
+// (re)requests permission and reveals the enable-push control where relevant.
+$('settings-btn').addEventListener('click', async () => {
+  await requestNotifyPermission();
+  updatePushButton();
+});
+
+/* ---------- conversation list ---------- */
+
+// Order: last activity (newest first); then live before offline; then name.
+// Attention deliberately does NOT reorder (honest ordering) — the row gets an
+// accent instead.
+function listSort(a, b) {
+  const am = lastActivityMs(a), bm = lastActivityMs(b);
+  if (am !== bm) return bm - am;
+  const ao = a.status === 'offline', bo = b.status === 'offline';
+  if (ao !== bo) return ao ? 1 : -1;
+  return (a.name || '').localeCompare(b.name || '');
+}
+
+function renderList() {
+  const list = $('contact-list');
+  const empty = $('list-empty');
+  if (!state.contacts.length) {
+    list.innerHTML = '';
+    empty.classList.remove('hidden');
+    updateUnreadTotals();
+    return;
+  }
+  empty.classList.add('hidden');
+  const rows = state.contacts.slice().sort(listSort);
+  list.innerHTML = '';
+  for (const c of rows) list.appendChild(makeRow(c));
+  updateUnreadTotals();
+}
+
+function makeRow(contact) {
+  const id = contact.id;
+  const offline = contact.status === 'offline';
+  const row = document.createElement('button');
+  row.className = 'row' + (offline ? ' offline' : '') +
+    (state.attentions.has(id) ? ' attn' : '');
+  row.onclick = () => navigateToThread(id);
+
+  const av = document.createElement('span');
+  av.className = 'avatar';
+  av.style.background = avatarColor(contact.name);
+  av.textContent = monogram(contact.name);
+  const sdot = document.createElement('span');
+  sdot.className = 'status-dot ' + (offline ? 'offline' : (contact.health || 'ok'));
+  av.appendChild(sdot);
+  row.appendChild(av);
+
+  const main = document.createElement('span');
+  main.className = 'row-main';
+
+  const top = document.createElement('span');
+  top.className = 'row-top';
+  const name = document.createElement('span');
+  name.className = 'row-name';
+  name.textContent = contact.name || 'contact';
+  const time = document.createElement('span');
+  time.className = 'row-time';
+  const ms = lastActivityMs(contact);
+  time.textContent = ms ? listTime(ms) : '';
+  top.appendChild(name);
+  top.appendChild(time);
+
+  const bottom = document.createElement('span');
+  bottom.className = 'row-bottom';
+  const preview = document.createElement('span');
+  preview.className = 'row-preview';
+  const p = previewFor(contact);
+  if (p.cls) preview.classList.add(p.cls);
+  preview.textContent = p.text;
+  bottom.appendChild(preview);
+  const n = unreadCount(id);
+  if (n > 0) {
+    const badge = document.createElement('span');
+    badge.className = 'row-badge';
+    badge.textContent = n > 99 ? '99+' : String(n);
+    bottom.appendChild(badge);
+  }
+
+  main.appendChild(top);
+  main.appendChild(bottom);
+  row.appendChild(main);
+  return row;
+}
+
+// Monogram + a deterministic colour derived from the name — stable across
+// loads (adjective-animal names like "swift-wolf" → "SW").
+function monogram(name) {
+  const parts = (name || '?').trim().split(/[\s_-]+/).filter(Boolean);
+  if (!parts.length) return '?';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function avatarColor(name) {
+  let h = 0;
+  const s = name || '';
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return 'hsl(' + (h % 360) + ' 42% 42%)';   // muted, dark-theme friendly
+}
+
+// The one-line row preview. Precedence per the charter: live typing → open
+// prompt → newest message → the contact's directory / a placeholder.
+function previewFor(contact) {
+  const id = contact.id;
+  if ((state.typing.get(id) || 0) > Date.now()) return { text: 'typing…', cls: 'typing' };
+  if (contact.health === 'prompt') return { text: '🔔 needs your approval', cls: 'alert' };
+  const item = newestMessage(id);
+  if (!item) return { text: contact.directory || 'no messages yet', cls: 'muted' };
+  const out = item.type === 'sent' || item.mstate !== undefined;   // event vs outbox echo
+  const body = item.image ? '📷 photo' : (plainPreview(item.text) || '📷 photo');
+  return { text: (out ? 'You: ' : '') + body };
+}
+
+// Newest message-like item touching the contact — a stored reply/mention/sent
+// event or a not-yet-confirmed outbox echo — whichever is more recent.
+function newestMessage(id) {
+  let ev = null;
+  for (let i = state.events.length - 1; i >= 0; i--) {
+    const e = state.events[i];
+    if (e.agent === id && (e.type === 'reply' || e.type === 'mention' || e.type === 'sent')) {
+      ev = e; break;
+    }
+  }
+  let pend = null;
+  for (const m of state.pending) if (m.agent === id) pend = m;   // last wins (chronological)
+  if (ev && pend) return (Date.parse(pend.ts) || 0) >= (Date.parse(ev.ts) || 0) ? pend : ev;
+  return ev || pend;
+}
+
+// Milliseconds of the last activity of ANY kind touching the contact (drives
+// ordering). 0 for a contact the phone has never seen an event for.
+function lastActivityMs(contact) {
+  const id = contact.id;
+  let ms = 0;
+  for (let i = state.events.length - 1; i >= 0; i--) {
+    if (state.events[i].agent === id) { ms = Date.parse(state.events[i].ts) || 0; break; }
+  }
+  for (const m of state.pending) {
+    if (m.agent === id) { const t = Date.parse(m.ts) || 0; if (t > ms) ms = t; }
+  }
+  return ms;
+}
+
+// Strip thinking/response markers and collapse to a single preview line.
+function plainPreview(text) {
+  return (text || '')
+    .replace(/\[thinking\][\s\S]*?(?:\[end-thinking\]|\[\/thinking\]|(?=\[response\])|$)/g, '')
+    .replace(/\[response\]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function updateThreadHeader() {
+  const c = state.contacts.find((x) => x.id === state.selected);
+  $('thread-name').textContent = (c && c.name) || 'contact';
+  $('thread-status').textContent = threadStatusText(c);
+}
+
+function threadStatusText(contact) {
+  if (!contact) return '';
+  if (contact.status === 'offline') return 'offline';
+  const h = HEALTH_LABELS[contact.health];
+  return 'live' + (h ? ' · ' + h : '');
+}
+
+// Total unread across contacts → app-icon badge (where supported) + a
+// document.title prefix; both cleared when everything is read.
+function updateUnreadTotals() {
+  let total = 0;
+  for (const c of state.contacts) total += unreadCount(c.id);
+  document.title = total > 0 ? '(' + total + ') bridge' : 'bridge';
+  if ('setAppBadge' in navigator) {
+    if (total > 0) navigator.setAppBadge(total).catch(() => {});
+    else if ('clearAppBadge' in navigator) navigator.clearAppBadge().catch(() => {});
+  }
 }
 
 /* ---------- feed ---------- */
 
 function visibleEvents() {
-  if (state.selected === 'all') return state.events;
   return state.events.filter((e) => e.agent === state.selected);
 }
 
 function visiblePending() {
-  if (state.selected === 'all') return state.pending;
   return state.pending.filter((m) => m.agent === state.selected);
 }
 
 function renderFeed() {
+  if (state.view !== 'thread' || !state.selected) return;   // feed is hidden
   const feed = $('feed');
   const stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
   feed.innerHTML = '';
   let lastDay = '';
   for (const event of visibleEvents()) {
-    const day = (event.ts || '').slice(0, 10);
+    const day = (event.ts || '').slice(0, 10);   // group by calendar day
     if (day && day !== lastDay) {
       lastDay = day;
       const sep = document.createElement('div');
       sep.className = 'day-sep';
-      sep.textContent = day;
+      sep.textContent = dayLabel(event.ts);       // Today / Yesterday / date
       feed.appendChild(sep);
     }
     feed.appendChild(renderEvent(event));
@@ -354,17 +563,15 @@ function renderFeed() {
   const now = Date.now();
   for (const [id, until] of state.typing) {
     if (until < now) continue;
-    if (state.selected !== 'all' && state.selected !== id) continue;
+    if (state.selected !== id) continue;
     feed.appendChild(typingBubble(contactName(id) || 'contact'));
   }
   if (stick) feed.scrollTop = feed.scrollHeight;
-  if (state.selected !== 'all') markSeen(state.selected);
-  $('msg-input').placeholder = state.selected === 'all'
-    ? 'Pick a contact to message…'
-    : 'Message ' + (contactName(state.selected) || 'contact') + '…';
-  const noContact = state.selected === 'all';
-  $('send-btn').disabled = noContact;
-  $('attach-btn').disabled = noContact;
+  // New events arriving while the thread is open and visible clear its unread.
+  if (!document.hidden) { markSeen(state.selected); updateUnreadTotals(); }
+  $('msg-input').placeholder = 'Message ' + (contactName(state.selected) || 'contact') + '…';
+  $('send-btn').disabled = false;
+  $('attach-btn').disabled = false;
 }
 
 function contactName(id) {
@@ -456,6 +663,35 @@ function localTime(ts) {
   const d = new Date(ts);
   return isNaN(d) ? '' :
     d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// iMessage-convention compact stamp for a conversation row:
+// today → time; yesterday → "Yesterday"; this week → weekday; older → date.
+function listTime(ts) {
+  const d = new Date(ts);
+  if (isNaN(d)) return '';
+  const days = daysAgo(d);
+  if (days <= 0) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (days === 1) return 'Yesterday';
+  if (days < 7) return d.toLocaleDateString([], { weekday: 'short' });
+  return d.toLocaleDateString([], { month: 'numeric', day: 'numeric', year: '2-digit' });
+}
+
+// Day-separator label inside a thread feed.
+function dayLabel(ts) {
+  const d = new Date(ts);
+  if (isNaN(d)) return '';
+  const days = daysAgo(d);
+  if (days <= 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days < 7) return d.toLocaleDateString([], { weekday: 'long' });
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// Whole calendar days between D and now (0 = today, 1 = yesterday, …).
+function daysAgo(d) {
+  const startOfDay = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  return Math.round((startOfDay(new Date()) - startOfDay(d)) / 86400000);
 }
 
 /* Render text with [thinking] blocks collapsed into tappable pills and
@@ -691,7 +927,7 @@ function downscale(file) {
 function sendMessage() {
   const body = input.value.trim();
   const image = pendingImage;
-  if ((!body && !image) || state.selected === 'all') return;
+  if ((!body && !image) || !state.selected) return;
   input.value = '';
   localStorage.removeItem(draftKey());
   clearAttachment();
