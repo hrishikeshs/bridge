@@ -41,7 +41,7 @@ paired-device token, except `POST /api/pair` and static assets. Requests are
 audited; bodies capped; history durable (JSONL on disk).
 
 - `POST /api/pair {code, device}` → Set-Cookie token. Codes: 6 digits,
-  2-minute, single-use, printed only by `bridge pair` on the machine.
+  10-minute, single-use, printed only by `bridge pair` on the machine.
 - `GET  /api/status` → `{contacts: [{id, name, directory, status, health,
   attention}], version}`. `status`: `live | offline`. `health`:
   `ok | working | prompt | offline`.
@@ -122,14 +122,24 @@ offline semantics. The phone sees the traffic in the relevant threads.
 1. Daemon binds **127.0.0.1**; the tailnet (via `tailscale serve`) is the
    phone's only road in. `bridge expose` wraps the serve setup.
 2. Tailscale identity allowlist (`~/.bridge/config.json`) + per-device
-   pairing tokens (0600), single-use 2-minute codes printed only on-machine.
+   pairing tokens (0600), single-use 10-minute codes printed only on-machine.
 3. Local CLI↔daemon calls authenticate with the lockfile token (0600) —
    same local-trust posture as magnus-bridge, documented.
 4. Approve endpoint: whitelisted keys, hook-attested prompt state only.
 5. Every request audited (`~/.bridge/audit.log`); bodies size-capped;
    `bridge lockdown` kills the server and revokes every device.
-6. Agents still face Claude Code's own permission system — the bridge
-   extends the human loop, never removes it.
+6. Agents still face Claude Code's own permission system. For an **honest**
+   agent, the bridge *extends* the human loop — you approve from your phone —
+   it doesn't replace it.
+7. **What the bridge does NOT do: contain a compromised agent.** Managed
+   agents run as the *same UNIX user* as the daemon, so a prompt-injected
+   agent can read its own device token from `~/.bridge/` and `POST
+   /api/approve` to answer its own permission prompt — no human. The 0600
+   file perms stop *other users*, not the very process they host. So the
+   human-in-the-loop guarantee holds exactly as far as the agent is
+   trustworthy. Real containment (running agents under a separate uid, or an
+   out-of-band approve confirmation) is out of scope for v1 — **don't rely on
+   the bridge to sandbox an agent you don't already trust.**
 
 ## 8. Explicitly out (v1)
 

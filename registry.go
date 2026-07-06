@@ -6,18 +6,19 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 )
 
 // Contact is a managed agent: a stable, daemon-minted identity that outlives
-// session churn. Each --resume mints a new SessionID, but the Contact (and its
-// thread and outbox) persists.
+// session churn. The Contact (and its thread and outbox) persists across daemon
+// restarts and reconnects, keyed by name+directory; its id never changes.
 type Contact struct {
-	ID         string `json:"id"`          // daemon-minted uuid for the agent
-	Name       string `json:"name"`        // self-chosen address, unique among the living
+	ID         string `json:"id"`          // daemon-minted uuid for the agent; the immutable identity
+	Name       string `json:"name"`        // self-chosen address, unique among the living (a display name; may be suffixed)
 	Directory  string `json:"directory"`   // the agent's working directory
-	SessionID  string `json:"session_id"`  // current Claude Code conversation id (churns on resume)
-	TmuxTarget string `json:"tmux_target"` // tmux target hosting the agent (bridge-<name>)
+	SessionID  string `json:"session_id"`  // Claude Code conversation id; `claude --resume` PRESERVES it (verified empirically), so it is stable across resume — the tail pins on it, falling back to the newest .jsonl only if it goes missing/stale (see sessionFileFor)
+	TmuxTarget string `json:"tmux_target"` // tmux window id ("@N") hosting the agent; legacy rows may hold "bridge:<name>"
 	Status     string `json:"status"`      // "live" | "offline"
 	Health     string `json:"health"`      // "ok" | "working" | "prompt" | "offline"
 	PromptOpen bool   `json:"prompt_open"` // a permission prompt is hook-attested open
@@ -44,13 +45,19 @@ type Registry struct {
 	mu       sync.Mutex
 	contacts map[string]*Contact
 	mailbox  map[string][]MailMessage
+	flushing map[string]bool // ids with a mailbox flush in progress
 }
 
 // registry is the process-wide roster.
 var registry = &Registry{
 	contacts: map[string]*Contact{},
 	mailbox:  map[string][]MailMessage{},
+	flushing: map[string]bool{},
 }
+
+// maxMailbox caps a contact's offline queue; enqueuing past it drops the oldest
+// so a peer flooding an offline contact can't grow the file unbounded (M8).
+const maxMailbox = 100
 
 // registryFile is the on-disk shape of the registry.
 type registryFile struct {
@@ -69,6 +76,36 @@ func newID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// nameAdjectives and nameAnimals seed auto-generated agent addresses
+// (adjective-animal, e.g. "swift-fox"). Ported from Magnus's wordlists; indices
+// are drawn with the shared randInt (uniform, rejection-sampled), so the list
+// lengths no longer have to divide 256 to stay unbiased.
+var (
+	nameAdjectives = []string{
+		"swift", "bright", "calm", "bold", "keen", "wise", "quick", "sharp",
+		"cool", "warm", "brave", "clever", "gentle", "lively", "noble", "merry",
+	}
+	nameAnimals = []string{
+		"fox", "owl", "hawk", "wolf", "bear", "deer", "crow", "lynx",
+		"hare", "wren", "otter", "raven", "finch", "seal", "moth", "toad",
+	}
+)
+
+// generateName returns an "adjective-animal" address absent from `taken`,
+// regenerating on collision up to 100 times before falling back to an
+// id-suffixed form. It lives on the registry side so both the connect CLI (via
+// the /local/contacts roster) and the daemon can reuse it. `taken` may be nil.
+func generateName(taken map[string]bool) string {
+	for i := 0; i < 100; i++ {
+		n := nameAdjectives[randInt(len(nameAdjectives))] + "-" + nameAnimals[randInt(len(nameAnimals))]
+		if !taken[n] {
+			return n
+		}
+	}
+	return nameAdjectives[randInt(len(nameAdjectives))] + "-" +
+		nameAnimals[randInt(len(nameAnimals))] + "-" + newID()[:4]
+}
+
 // loadRegistry restores contacts and mailboxes from disk. Every contact loads
 // offline: a fresh daemon owns no tmux sessions until agents reconnect.
 func loadRegistry() {
@@ -80,6 +117,10 @@ func loadRegistry() {
 	}
 	var rf registryFile
 	if json.Unmarshal(data, &rf) != nil {
+		// Corrupt roster: preserve it for forensics rather than letting the next
+		// save() silently clobber it with an empty registry (M3). Atomic writes
+		// make this rare; this is the belt-and-suspenders half, matching events.go.
+		_ = os.Rename(bridgePath("contacts.json"), bridgePath("contacts.json.corrupt"))
 		return
 	}
 	registry.contacts = map[string]*Contact{}
@@ -118,9 +159,42 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 			break
 		}
 	}
+	// Sanitize a NEW registration here, at the choke point every producer flows
+	// through, so no caller of the local connect endpoint (a rollback binary, a
+	// stale client) can bypass runConnect's CLI-side checks and register a
+	// routing-hostile identity (C2). A *revive* of an existing contact is left
+	// alone: its name was validated when first registered, and the session
+	// manager has already migrated a legacy name-based target to a window id
+	// before calling us — so legacy stored state still reconciles.
 	if c == nil {
-		c = &Contact{ID: newID(), Name: name, Directory: directory}
+		if !nameConnectRe.MatchString(name) {
+			// A numeric/relative/whitespace name is exactly what tmux misresolves
+			// via its target grammar; replace it with a safe generated address
+			// rather than store it as a routing key.
+			name = generateName(r.liveNames())
+		}
+		if !strings.HasPrefix(tmuxTarget, "@") {
+			// Only a window id ("@N") is immune to tmux's target grammar. A
+			// name-based target ("bridge:1") could send-keys to a window *index* —
+			// the original misroute. Neutralize it: an empty target never routes
+			// (tmuxAlive is false), so the contact stays offline until it
+			// reconnects with a real window id.
+			tmuxTarget = ""
+		}
+	}
+	// Guarantee the name is unique among *live* contacts so the phone can address
+	// an agent unambiguously. On collision with a different live contact, append
+	// a numeric suffix (swift-fox-2, -3, ...). The final name is returned via
+	// Contact.Name so the caller can reconcile the tmux window title.
+	final := name
+	for n := 2; r.liveNameTaken(final, c); n++ {
+		final = fmt.Sprintf("%s-%d", name, n)
+	}
+	if c == nil {
+		c = &Contact{ID: newID(), Name: final, Directory: directory}
 		r.contacts[c.ID] = c
+	} else {
+		c.Name = final
 	}
 	c.SessionID = sessionID
 	c.TmuxTarget = tmuxTarget
@@ -129,6 +203,29 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 	c.PromptOpen = false
 	r.save()
 	return c.copy()
+}
+
+// liveNameTaken reports whether a live contact other than `self` already answers
+// to `name`. Caller holds r.mu.
+func (r *Registry) liveNameTaken(name string, self *Contact) bool {
+	for _, c := range r.contacts {
+		if c != self && c.Status == "live" && c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// liveNames returns the set of names held by live contacts, for generating a
+// fresh non-colliding address. Caller holds r.mu.
+func (r *Registry) liveNames() map[string]bool {
+	taken := map[string]bool{}
+	for _, c := range r.contacts {
+		if c.Status == "live" && c.Name != "" {
+			taken[c.Name] = true
+		}
+	}
+	return taken
 }
 
 // Resolve maps a handle (contact id, or a name unique among the living) to a
@@ -221,34 +318,77 @@ func (r *Registry) SetOffline(id string) {
 	r.save()
 }
 
-// Queue appends a message to a contact's offline mailbox.
+// Queue appends a message to a contact's offline mailbox, dropping the oldest
+// messages beyond maxMailbox so the queue (and its on-disk footprint) is bounded.
 func (r *Registry) Queue(id string, m MailMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.mailbox[id] = append(r.mailbox[id], m)
-	r.save()
-}
-
-// TakeMailbox returns and clears a contact's queued messages.
-func (r *Registry) TakeMailbox(id string) []MailMessage {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	msgs := r.mailbox[id]
-	delete(r.mailbox, id)
-	r.save()
-	return msgs
-}
-
-// Requeue restores messages to the front of a contact's mailbox when delivery
-// of a drained mailbox fails partway through.
-func (r *Registry) Requeue(id string, msgs []MailMessage) {
-	if len(msgs) == 0 {
-		return
+	q := append(r.mailbox[id], m)
+	if len(q) > maxMailbox {
+		q = append([]MailMessage(nil), q[len(q)-maxMailbox:]...)
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.mailbox[id] = append(append([]MailMessage{}, msgs...), r.mailbox[id]...)
+	r.mailbox[id] = q
 	r.save()
+}
+
+// FlushMailbox delivers queued messages one at a time, removing (and persisting)
+// each only after deliver returns nil. Stops at the first delivery error, leaving
+// the remaining messages queued. Safe against crash-mid-flush (no delete-then-lose):
+// a message leaves disk only after its delivery succeeded, so a crash between
+// deliver and save at worst redelivers the last message (deliveries are idempotent
+// enough for that). Concurrent flushes of the same id are coalesced to one.
+func (r *Registry) FlushMailbox(id string, deliver func(MailMessage) error) {
+	r.mu.Lock()
+	if r.flushing == nil {
+		r.flushing = map[string]bool{}
+	}
+	if r.flushing[id] {
+		r.mu.Unlock()
+		return // another flush is already draining this mailbox
+	}
+	r.flushing[id] = true
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.flushing, id)
+		r.mu.Unlock()
+	}()
+
+	for {
+		r.mu.Lock()
+		q := r.mailbox[id]
+		if len(q) == 0 {
+			r.mu.Unlock()
+			return
+		}
+		m := q[0]
+		r.mu.Unlock()
+
+		if err := deliver(m); err != nil {
+			return // leave m and the rest queued for the next flush
+		}
+
+		// Delivered: remove that exact message and persist before moving on. The
+		// head may have shifted while the lock was released — a concurrent Queue at
+		// the maxMailbox cap drops the oldest — so re-find m by value instead of
+		// assuming it is still q[0], which would discard a never-delivered message
+		// (#5). If m was itself the one the cap dropped, it is already gone and
+		// there is nothing to remove.
+		r.mu.Lock()
+		if q := r.mailbox[id]; len(q) > 0 {
+			for i := range q {
+				if q[i] == m {
+					r.mailbox[id] = append(q[:i:i], q[i+1:]...)
+					break
+				}
+			}
+			if len(r.mailbox[id]) == 0 {
+				delete(r.mailbox, id)
+			}
+		}
+		r.save()
+		r.mu.Unlock()
+	}
 }
 
 // SetHealth updates a live contact's health indicator (e.g. "working" while
@@ -262,13 +402,43 @@ func (r *Registry) SetHealth(id, health string) {
 	}
 }
 
-// SetSession records a contact's current Claude Code session id, which churns
-// on every --resume; the tail loop re-resolves the JSONL when it changes.
+// SessionHeldByOther reports whether a live contact other than exceptID is
+// already tailing sessionID's JSONL. The stale-file fallback consults it so it
+// never adopts a sibling agent's conversation in the same directory (H2).
+func (r *Registry) SessionHeldByOther(sessionID, exceptID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.contacts {
+		if c.ID != exceptID && c.Status == "live" && c.SessionID == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSession records a contact's current Claude Code session id. `claude
+// --resume` preserves the id today, so this changes rarely; the tail loop
+// re-resolves the JSONL when it does.
 func (r *Registry) SetSession(id, sessionID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if c, ok := r.contacts[id]; ok {
-		c.SessionID = sessionID
-		r.save()
+	c, ok := r.contacts[id]
+	if !ok {
+		return
 	}
+	// Don't adopt a session id already held by another live contact: two agents
+	// rehomed from the same directory must not converge on one JSONL, which would
+	// cross their reply threads and misroute permission cards (H2).
+	if sessionID != "" {
+		for _, other := range r.contacts {
+			if other != c && other.Status == "live" && other.SessionID == sessionID {
+				return
+			}
+		}
+	}
+	c.SessionID = sessionID
+	r.save()
 }

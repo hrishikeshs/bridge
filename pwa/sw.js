@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE = 'bridge-v6';
+const CACHE = 'bridge-v7';
 const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest',
                '/icons/icon-192.png', '/icons/icon-512.png'];
 
@@ -27,8 +27,12 @@ self.addEventListener('fetch', (e) => {
   e.respondWith(
     fetch(e.request)
       .then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE).then((c) => c.put(e.request, copy));
+        // Only cache successful GETs — a transient 5xx (or a non-GET) must not
+        // poison the offline shell (e.g. a bad /app.js served forever).
+        if (e.request.method === 'GET' && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(e.request, copy));
+        }
         return res;
       })
       .catch(() => caches.match(e.request, { ignoreSearch: true }))
@@ -38,7 +42,12 @@ self.addEventListener('fetch', (e) => {
 // Web Push: the daemon fires these so the phone rings with the app closed.
 self.addEventListener('push', (e) => {
   let d = { title: 'bridge', body: '' };
-  try { d = e.data.json(); } catch (_) { if (e.data) d.body = e.data.text(); }
+  try {
+    // A `null` (or non-object) JSON body would make the d.title/d.body reads
+    // below throw a TypeError and drop the notification — fall back to {}.
+    const parsed = e.data.json();
+    d = (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch (_) { if (e.data) d.body = e.data.text(); }
   e.waitUntil(self.registration.showNotification(d.title || 'bridge', {
     body: d.body || '',
     tag: d.tag || undefined,

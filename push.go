@@ -6,12 +6,16 @@ package main
 // E2E-encrypted per the spec, so nothing legible transits Apple/Mozilla/Google.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
+	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
 )
@@ -60,6 +64,113 @@ func savePushSubs() {
 	_ = writeFilePrivate(subsPath(), data)
 }
 
+// clearPushSubs drops every stored push subscription and persists the empty
+// set. Called on lockdown (revokeAllDevices) so a revoked or lost phone stops
+// receiving pushes. savePushSubs takes pushMu itself, so release it first.
+func clearPushSubs() {
+	pushMu.Lock()
+	pushSubs = map[string]*webpush.Subscription{}
+	pushMu.Unlock()
+	savePushSubs()
+}
+
+// validPushEndpoint guards handlePushSubscribe against SSRF: a paired device
+// could otherwise register an arbitrary Endpoint that sendPush would then POST
+// to (and log the response of). We require https and reject anything that
+// isn't a plausible public push host — raw IP literals and any name that
+// resolves into a loopback/private/link-local range. This is deliberately a
+// range check rather than a brittle origin allowlist so legitimate Apple /
+// FCM / Mozilla / WNS hosts keep working without maintenance.
+//
+// This is only the fast early gate. The real enforcement is pushClient's
+// dial-time re-check (#7): a subscribe-time resolution can be rebound to
+// 127.0.0.1 before the push actually goes out, so the IP is vetted again — and
+// pinned — at the moment sendPush dials.
+func validPushEndpoint(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	// Real push services are DNS names, never raw IPs — reject IP literals
+	// (the most direct SSRF vector).
+	if net.ParseIP(host) != nil {
+		return false
+	}
+	// Resolve now and fail CLOSED: reject a lookup miss (0 addresses / error) or
+	// any address in an internal range. Dial time re-checks, so a rebind after
+	// this point still can't reach an internal address.
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		if isInternalIP(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// isInternalIP reports whether ip belongs to a range a public push service
+// should never live in.
+func isInternalIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
+}
+
+// pushClient is the HTTP client sendPush hands to the webpush library. Its
+// DialContext re-vets the destination at connection time and dials only
+// vetted public IPs — closing the DNS-rebinding hole a subscribe-time-only
+// guard leaves open (#7). The TLS handshake still uses the original hostname (the
+// Transport derives ServerName from the dial address, not from the IP we
+// return), so certificate verification is unaffected.
+var pushClient = &http.Client{
+	Transport: &http.Transport{DialContext: safeDialContext},
+	Timeout:   30 * time.Second, // a wedged push service must not park a goroutine forever
+}
+
+// safeDialContext resolves the host, refuses to connect if the lookup fails or
+// *any* address is internal (fail CLOSED), and then dials the vetted IP itself
+// rather than the hostname — so a racing DNS change can't rebind the connection
+// into an internal range between the check and the dial.
+func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("push: no addresses for %s", host)
+	}
+	for _, ip := range ips {
+		if isInternalIP(ip) {
+			return nil, fmt.Errorf("push: refusing to dial internal address %s", ip)
+		}
+	}
+	// Every resolved address passed, so dialing any of them is safe and blocks a
+	// second resolution from swapping in an internal IP. Walk the list rather
+	// than pinning ips[0]: dialing by hostname would have fallen back across
+	// address families (Happy Eyeballs), and an unreachable first family must
+	// not strand pushes.
+	var d net.Dialer
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 // handlePushKey returns the VAPID public key the client needs to subscribe.
 func handlePushKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"key": vapid.Public})
@@ -74,6 +185,10 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	var sub webpush.Subscription
 	if json.Unmarshal(data, &sub) != nil || sub.Endpoint == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-subscription"})
+		return
+	}
+	if !validPushEndpoint(sub.Endpoint) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-endpoint"})
 		return
 	}
 	token := requestToken(r)
@@ -110,6 +225,7 @@ func sendPush(p pushPayload) (int, error) {
 	sent, dead := 0, []string{}
 	for token, sub := range subs {
 		resp, err := webpush.SendNotification(body, sub, &webpush.Options{
+			HTTPClient:      pushClient, // dial-time SSRF re-check (#7)
 			Subscriber:      "https://github.com/hrishikeshs/bridge",
 			VAPIDPublicKey:  vapid.Public,
 			VAPIDPrivateKey: vapid.Private,
