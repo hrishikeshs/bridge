@@ -234,6 +234,7 @@ async function refreshStatus() {
   const revived = state.contacts.some(
     (c) => c.status !== 'offline' && wasOffline.get(c.id));
   if (revived) flushOutbox();
+  pruneAttentions();
   renderList();
   if (state.view === 'thread') updateThreadHeader();
   updateAttentionBanner();
@@ -244,8 +245,23 @@ async function loadHistory() {
   if (!res || !res.ok) return;
   const data = await res.json();
   (data.events || []).forEach(ingest);
+  pruneAttentions();   // history replay can resurrect orphaned attentions
   cacheEvents();
   renderFeed();
+}
+
+// Roster truth beats history replay. An attention whose clear never got
+// emitted (a desk-answered prompt from before the daemon re-verified them)
+// survives in history forever; the daemon's live PromptOpen flag is the
+// authority on who needs approval RIGHT NOW. Prune anything the roster
+// disowns so a banner can never outlive its prompt.
+function pruneAttentions() {
+  let changed = false;
+  for (const id of [...state.attentions.keys()]) {
+    const c = state.contacts.find((x) => x.id === id);
+    if (!c || !c.attention) { state.attentions.delete(id); changed = true; }
+  }
+  if (changed) { updateAttentionBanner(); renderList(); }
 }
 
 function connectEvents() {
@@ -761,7 +777,12 @@ function renderFeed() {
       sep.textContent = dayLabel(event.ts);       // Today / Yesterday / date
       feed.appendChild(sep);
     }
-    feed.appendChild(renderEvent(event, resolutions.get(event.id)));
+    let res = resolutions.get(event.id);
+    if (!res && event.type === 'attention') {
+      const c = state.contacts.find((x) => x.id === event.agent);
+      if (!c || !c.attention) res = { kind: 'cleared', ts: null };   // orphaned: roster says no prompt
+    }
+    feed.appendChild(renderEvent(event, res));
   }
   for (const msg of visiblePending()) feed.appendChild(renderPending(msg));
   const now = Date.now();
@@ -1084,7 +1105,7 @@ function attentionCard(event, resolution) {
     done.className = 'attn-resolved';
     const label = resolution.kind === 'approved'
       ? '✓ Approved from phone' : '✓ Resolved';
-    done.textContent = label + ' · ' + localTime(resolution.ts);
+    done.textContent = resolution.ts ? label + ' · ' + localTime(resolution.ts) : label;
     el.appendChild(done);
   } else {
     el.appendChild(who((event.name || '?') + ' needs your attention'));
