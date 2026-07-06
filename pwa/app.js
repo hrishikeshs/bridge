@@ -108,6 +108,7 @@ const state = {
   typing: new Map(),     // contact id -> expiry ms; fed by transient events
   connected: false,      // SSE open / last request reached the bridge
   pending: [],           // local echoes + outbox (see loadPending)
+  guidance: null,        // {agent, until} — a No was tapped; next message is the "do this instead"
 };
 
 /* Outbox: unsent/undelivered messages, persisted so they survive an app
@@ -772,7 +773,10 @@ function renderFeed() {
   if (stick) feed.scrollTop = feed.scrollHeight;
   // New events arriving while the thread is open and visible clear its unread.
   if (!document.hidden) { markSeen(state.selected); updateUnreadTotals(); }
-  $('msg-input').placeholder = 'Message ' + (contactName(state.selected) || 'contact') + '…';
+  const g = state.guidance;
+  $('msg-input').placeholder = (g && g.agent === state.selected && g.until > Date.now())
+    ? 'Tell ' + (contactName(state.selected) || 'the agent') + ' what to do differently…'
+    : 'Message ' + (contactName(state.selected) || 'contact') + '…';
   $('send-btn').disabled = false;
   $('attach-btn').disabled = false;
 }
@@ -1119,10 +1123,22 @@ function promptOptions(text) {
   const options = [];
   for (const line of (text || '').split('\n')) {
     const m = line.match(/^\s*(?:❯\s*)?([123])\.\s*(.+?)\s*$/);
-    if (m) options.push({ key: m[1], label: m[2].slice(0, 28) });
+    if (m) options.push({ key: m[1], label: normalizeOption(m[2]) });
   }
   return options.length ? options : [
     { key: '1', label: 'Yes' }, { key: '3', label: 'No' }];
+}
+
+// Claude Code phrases its dialog options verbosely ("Yes, and don't ask
+// again this session", "No, and tell Claude what to do differently…").
+// On a phone card they normalize to the canonical trio; anything that
+// doesn't match stays as (truncated) dialog text, so unusual dialogs keep
+// their real choices. The tapped KEY is always the dialog's own number.
+function normalizeOption(label) {
+  if (/don'?t ask|always/i.test(label)) return 'Always';
+  if (/^yes/i.test(label)) return 'Yes';
+  if (/^no/i.test(label)) return 'No';
+  return label.slice(0, 28);
 }
 
 function approveKeys(event) {
@@ -1131,7 +1147,14 @@ function approveKeys(event) {
   for (const opt of promptOptions(event.text)) {
     const btn = document.createElement('button');
     btn.textContent = opt.label;
-    btn.onclick = () => approve(event.agent, opt.key);
+    btn.onclick = () => {
+      approve(event.agent, opt.key);
+      // "No" in Claude Code means "no — and tell me what to do instead":
+      // the agent opens a guidance input, and the next phone message lands
+      // straight in it. Teach that ("chat about this") instead of leaving
+      // the user wondering what No did.
+      if (opt.label === 'No') offerGuidance(event.agent, event.name);
+    };
     keys.appendChild(btn);
   }
   const esc = document.createElement('button');
@@ -1140,6 +1163,14 @@ function approveKeys(event) {
   esc.onclick = () => approve(event.agent, 'esc');
   keys.appendChild(esc);
   return keys;
+}
+
+// After a No: the agent is waiting to hear what to do differently. Point the
+// composer at that conversation and say so; the hint expires quietly.
+function offerGuidance(agentID, name) {
+  state.guidance = { agent: agentID, until: Date.now() + 2 * 60 * 1000 };
+  input.placeholder = 'Tell ' + (name || 'the agent') + ' what to do differently…';
+  input.focus();
 }
 
 /* ---------- composer ---------- */
@@ -1263,6 +1294,7 @@ function sendMessage() {
     inflight: false,
   };
   state.pending.push(msg);
+  state.guidance = null;   // whatever this message was, the No has its answer
   savePending();
   renderFeed();
   if (!state.connected) {                // banner is up — don't wait on a dead link
