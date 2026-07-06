@@ -40,24 +40,24 @@ const (
 	clientIDRing = 200
 )
 
-// errSessionAdapter is returned by the session-adapter stubs until session.go
+// errSessionAdapter is returned by the session-adapter stubs until tmux.go
 // wires the real tmux implementation.
 var errSessionAdapter = errors.New("session adapter not loaded")
 
 // deliverToSession injects a message into a live contact's managed tmux session
-// (send-keys, literal, followed by Enter). session.go assigns the real
+// (send-keys, literal, followed by Enter). tmux.go assigns the real
 // implementation at startup; until then the stub reports no adapter is loaded.
 var deliverToSession = func(c *Contact, text string) error { return errSessionAdapter }
 
 // capturePrompt returns a single tmux capture-pane snapshot of a contact's
-// terminal, used to render a permission card. session.go assigns the real
+// terminal, used to render a permission card. tmux.go assigns the real
 // implementation; the stub returns the empty string.
 var capturePrompt = func(c *Contact) string { return "" }
 
 // sendKey delivers one whitelisted approval keystroke to a live contact:
 // "1"/"2"/"3"/"y"/"n" answered with Enter, or "esc" as a bare Escape. It is
 // separate from deliverToSession because approvals carry no sender prefix and
-// "esc" takes no Enter. session.go assigns the real implementation; the stub
+// "esc" takes no Enter. tmux.go assigns the real implementation; the stub
 // reports no adapter is loaded.
 var sendKey = func(c *Contact, key string) error { return errSessionAdapter }
 
@@ -147,7 +147,7 @@ func runServe(port int) error {
 	defer removeOwnLockfile(localToken)
 
 	startHeartbeat()
-	startSessionManager() // assigned in session.go: tail loops + liveness
+	startSessionManager() // reconcile.go: tail loops + liveness
 	if err := loadVAPID(); err != nil {
 		fmt.Printf("(push disabled: %v)\n", err)
 	}

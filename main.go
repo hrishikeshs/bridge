@@ -64,7 +64,7 @@ func serveCmd() *cobra.Command {
 	return cmd
 }
 
-// connectCmd is implemented in session.go; here it is a stub carrying the flag.
+// connectCmd is implemented in cli.go; here it is a stub carrying the flag.
 func connectCmd() *cobra.Command {
 	var name string
 	cmd := &cobra.Command{
@@ -100,7 +100,7 @@ to it — the daemon tells you the final address.`,
 	return cmd
 }
 
-// attachCmd is implemented in session.go; here it is a stub.
+// attachCmd is implemented in cli.go; here it is a stub.
 func attachCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "attach <name>",
@@ -111,7 +111,7 @@ func attachCmd() *cobra.Command {
 	}
 }
 
-// sendCmd is implemented in session.go; here it is a stub carrying the flag.
+// sendCmd is implemented in cli.go; here it is a stub carrying the flag.
 func sendCmd() *cobra.Command {
 	var to string
 	cmd := &cobra.Command{
@@ -144,7 +144,7 @@ func retireCmd() *cobra.Command {
 	}
 }
 
-// exposeCmd is implemented in session.go; here it is a stub.
+// exposeCmd is implemented in cli.go; here it is a stub.
 func exposeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "expose",
@@ -155,7 +155,7 @@ func exposeCmd() *cobra.Command {
 	}
 }
 
-// hookCmd is implemented in session.go; here it is a stub.
+// hookCmd is implemented in cli.go; here it is a stub.
 func hookCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "hook",

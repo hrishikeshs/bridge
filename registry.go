@@ -14,15 +14,15 @@ import (
 // session churn. The Contact (and its thread and outbox) persists across daemon
 // restarts and reconnects, keyed by name+directory; its id never changes.
 type Contact struct {
-	ID         string `json:"id"`          // daemon-minted uuid for the agent; the immutable identity
-	Name       string `json:"name"`        // self-chosen address, unique among the living (a display name; may be suffixed)
-	Directory  string `json:"directory"`   // the agent's working directory
-	SessionID  string `json:"session_id"`  // Claude Code conversation id; `claude --resume` PRESERVES it (verified empirically), so it is stable across resume — the tail pins on it, falling back to the newest .jsonl only if it goes missing/stale (see sessionFileFor)
-	TmuxTarget string `json:"tmux_target"` // tmux window id ("@N") hosting the agent; legacy rows may hold "bridge:<name>"
-	Status     string `json:"status"`       // "live" | "offline"
-	Health     string `json:"health"`       // "ok" | "working" | "prompt" | "offline"
-	PromptOpen bool   `json:"prompt_open"`  // a permission prompt is hook-attested open
-	PromptSince int64 `json:"prompt_since"` // unix seconds the current prompt opened; 0 when none (drives frozen-agent escalation)
+	ID          string `json:"id"`           // daemon-minted uuid for the agent; the immutable identity
+	Name        string `json:"name"`         // self-chosen address, unique among the living (a display name; may be suffixed)
+	Directory   string `json:"directory"`    // the agent's working directory
+	SessionID   string `json:"session_id"`   // Claude Code conversation id; `claude --resume` PRESERVES it (verified empirically), so it is stable across resume — the tail pins on it, falling back to the newest .jsonl only if it goes missing/stale (see sessionFileFor)
+	TmuxTarget  string `json:"tmux_target"`  // tmux window id ("@N") hosting the agent; legacy rows may hold "bridge:<name>"
+	Status      string `json:"status"`       // "live" | "offline"
+	Health      string `json:"health"`       // "ok" | "working" | "prompt" | "offline"
+	PromptOpen  bool   `json:"prompt_open"`  // a permission prompt is hook-attested open
+	PromptSince int64  `json:"prompt_since"` // unix seconds the current prompt opened; 0 when none (drives frozen-agent escalation)
 
 	// Fields are plugin-set key/value annotations (docs/plugins.md set-field):
 	// expertise tags, last-memory-save stamps, whatever a plugin wants to pin
