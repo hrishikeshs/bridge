@@ -113,6 +113,7 @@ const state = {
   serverStarted: null,   // daemon start unix (a change = it restarted)
   seenWake: 0,           // newest wake_to the phone has already surfaced
   wakeNote: null,        // {from,to,until} — transient "Mac was asleep X–Y" banner
+  wired: false,          // one-time listeners/intervals installed (init re-runs)
 };
 
 /* Outbox: unsent/undelivered messages, persisted so they survive an app
@@ -135,15 +136,6 @@ setInterval(() => {                 // expire stale typing bubbles
 /* ---------- bootstrap ---------- */
 
 async function init() {
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
-    // Notification tap (app already open): the SW posts the contact to open.
-    // Validate it against the live roster before selecting — never trust a
-    // value from outside to pick the target agent.
-    navigator.serviceWorker.addEventListener('message', (e) => {
-      if (e.data && e.data.type === 'open-contact') selectContactIfValid(e.data.contact);
-    });
-  }
   const res = await fetch('/api/status').catch(() => null);
   if (!res) return showOffline();          // unreachable: show cached feed
   if (res.status === 401) return showPairing();
@@ -159,19 +151,51 @@ async function init() {
   // the id against the roster (a crafted id must not select a real target).
   restoreView();
   connectEvents();
-  setInterval(refreshStatus, 30000);
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) {
-      refreshStatus(); connectEvents(); flushOutbox();
-      clearDeliveredNotifications();   // you're looking at the app now
-      // Returning to the foreground on an open thread clears its unread.
-      if (state.view === 'thread' && state.selected) markSeen(state.selected);
-      renderList();
+  // One-time wiring, guarded: init() re-runs (showOffline retry loop, the
+  // pair button), and unguarded it stacked a duplicate interval and listener
+  // set per run — N× polling and N× handlers after a flaky morning.
+  if (!state.wired) {
+    state.wired = true;
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+      // Notification tap (app already open): the SW posts the contact to
+      // open. Validate it against the live roster before selecting — never
+      // trust a value from outside to pick the target agent.
+      navigator.serviceWorker.addEventListener('message', (e) => {
+        if (e.data && e.data.type === 'open-contact') selectContactIfValid(e.data.contact);
+      });
     }
-  });
+    setInterval(refreshStatus, 30000);
+    // Stream liveness watchdog (H12): heartbeats are real events now, so a
+    // healthy stream proves itself every 25s. 70s of silence (three missed
+    // beats) on a non-closed source means the socket is a zombie — readyState
+    // still says OPEN, nothing flows, onerror never fires. Replace it.
+    setInterval(() => {
+      if (!state.source || state.source.readyState === EventSource.CLOSED) return;
+      if (Date.now() - (state.lastContact || 0) <= 70000) return;
+      state.source.close();
+      setConnected(false);
+      scheduleReconnect();
+    }, 15000);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        // Waking from a sleep/background gap: a source that heard nothing for
+        // 35s+ may be a zombie whose readyState still lies OPEN — recycle it
+        // rather than trusting connectEvents' early-return (H12).
+        if (state.source && Date.now() - (state.lastContact || 0) > 35000) {
+          state.source.close();
+        }
+        refreshStatus(); connectEvents(); flushOutbox();
+        clearDeliveredNotifications();   // you're looking at the app now
+        // Returning to the foreground on an open thread clears its unread.
+        if (state.view === 'thread' && state.selected) markSeen(state.selected);
+        renderList();
+      }
+    });
+    window.addEventListener('online', () => { connectEvents(); flushOutbox(); });
+    window.addEventListener('offline', () => setConnected(false));
+  }
   clearDeliveredNotifications();
-  window.addEventListener('online', () => { connectEvents(); flushOutbox(); });
-  window.addEventListener('offline', () => setConnected(false));
   updatePushButton();          // iOS only prompts on a tap, so offer a button
 }
 
@@ -252,7 +276,14 @@ async function loadHistory() {
   const res = await fetch('/api/history?since=0').catch(() => null);
   if (!res || !res.ok) return;
   const data = await res.json();
-  (data.events || []).forEach(ingest);
+  (data.events || []).forEach((e) => {
+    // Reconcile the outbox against the replay exactly like the live path
+    // (H10): a 'sent' we never saw live (SSE died mid-send) must still drop
+    // its local echo, or the next flushOutbox re-delivers it — and after a
+    // daemon restart the client_id ring is empty, so the retry types into
+    // the pane a second time.
+    if (ingest(e) && e.type === 'sent') dropPendingEcho(e.agent, e.text, e.client_id);
+  });
   pruneAttentions();   // history replay can resurrect orphaned attentions
   cacheEvents();
   renderFeed();
@@ -277,8 +308,16 @@ function connectEvents() {
   clearTimeout(reconnectTimer);
   const source = new EventSource('/api/events?since=' + state.lastEventId);
   state.source = source;
+  state.lastContact = Date.now();   // fresh socket gets its full liveness grace
+  // Server heartbeat (every 25s, a named event so old clients ignore it):
+  // proof the socket is genuinely alive, consumed by the H12 watchdog.
+  source.addEventListener('hb', () => {
+    state.lastContact = Date.now();
+    setConnected(true);
+  });
   source.onopen = () => {
     reconnectDelay = 1000;   // healthy link — reset the backoff
+    state.lastContact = Date.now();
     setConnected(true);
     refreshStatus();         // roster may have changed while we were away
     flushOutbox();           // drain anything queued during the outage
@@ -480,7 +519,15 @@ async function clearDeliveredNotifications() {
   try {
     if (!('serviceWorker' in navigator)) return;
     const reg = await navigator.serviceWorker.ready;
-    (await reg.getNotifications()).forEach((n) => n.close());
+    (await reg.getNotifications()).forEach((n) => {
+      // Opening the app clears DELIVERED notifications — but a "needs you"
+      // whose prompt is still open is a live demand, not a delivered one.
+      // Closing it here silenced other agents' active prompts every time the
+      // app was foregrounded (review round 3 hygiene).
+      const m = (n.tag || '').match(/^attn-(.+)$/);
+      if (m && state.attentions.has(m[1])) return;
+      n.close();
+    });
   } catch (e) { /* unsupported or not yet registered — nothing to clear */ }
 }
 
@@ -861,9 +908,14 @@ function renderFeed() {
       feed.appendChild(sep);
     }
     let res = resolutions.get(event.id);
-    if (!res && event.type === 'attention') {
-      const c = state.contacts.find((x) => x.id === event.agent);
-      if (!c || !c.attention) res = { kind: 'cleared', ts: null };   // orphaned: roster says no prompt
+    if (!res && event.type === 'attention' && !state.attentions.has(event.agent)) {
+      // Orphaned: no clear event survived, but the attention is no longer
+      // live. state.attentions is the authority here — event-stream truth,
+      // pruned only against a FRESHLY fetched roster (pruneAttentions). The
+      // old check read state.contacts directly, and that snapshot can be 30s
+      // stale: a brand-new prompt rendered "✓ Resolved", buttons missing,
+      // until the next poll (H11).
+      res = { kind: 'cleared', ts: null };
     }
     feed.appendChild(renderEvent(event, res));
   }
@@ -1561,8 +1613,12 @@ function flushOutbox() {
    Uploads arrive with a " 📷 photo" suffix the echo doesn't have. */
 function dropPendingEcho(agent, text, clientId) {
   let i = -1;
-  if (clientId) i = state.pending.findIndex((m) => m.clientId === clientId);
-  if (i === -1) {
+  if (clientId) {
+    // The server named the exact message; if its echo is already gone there
+    // is nothing to drop. Falling through to text here used to splice out a
+    // DIFFERENT queued message that happened to share the text ("yes"/"go").
+    i = state.pending.findIndex((m) => m.clientId === clientId);
+  } else {
     const bare = (text || '').replace(/\s*📷 photo$/, '').trim();
     i = state.pending.findIndex((m) =>
       m.agent === agent && (m.text === (text || '') || m.text.trim() === bare));
@@ -1658,18 +1714,35 @@ function urlB64ToUint8Array(base64) {
   return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
 }
 
+/* Page-side notification for events arriving while the tab is hidden. Routed
+   through the service worker with the daemon's own tag scheme, so it REPLACES
+   the matching Web Push instead of stacking a second, untagged banner beside
+   it — and it becomes visible to clearDeliveredNotifications and tappable
+   into the right thread, neither of which a bare page-scoped Notification
+   was (review round 3 hygiene). Bare Notification remains as the fallback. */
 function maybeNotify(event) {
   if (!('Notification' in window)) return;
   if (Notification.permission !== 'granted' || !document.hidden) return;
+  let title, body, tag;
   if (event.type === 'attention') {
-    new Notification(event.name + ' needs your attention', {
-      body: (event.text || '').slice(-120),
-    });
+    title = (event.name || 'agent') + ' needs your attention';
+    body = (event.text || '').slice(-120);
+    tag = 'attn-' + event.agent;
   } else if (event.type === 'mention' || event.type === 'reply' || event.type === 'peer') {
-    new Notification(event.name || 'bridge', {
-      body: (event.text || '').slice(0, 160),
-    });
+    title = event.name || 'bridge';
+    body = (event.text || '').slice(0, 160);
+    tag = 'msg-' + event.agent;
+  } else {
+    return;
   }
+  navigator.serviceWorker.ready
+    .then((reg) => reg.showNotification(title, {
+      body, tag,
+      icon: '/icons/icon-192.png',
+      badge: '/icons/icon-192.png',
+      data: { contact: event.agent },
+    }))
+    .catch(() => { try { new Notification(title, { body }); } catch (e) { /* blocked */ } });
 }
 
 init();

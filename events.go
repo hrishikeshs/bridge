@@ -265,12 +265,18 @@ func loadHistory() {
 
 // startHeartbeat pings every SSE client on an interval so idle connections and
 // intervening proxies keep the stream open; dead clients are pruned on write.
+// The ping is a NAMED SSE event, not a comment: comments are invisible to
+// EventSource JavaScript, so a half-dead socket (Mac slept, NAT dropped the
+// path) used to sit in readyState OPEN receiving nothing while the app showed
+// a green dot — the silent-blackout class (H12). A named event reaches the
+// client's 'hb' listener (proof of life) without firing onmessage on older
+// cached clients.
 func startHeartbeat() {
 	go func() {
 		t := time.NewTicker(heartbeatEvery)
 		defer t.Stop()
 		for range t.C {
-			broadcast(": hb\n\n")
+			broadcast("event: hb\ndata: {}\n\n")
 		}
 	}()
 }
