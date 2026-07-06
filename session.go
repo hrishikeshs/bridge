@@ -461,11 +461,24 @@ func runConnect(ctx *cliCtx) error {
 	if err != nil {
 		return err
 	}
-	sessionFile := currentSessionFile(cwd)
-	if sessionFile == "" {
-		return fmt.Errorf("no Claude Code session found for %s — run this from inside a session", cwd)
+	// The calling agent identifies ITSELF: Claude Code exports the session id
+	// into every shell it runs. This makes connect deterministic in shared
+	// project directories — several agents can live in one directory and each
+	// rehomes its own conversation, never a sibling's. The newest-file
+	// heuristic survives only as a fallback for CC versions without the var.
+	sessionID := os.Getenv("CLAUDE_CODE_SESSION_ID")
+	if sessionID != "" {
+		if _, err := os.Stat(filepath.Join(projectDir(cwd), sessionID+".jsonl")); err != nil {
+			sessionID = "" // env names a session that isn't in this directory
+		}
 	}
-	sessionID := sessionIDFromPath(sessionFile)
+	if sessionID == "" {
+		sessionFile := currentSessionFile(cwd)
+		if sessionFile == "" {
+			return fmt.Errorf("no Claude Code session found for %s — run this from inside a session", cwd)
+		}
+		sessionID = sessionIDFromPath(sessionFile)
+	}
 
 	// One roster read drives both auto-naming and reconnect reuse.
 	contacts := liveContacts()
