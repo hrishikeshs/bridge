@@ -1211,7 +1211,7 @@ footer {
 
 #action-sheet { position: fixed; inset: 0; z-index: 60; }
 #action-menu {
-  position: fixed;                 /* app.js anchors left/top near the bubble */
+  position: fixed;                 /* app.js anchors left/top at the press point */
   display: flex;
   flex-direction: column;
   gap: 8px;

@@ -382,6 +382,10 @@ async function loadHistory() {
   pruneAttentions();   // history replay can resurrect orphaned attentions
   cacheEvents();
   renderFeed();
+  // A replay landing on an already-open thread (an offline-retry re-init) can
+  // backfill content under the fold after renderFeed's synchronous stick; hold
+  // the bottom as it settles — guarded, so only for a reader already at the end.
+  if (state.view === 'thread' && state.selected) pinFeedBottom();
 }
 
 // Roster truth beats history replay. An attention whose clear never got
@@ -629,8 +633,9 @@ function openThread(id) {
   // logic only holds the bottom once you're already there; on entry the feed
   // may carry the previous thread's scroll position — and thumbs shouldn't
   // pay for history they didn't ask to read (field report, 2026-07-06).
-  const feed = $('feed');
-  feed.scrollTop = feed.scrollHeight;
+  // pinFeedBottom re-pins as late content (a photo's <img>, a font swap)
+  // inflates the feed under the fold, so the landing holds instead of drifting.
+  pinFeedBottom(true);
   restoreDraft();
   state.quote = null;   // a quote is a reply to THIS thread; don't carry it across
   renderQuoteChip();
@@ -1239,6 +1244,34 @@ function renderFeed() {
   // Photos are a 1:1 feature in v1 — the room upload path has no fan-out, so a
   // photo to #crew would stick queued. Disable the attach button in a room.
   $('attach-btn').disabled = isRoomId(state.selected);
+}
+
+/* Land the feed on its newest message — and KEEP it there as late content
+   settles. The pin is easily undone a beat later: a photo bubble's <img>
+   decodes after layout, a webfont swaps in — each grows scrollHeight below the
+   fold and slides the true bottom out from under the landing. So we re-pin
+   across the three windows where that inflation shows up: the next two frames
+   (layout), each <img>'s load (decode), and one 300ms backstop.
+   `land` forces the first pin — entering a thread always drops you at the
+   bottom. Without it (a history replay onto an already-open thread) we only
+   re-pin when already near the bottom, so we hold a reader parked at the end
+   without yanking one who scrolled up. Every DEFERRED re-pin honours that
+   near-bottom guard regardless — 60px, renderFeed's own stick threshold — so a
+   settle that lands mid-scroll never steals the view (field report, 2026-07-06). */
+function pinFeedBottom(land) {
+  const feed = $('feed');
+  const nearBottom = () =>
+    feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+  const pin = () => { feed.scrollTop = feed.scrollHeight; };
+  const settle = () => { if (nearBottom()) pin(); };
+  if (land) pin();
+  requestAnimationFrame(() => requestAnimationFrame(land ? pin : settle));
+  // One-shot per image still decoding: its height lands after this frame, and a
+  // photo can grow the fold well past where we just parked.
+  feed.querySelectorAll('img').forEach((img) => {
+    if (!img.complete) img.addEventListener('load', settle, { once: true });
+  });
+  setTimeout(settle, 300);
 }
 
 function contactName(id) {
@@ -1925,8 +1958,12 @@ function attachBubbleActions(el, meta) {
     const t = e.touches && e.touches[0];
     if (!t) return;
     lpStart = { x: t.clientX, y: t.clientY };
+    // Freeze the press point for the sheet: it opens AT the finger, never at the
+    // bubble's box — a tall bubble's top edge can sit a screenful above the
+    // touch, which is how the menu used to fly to the top of the screen.
+    const at = { x: t.clientX, y: t.clientY };
     clearTimeout(lpTimer);
-    lpTimer = setTimeout(() => { lpStart = null; openActionSheet(el, meta); }, 500);
+    lpTimer = setTimeout(() => { lpStart = null; openActionSheet(meta, at); }, 500);
   }, { passive: true });
   el.addEventListener('touchmove', (e) => {
     if (!lpStart) return;
@@ -1936,11 +1973,14 @@ function attachBubbleActions(el, meta) {
     }
   }, { passive: true });
   el.addEventListener('touchend', () => { clearTimeout(lpTimer); lpStart = null; }, { passive: true });
-  // Desktop: right-click / trackpad long-press raises the same sheet.
-  el.addEventListener('contextmenu', (e) => { e.preventDefault(); openActionSheet(el, meta); });
+  // Desktop: right-click / trackpad long-press raises the same sheet at the cursor.
+  el.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    openActionSheet(meta, { x: e.clientX, y: e.clientY });
+  });
 }
 
-function openActionSheet(bubbleEl, meta) {
+function openActionSheet(meta, at) {
   const reactions = $('action-reactions');
   reactions.innerHTML = '';
   const mine = state.myReactions.get(meta.id);
@@ -1958,23 +1998,27 @@ function openActionSheet(bubbleEl, meta) {
   }
   $('action-quote').onclick = () => { setQuote(meta); closeActionSheet(); };
   actionOpenedAt = Date.now();
-  positionActionMenu(bubbleEl);
+  positionActionMenu(at);
 }
 
 function closeActionSheet() { $('action-sheet').classList.add('hidden'); }
 
-// Anchor the menu near the bubble: prefer just above it, fall below when there's
-// no room, and clamp inside the viewport. CSSOM writes, allowed by the CSP.
-function positionActionMenu(bubbleEl) {
+// Raise the menu AT the press point (touch or cursor), in viewport coordinates.
+// position:fixed makes {x,y} a viewport anchor — immune to the feed's scroll
+// offset and any positioned ancestor (the old code anchored to the bubble's
+// box, so a tall bubble threw the menu to the top of the screen). Reveal to
+// measure, clamp 8px inside every edge, and flip ABOVE the finger when placing
+// below it would spill past the bottom. CSSOM writes, allowed by the CSP.
+function positionActionMenu(at) {
   const menu = $('action-menu');
   menu.style.visibility = 'hidden';        // reveal to measure, place, then show
   $('action-sheet').classList.remove('hidden');
-  const r = bubbleEl.getBoundingClientRect();
   const mw = menu.offsetWidth, mh = menu.offsetHeight, pad = 8;
-  let top = r.top - mh - pad;
-  if (top < pad) top = r.bottom + pad;
-  top = Math.max(pad, Math.min(top, window.innerHeight - mh - pad));
-  const left = Math.max(pad, Math.min(r.left, window.innerWidth - mw - pad));
+  const vw = window.innerWidth, vh = window.innerHeight;
+  let top = at.y;
+  if (top + mh + pad > vh) top = at.y - mh;   // would spill below → flip above the finger
+  top = Math.max(pad, Math.min(top, vh - mh - pad));
+  const left = Math.max(pad, Math.min(at.x, vw - mw - pad));
   menu.style.left = left + 'px';
   menu.style.top = top + 'px';
   menu.style.visibility = 'visible';
