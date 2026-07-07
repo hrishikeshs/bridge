@@ -625,6 +625,12 @@ function openThread(id) {
   updateThreadHeader();
   updateAttentionBanner();
   renderFeed();
+  // Entering a thread always lands on the newest message. renderFeed's sticky
+  // logic only holds the bottom once you're already there; on entry the feed
+  // may carry the previous thread's scroll position — and thumbs shouldn't
+  // pay for history they didn't ask to read (field report, 2026-07-06).
+  const feed = $('feed');
+  feed.scrollTop = feed.scrollHeight;
   restoreDraft();
   state.quote = null;   // a quote is a reply to THIS thread; don't carry it across
   renderQuoteChip();
