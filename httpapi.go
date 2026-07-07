@@ -64,10 +64,16 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		Attention bool              `json:"attention"`
 		Away      string            `json:"away,omitempty"`   // agent's self-set status line
 		Fields    map[string]string `json:"fields,omitempty"` // plugin annotations
+		// Where the agent lives — omitted for the tmux default; "remote" plus a
+		// client-supplied flavor ("emacs") for client-hosted agents. The half of
+		// Decision 4 (docs/transports.md) that registry.go promised the phone;
+		// until now only /local/contacts told the truth.
+		Transport string `json:"transport,omitempty"`
+		Flavor    string `json:"transport_flavor,omitempty"`
 	}
 	items := []item{}
 	for _, c := range registry.Roster() {
-		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Away, c.Fields})
+		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Away, c.Fields, c.Transport, c.TransportFlavor})
 	}
 	// Clocks for phone-side presence truth (round 4): the phone compares `now`
 	// to its own clock and its last-contact timestamp to distinguish "my

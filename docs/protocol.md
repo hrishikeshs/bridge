@@ -10,7 +10,7 @@ phone (PWA over tailnet HTTPS)
    ⇅  REST + SSE, paired-device tokens
 daemon (127.0.0.1, Go, one process)
    ⇅  tmux send-keys (in) · session JSONL tail (out) · Notification hook (prompts)
-sessions (claude, rehomed into daemon-owned tmux)
+sessions (claude — in daemon-owned tmux, or hosted by a connected transport client)
 ```
 
 Design lineage: the phone⇄daemon half is ported from
@@ -44,7 +44,9 @@ audited; bodies capped; history durable (JSONL on disk).
   10-minute, single-use, printed only by `bridge pair` on the machine.
 - `GET  /api/status` → `{contacts: [{id, name, directory, status, health,
   attention}], version}`. `status`: `live | offline`. `health`:
-  `ok | working | prompt | offline`.
+  `ok | working | prompt | offline`. Non-tmux contacts additionally carry
+  `transport` (`"remote"`) and `transport_flavor` (`"emacs"`), so the buddy
+  list can tell a vterm from a tmux window (§7).
 - `POST /api/send {agent, text, client_id}` → 200 | 200 duplicate | 409 offline.
   `agent` = contact id or name.
 - `POST /api/approve {agent, key}` — key ∈ `1 2 3 y n esc` and only while a
@@ -81,7 +83,10 @@ The agent does the work; the human types two commands and one code.
 ## 4. Message flow
 
 - **Phone → agent**: daemon `send-keys -t bridge-<name> -l <text>` + Enter
-  (single line; literal mode). Prefixed `[From <user> (phone)]:`. Works
+  (single line; literal mode) — the tmux transport. For a **remote** contact
+  the same composed line is instead *parked* for its hosting client to drain,
+  type, and ack (§7); the frame is daemon-authored either way. Prefixed
+  `[From <user> (phone)]:`. Works
   mid-task (queued by CC input) and while idle (wakes the read loop).
   Offline contact → mailbox (server-side outbox) + 409 to phone; delivered
   on next `connect`/revive of that contact.
@@ -110,6 +115,10 @@ The agent does the work; the human types two commands and one code.
   `idle_prompt` notification clears the prompt state.
 - **No polling loop; no continuous scraping.** Worst case if CC repaints its
   prompt UI: an uglier card whose buttons still work.
+- **Remote contacts**: the same dialog detector runs daemon-side at *attest
+  time* on the client-attested screen tail — one judge for both the raise and
+  the clear, transition-only so the hook path composes instead of double-
+  ringing. Approval keys ride the client drain with Deliver's ack discipline.
 
 ## 6. Switchboard (agent ⇄ agent)
 
@@ -117,7 +126,42 @@ The agent does the work; the human types two commands and one code.
 mailboxes, delivered as `[From <sender> (bridge)]:` via send-keys. Same
 offline semantics. The phone sees the traffic in the relevant threads.
 
-## 7. Security model (inherited, adapted)
+## 7. Transports — how words reach an agent (pluggable)
+
+Only five operations were ever tmux-shaped, and they are the `Transport`
+interface: **Alive** (host exists), **Ready** (safe to type THIS instant),
+**Deliver** (one prepared line), **Capture** (screen for dialog detection),
+**SendKey** (one whitelisted approval key). A contact names its transport
+(empty = `tmux`, so every pre-transport roster row migrates by doing
+nothing); an unknown name fails safe — never ready, mail waits durably.
+
+The **remote transport** inverts the reach: the daemon never touches the
+client's environment; the client (an Emacs package first — a curl loop in
+smoke, which is the point) registers agents and continuously attests their
+state over the local API (lockfile token, same trust as every CLI verb):
+
+- `POST /local/transport/hello {transport, agents:[{name, directory,
+  session_id}]}` → `{agents:[{id, name}], lease, ttl_s}` — registers or
+  adopts contacts. A LIVE tmux contact is never hijacked (the hello gets a
+  suffixed fresh identity); an offline same-name+directory contact is
+  adopted — same id, same thread, same mailbox.
+- `POST /local/transport/attest {lease, states:[{id, ready, prompt_open,
+  screen_tail}]}` — the heartbeat. Alive = lease fresh; Ready = fresh ∧
+  attested ready ∧ no dialog visible in the attested tail (the delivery
+  belt); Capture = the attested tail. A stale lease fails every answer safe;
+  attesting against one returns 410 and the client re-hellos.
+- `GET /local/transport/mail?lease=…&wait=25` — long-poll; returns ALL
+  currently-parked deliveries every time (the client dedups by id).
+- `POST /local/transport/ack {lease, ids}` — `Deliver`/`SendKey` BLOCK until
+  this ack (bounded by `remote_ack_timeout_s`); only a real ack releases the
+  durable mailbox. At-least-once: a timeout redelivers under a fresh id.
+
+A disconnected client is byte-for-byte an offline contact: its lease goes
+stale, its agents read dead, mail queues durably, a re-hello revives them —
+no new failure modes. Full protocol, settled decisions, and the recorded
+design rulings: [transports.md](transports.md).
+
+## 8. Security model (inherited, adapted)
 
 1. Daemon binds **127.0.0.1**; the tailnet (via `tailscale serve`) is the
    phone's only road in. `bridge expose` wraps the serve setup.
@@ -141,9 +185,10 @@ offline semantics. The phone sees the traffic in the relevant threads.
    out-of-band approve confirmation) is out of scope for v1 — **don't rely on
    the bridge to sandbox an agent you don't already trust.**
 
-## 8. Explicitly out (v1)
+## 9. Explicitly out (v1)
 
-Windows (POSIX+tmux first) · web push (RFC 8291 later — payloads E2E) ·
+Windows (POSIX+tmux first) ·
 Channels transport (optional adapter if/when it exits preview and the
 allowlist politics resolve) · multi-machine federation (one daemon per box;
 the tailnet already reaches them all — the PWA can point at several).
+(Web push graduated from this list: shipped, RFC 8291 E2E-encrypted.)

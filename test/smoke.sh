@@ -744,6 +744,12 @@ LEASE3=$(printf '%s' "$RT_HELLO3" | rt_field lease)
 RCID3=$(printf '%s' "$RT_HELLO3" | rt_agent0)
 check "live re-hello keeps the same contact id" "$RCID" "$RCID3"
 
+# Decision 4, both halves: the PHONE api (not just /local/contacts) surfaces
+# where an agent lives, so the buddy list can tell a vterm from a tmux window.
+RT_STATUS_F=$(curl -s "${DEV_AUTH[@]}" $BASE/api/status)
+body_has "api/status surfaces the remote transport" '"transport":"remote"' "$RT_STATUS_F"
+body_has "api/status surfaces the client flavor"    '"transport_flavor":"sim"' "$RT_STATUS_F"
+
 # A dialog tail that GENUINELY satisfies looksLikePrompt: the ❯ selector, a
 # line-anchored numbered option (" ❯ 1. Yes"), and proceed vocabulary ("Do you
 # want to proceed?"). Built with python3 so the newlines and multibyte ❯ survive
