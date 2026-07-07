@@ -21,12 +21,22 @@ terminal, and `bridge pair` to put it on your phone. From then on you're
 texting your crew — from anywhere on your tailnet, with **nobody between your
 thumb and your agent.**
 
-| The buddy list | Approve from the couch | A thread |
+| Your crew — tmux *and* Emacs | Approve from the couch | A thread |
 |:---:|:---:|:---:|
-| ![The conversation list — Golden Hour theme, the Golden Gate under drifting fog](assets/screen-list.jpg) | ![A real Claude Code permission prompt with Yes / No keys](assets/screen-approve.jpg) | ![A thread — rendered markdown on solid ground](assets/screen-thread.jpg) |
+| ![The buddy list — daemon-managed tmux agents and Emacs-hosted agents side by side, each tagged by where it lives, under the Golden Gate and drifting fog](assets/screen-list.jpg) | ![A real Claude Code permission prompt rendered as a card — the command, then its own Yes / No / Esc as full-width buttons](assets/screen-approve.jpg) | ![A thread — rendered markdown, a real exchange on solid ground](assets/screen-thread.jpg) |
 
-<sub><i>Real screenshots, unstaged. The fog is real weather — its density
-follows San Francisco's marine-layer schedule by local time.</i></sub>
+<sub><i>Real screenshots, unstaged. Agents hosted outside tmux wear a small tag
+(here, <code>emacs</code>) naming where they live. The palette follows the real
+sun and the fog is real weather — its density tracks San Francisco's marine-layer
+schedule by local time. The same list at golden hour:</i></sub>
+
+<p align="center">
+  <img src="assets/screen-day.jpg" width="32%" alt="The same buddy list at golden hour — warm daylight palette, the Golden Gate in full sun through the rows">
+</p>
+
+<p align="center">
+  <img src="assets/screen-herald.jpg" width="32%" alt="The Bridge Herald">
+</p>
 
 ## How it works
 
