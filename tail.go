@@ -152,6 +152,9 @@ func pollReplies(c *Contact) {
 	region := size - st.offset
 	var consumed int64
 	var texts []string
+	var ctxTokens int
+	var ctxModel string
+	var haveUsage bool
 	sc := bufio.NewScanner(io.LimitReader(f, region))
 	sc.Buffer(make([]byte, 0, 1024*1024), maxJSONLLine)
 	for sc.Scan() {
@@ -165,6 +168,12 @@ func pollReplies(c *Contact) {
 		consumed = end + 1 // token + its stripped newline
 		if t := assistantText(line); t != "" {
 			texts = append(texts, t)
+		}
+		// Passively capture the newest context-window reading this window carries.
+		// The LAST usage-bearing assistant line is the current context size; keep
+		// overwriting so ctx* holds it after the scan.
+		if tk, md, ok := assistantUsage(line); ok {
+			ctxTokens, ctxModel, haveUsage = tk, md, true
 		}
 	}
 	if err := sc.Err(); err == bufio.ErrTooLong {
@@ -190,6 +199,14 @@ func pollReplies(c *Contact) {
 		// running tools — i.e. working.
 		registry.SetHealth(c.ID, "working")
 		EmitTyping(c.ID, c.Name)
+	}
+	// Surface the context-window pressure this batch revealed (context.go). A pure
+	// read off the tail we already follow — no session is opened for it — so
+	// /api/status can draw the gauge; SetContext is live-gated and skips an
+	// unchanged reading, so an idle agent's file (which advances nothing) never
+	// churns the roster.
+	if haveUsage {
+		registry.SetContext(c.ID, ctxTokens, ctxModel)
 	}
 }
 
@@ -220,6 +237,43 @@ func assistantText(line []byte) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+// assistantUsage extracts the current context-window token count and the model
+// from a Claude Code assistant JSONL line — the same line assistantText reads,
+// parsed additively (a second, independent Unmarshal of the same shape). Current
+// context = input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+// (the tokens the model actually saw this turn: fresh input plus both cache
+// tiers), verified present in real sessions. ok is true only for an assistant
+// line carrying a positive usage reading; every other line (user, tool result,
+// summary, or a usage-less / all-zero assistant line) returns ok=false so the
+// tail records nothing for it. The model rides out so context.go can size the
+// percentage against the right window (context_pct on /api/status).
+func assistantUsage(line []byte) (tokens int, model string, ok bool) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 {
+		return 0, "", false
+	}
+	var entry struct {
+		Type    string `json:"type"`
+		Message struct {
+			Model string `json:"model"`
+			Usage struct {
+				InputTokens         int `json:"input_tokens"`
+				CacheReadTokens     int `json:"cache_read_input_tokens"`
+				CacheCreationTokens int `json:"cache_creation_input_tokens"`
+			} `json:"usage"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &entry) != nil || entry.Type != "assistant" {
+		return 0, "", false
+	}
+	u := entry.Message.Usage
+	tokens = u.InputTokens + u.CacheReadTokens + u.CacheCreationTokens
+	if tokens <= 0 {
+		return 0, "", false
+	}
+	return tokens, entry.Message.Model, true
 }
 
 // maxJSONLLine bounds how large a single session-JSONL line the tail will

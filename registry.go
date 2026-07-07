@@ -46,6 +46,17 @@ type Contact struct {
 	// expertise tags, last-memory-save stamps, whatever a plugin wants to pin
 	// on a contact. Capped at maxContactFields; surfaced in /api/status.
 	Fields map[string]string `json:"fields,omitempty"`
+
+	// ContextTokens is the newest current-context token count read passively from
+	// this agent's session-JSONL usage line (input + both cache tiers, tail.go);
+	// ContextModel is the model that reading came from, whose window sizes the
+	// percentage (context.go). Set by the tail via SetContext; 0/"" until a
+	// usage-bearing assistant line is seen, so a sessionless agent simply omits
+	// context_pct on /api/status. Both omitempty — a pre-context roster loads
+	// unchanged. This is a live gauge, not durable identity, but it persists
+	// harmlessly across a restart (the next tail line refreshes it).
+	ContextTokens int    `json:"context_tokens,omitempty"`
+	ContextModel  string `json:"context_model,omitempty"`
 }
 
 // maxContactFields bounds plugin annotations per contact so a chatty plugin
@@ -627,6 +638,29 @@ func (r *Registry) SetHealth(id, health string) {
 			dispatchPluginEvent("agent.idle", c, nil)
 		}
 	}
+}
+
+// SetContext records the newest context-window reading (token count + the model
+// that produced it) for a contact, parsed passively from its session JSONL by
+// the tail. It mirrors SetHealth: live-only — a stale tail must never move an
+// offline agent's gauge — and persisted. It additionally skips the write when
+// the reading is unchanged, so an agent re-emitting an identical usage line
+// never churns the roster file (the tail only calls this when the file
+// advanced, so a real change is the common case). The model rides along so
+// /api/status can size the percentage against the right window (context.go).
+func (r *Registry) SetContext(id string, tokens int, model string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.contacts[id]
+	if !ok || c.Status != "live" {
+		return
+	}
+	if c.ContextTokens == tokens && c.ContextModel == model {
+		return
+	}
+	c.ContextTokens = tokens
+	c.ContextModel = model
+	r.save()
 }
 
 // SetAway records (or clears, on "") a contact's away/status line. It follows
