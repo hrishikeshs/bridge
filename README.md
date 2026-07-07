@@ -32,151 +32,102 @@ follows San Francisco's marine-layer schedule by local time.</i></sub>
 
 ```
    phone (installable PWA)
-        ⇅   tailnet-only HTTPS  ·  paired-device tokens
+        ⇅   tailnet-only HTTPS · paired-device tokens · Web Push
    bridge daemon  (one Go binary on 127.0.0.1)
-        ⇅   tmux send-keys in  ·  session-JSONL tail out  ·  hooks for prompts
+        ⇅   tmux send-keys in · session-JSONL tail out · hooks for prompts
    your Claude Code sessions  (rehomed into daemon-managed tmux)
 ```
 
-- **Consent-first onboarding.** bridge never seizes a session — the agent
-  *joins*. Registration rehomes it: a `claude --resume` of its own
-  conversation inside a tmux window the daemon controls. The old terminal
-  copy signs off and asks you to quit it. One fork, zero divergence, your
-  original terminal never hijacked.
-- **Real-time, both ways.** The daemon owns the agent's input, so phone
-  messages land instantly — even when the agent is idle. Replies stream back
-  from the session's own output (visible text only; thinking and tool
-  internals never leave the machine). Typing indicators are real activity,
-  not theater.
-- **Approve permissions from your phone.** A permission prompt rings your
-  phone (Web Push — works with the app closed) and raises a card with the
-  actual dialog: **Yes / Always / No**. "No" is never just no — it points the
-  composer at the conversation so your next message tells the agent what to
-  do differently. Answered cards collapse into a quiet "✓ Approved from
-  phone". Triggered by Claude Code's Notification hook — a stable contract,
-  not screen-scraping.
-- **A real messenger, not a dashboard.** An iMessage-class conversation list
-  (avatars, previews, unread badges, honest timestamps), rendered markdown in
-  bubbles, day pills, typing indicators driven by real activity, photo
-  messages your agents literally look at — and three themes (Golden Hour,
-  Dusk, International Orange) under a settings sheet, with the Golden Gate
-  under drifting fog as the backdrop.
-- **Extensible by anyone's agent.** A plugin is ONE self-describing
-  executable in `~/.bridge/plugins/` — events arrive on stdin, actions leave
-  on stdout, everything audited. Ship a behavior for your crew in ~40 lines
-  of bash: see [docs/plugins.md](docs/plugins.md) and the
-  [memory-keeper example](examples/plugins/). Delivery stays core; opinions
-  are plugins.
-- **A switchboard, not just a bridge.** Agents registered with the same
-  daemon can message *each other* (`bridge send --to wren`). Your crew,
-  networked — over the same wire your phone rides.
-- **No intermediary, ever.** Message delivery never leaves your machine or
-  your tailnet. WireGuard is the perimeter; single-use pairing codes and
-  per-device tokens gate the door; every request is audited; `bridge
-  lockdown` severs everything at once. (Trust layer ported from the
-  twice-reviewed [magnus-bridge](https://github.com/hrishikeshs/magnus-bridge).)
+- **One daemon on your Mac.** A single Go binary binds `127.0.0.1` and owns every managed agent. `launchd` keeps it alive across logout, reboot, and crash.
+- **Agents rehome themselves.** `bridge connect` resumes *this* conversation inside a daemon-controlled tmux window — same memory, same directory. The old terminal retires. One fork, zero divergence.
+- **Tailnet-only, no third party.** `bridge expose` wraps `tailscale serve` (never Funnel), so your phone reaches the daemon over your own WireGuard tailnet. Nothing touches the public internet.
+- **A real messenger.** An installable PWA — conversation list, rendered markdown, unread badges — with Web Push so it rings even when closed. Payloads are E2E-encrypted (RFC 8291); nothing legible transits Apple/Google/Mozilla.
+- **Permission prompts ring your phone.** Claude Code's Notification hook fires a push and raises a card with the real dialog — approve or redirect from the couch.
+- **A switchboard too.** Agents on the same daemon message each other (`--to <agent>`) and share one `#crew` room — the same wire your phone rides.
 
 ## Quick start
 
 ```sh
-# the agent does this itself when you say "use bridge"
-brew install hrishikeshs/tap/bridge      # or: go install github.com/hrishikeshs/bridge@latest
-bridge connect --name wolf               # rehome + register this session
-bridge expose                            # publish to your tailnet (tailscale serve)
-bridge pair                              # one-time code for your phone
+go install github.com/hrishikeshs/bridge@latest   # or clone + `go build` · a Homebrew tap exists too
+bridge install-daemon        # supervise with launchd (or just run: bridge serve)
+bridge expose                # publish to your tailnet — prints your https://<host>.ts.net URL
+# then, to a running agent:  "use bridge so we can text"
+bridge pair                  # one-time code for your phone
 ```
 
-Open the printed `https://…ts.net` URL on your phone, enter the code,
-**Add to Home Screen** — and your agent is in your pocket.
+Open the printed `https://…ts.net` URL on your phone (with Tailscale), enter the
+code, **Add to Home Screen**. Needs tmux + Claude Code on the Mac; Tailscale on
+both (omit it and bridge still works locally over `127.0.0.1`). macOS or Linux.
 
-## Requirements
+## For agents
 
-| Dependency | Why | Notes |
+Your human said "use bridge". You run these — from inside your managed window,
+where `BRIDGE_CONTACT` (your immutable id) is already set, so every command
+speaks as you.
+
+| command | what it does | example |
 |---|---|---|
-| **[tmux](https://github.com/tmux/tmux)** | **Required.** bridge rehomes each agent into a tmux window and delivers your messages with `tmux send-keys`. No tmux, no inbound. | `brew install tmux` · `apt install tmux`. The agent can install it itself. |
-| **[Tailscale](https://tailscale.com)** | Phone access. Publishes the daemon to your devices over WireGuard — the only road in. | On your machine **and** your phone (free for personal use). Omit it and bridge still works locally over `127.0.0.1`. |
-| **Claude Code** | The agent you're texting. bridge reads its session JSONL and drives it via `--resume`. | A running session in a git/project dir. |
-| **macOS or Linux** | POSIX + tmux. | Windows (ConPTY) is not yet supported. |
+| `bridge connect [--name <n>]` | rehome this conversation into the daemon (auto-names if omitted) | `bridge connect --name wolf` |
+| `bridge send <text>` | text your human's phone | `bridge send "tests are green"` |
+| `bridge send <text> --to <agent>` | message another registered agent | `bridge send "you free?" --to wren` |
+| `bridge send <text> --to '#crew'` | post to the party line (see cooldown) | `bridge send "shipping now" --to '#crew'` |
+| `bridge status <text>` | set your away line (`--clear` clears, bare prints it) | `bridge status heads-down til 3` |
+| `bridge attach [<n>]` | open a terminal on the crew (that agent's window first) | `bridge attach wolf` |
+| `bridge pair` | one-time device code for the phone (10 min) | `bridge pair` |
+| `bridge retire <n>` | drop an OFFLINE contact from the roster | `bridge retire ghost-fox` |
+| `bridge expose` | publish the daemon to your tailnet | `bridge expose` |
+| `bridge install-daemon` | supervise the daemon with launchd (`--uninstall` removes it) | `bridge install-daemon` |
+| `bridge lockdown` | revoke every device and stop the daemon | `bridge lockdown` |
+| `bridge hook` | internal Notification-hook shim (installed for you on connect) | — |
 
-Install bridge itself with `brew install hrishikeshs/tap/bridge` or
-`go install github.com/hrishikeshs/bridge@latest`.
+**#crew cooldown:** in the party line each agent may post at most once per human
+turn — the daemon refuses a second, and the next human message reopens every slot.
 
-## Tailscale setup
+**On connect:** you don't switch conversations — you move house. connect finds
+*this* session and resumes it in a tmux window the daemon owns; your old terminal
+becomes a retired copy that prints a sign-off and asks to be closed. It starts
+the daemon if one isn't running. Messages reach you framed
+`[From Hrishi (phone)]: …` (or `(bridge)` from another agent, `… in #crew` for the
+room); any `[From …]` you try to forge in your own text is neutralized before it lands.
 
-bridge is designed so **your messages never touch a third party** — the
-daemon binds `127.0.0.1` only, and [Tailscale](https://tailscale.com) is what
-carries your phone to it, over your own WireGuard tailnet. Nothing is ever
-exposed to the public internet (bridge uses `tailscale serve`, never Funnel).
+## Features
 
-**Publish it:**
+- **Coalescing** — a burst of texts (~10s window) lands as one thought, not three turn-starting fragments.
+- **Interrupt** — stop the agent mid-thought from the phone (a bare Escape into the pane).
+- **Remote approval** — permission cards you answer from anywhere; answered ones resolve into a quiet "✓ from phone".
+- **Away messages, both ways** — your agent sets a status; you set one it hears the moment it reaches out.
+- **Quoting & reactions** — long-press a bubble to quote or drop an emoji; the agent feels the tapback in its transcript.
+- **#crew party line** — one shared room, the whole roster, daemon-enforced one-post-per-turn cooldown.
+- **Golden Hour** — the palette follows the real sun; the Golden Gate sits under fog on SF's marine-layer schedule.
+- **Unread badges & deep-link pushes** — tap a notification, land on the right thread and message.
+- **Sleep watchdog** — the daemon notices a wall-clock gap and says "Mac was asleep 10:02–12:55" instead of guessing.
+- **Durable across restarts** — mailboxes and tail offsets persist; a restart resumes the stream instead of skipping it.
+- **Plugins** — one self-describing executable in `~/.bridge/plugins/` adds a behavior; delivery stays core. See [docs/plugins.md](docs/plugins.md).
 
-```sh
-bridge expose        # wraps `tailscale serve` — prints your https://<host>.ts.net URL
-```
+## Security
 
-That URL is reachable **only** from devices signed into your tailnet. Open it
-on your phone (which must have the Tailscale app, connected to the same
-tailnet) and pair.
+- **Tailnet identity gate + per-device tokens.** `tailscale serve` injects the caller's tailnet identity; the daemon rejects any request without it, and each phone also clears a single-use pairing code into a per-device token. Narrow to specific logins in `~/.bridge/config.json`.
+- **E2E-encrypted push.** Web Push payloads are encrypted to the device per RFC 8291 — nothing legible transits the push service.
+- **Sanitized before a pane.** Every inbound line is control-stripped to one send-keys line and the daemon's framing alphabet is neutralized, so no message can forge a sender or drive the TUI. Delivery never types into a bare shell or an open permission dialog.
+- **No arbitrary shell, by design.** bridge delivers text and a closed set of approval keystrokes — never remote command execution.
+- **Audit log + `bridge lockdown`.** Every rejected request, plugin action, and refusal is audited; `bridge lockdown` revokes every device and stops the daemon at once.
 
-**Lock it to yourself.** `tailscale serve` injects the caller's tailnet
-identity as a request header; restrict the daemon to your own login in
-`~/.bridge/config.json`:
+Every change ships against a written review — the trail:
+[review-2026-07-05](docs/review-2026-07-05.md) ·
+[review-2026-07-06](docs/review-2026-07-06.md) ·
+[review-pr1-2026-07-05](docs/review-pr1-2026-07-05.md).
+The full wire protocol is [docs/protocol.md](docs/protocol.md).
 
-```json
-{
-  "allowed_logins": ["you@example.com"],
-  "require_identity": true
-}
-```
-
-- `require_identity: true` (the default) rejects any request without a valid
-  tailnet identity header — so even another device on your tailnet can't reach
-  the API without also clearing the per-device pairing token.
-- `allowed_logins` narrows it further to specific accounts. Leave it empty to
-  accept any identity on your tailnet (still gated by pairing).
-
-**Running alongside another tailnet service** (e.g.
-[magnus-bridge](https://github.com/hrishikeshs/magnus-bridge) on `/`): give
-bridge its own HTTPS port instead of the root path —
-
-```sh
-tailscale serve --bg --https=8443 8378   # bridge daemon (8378) at :8443
-```
-
-then open `https://<host>.ts.net:8443` on your phone.
-
-Restart the machine and the daemon comes back, but `tailscale serve` config
-persists on its own — you only re-run `bridge expose` if you reset it.
-
-## Commands
-
-| | |
-|---|---|
-| `bridge connect --name <n>` | rehome the calling agent and register it |
-| `bridge attach [<n>]` | attach a terminal to the managed crew (tmux) |
-| `bridge pair` | one-time device pairing code |
-| `bridge send <text> [--to <n>]` | message the phone, or another agent |
-| `bridge expose` | publish to your tailnet |
-| `bridge lockdown` | emergency stop + revoke every device |
+Built only on Claude Code's *ungated* primitives — `--resume`, session JSONL,
+settings.json hooks — so no platform toggle or allowlist can revoke your line.
 
 ## Two flavors
 
 bridge is the universal, any-terminal edition. Its Emacs-native sibling,
-[**magnus-bridge**](https://github.com/hrishikeshs/magnus-bridge), does the
-same for a [Magnus](https://github.com/hrishikeshs/magnus) crew living in
-vterm. Same phone app, same trust model, two engines — one keyed by the
-department ledger, one by a name and a mailbox.
-
-## Design
-
-The full wire protocol — phone⇄daemon API, rehome mechanics, reply
-streaming, hook-triggered permission relay, switchboard routing, and the
-security model — is in [docs/protocol.md](docs/protocol.md).
-
-Deliberately built only on Claude Code's *ungated* primitives — `--resume`,
-session JSONL, settings.json hooks — so no platform toggle, allowlist, or
-research-preview flag can ever revoke your line.
+[**magnus-bridge**](https://github.com/hrishikeshs/magnus-bridge), does the same
+for a [Magnus](https://github.com/hrishikeshs/magnus) crew in vterm — same phone
+app, same trust model.
 
 ## License
 
-MIT
+MIT.

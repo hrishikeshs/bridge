@@ -105,7 +105,7 @@ to it — the daemon tells you the final address.`,
 // attachCmd is implemented in cli.go; here it is a stub.
 func attachCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "attach <name>",
+		Use:   "attach [<name>]",
 		Short: "Attach a terminal to a managed agent (tmux attach)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return sessionCmdImpls["attach"](&cliCtx{args: args})
@@ -123,7 +123,7 @@ func sendCmd() *cobra.Command {
 			return sessionCmdImpls["send"](&cliCtx{args: args, to: to})
 		},
 	}
-	cmd.Flags().StringVar(&to, "to", "", "deliver to another agent by name instead of the phone")
+	cmd.Flags().StringVar(&to, "to", "", "deliver to another agent by name — or to the party line with '#crew' — instead of the phone")
 	return cmd
 }
 
