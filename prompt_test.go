@@ -93,3 +93,59 @@ func TestFirstPromptLine(t *testing.T) {
 		t.Errorf("firstPromptLine fallback = %q", got)
 	}
 }
+
+// TestMarkPromptRaiseRefreshNoFlap is the stale-permission-card fix (#15): the
+// card's caption is the COMMAND, and MarkPrompt decides atomically whether a
+// detected dialog raises a fresh card, re-captions an open one for a new
+// command, or (the anti-flap case) changes nothing because it is the same
+// command re-detected — the guarantee that an approval never lands on a command
+// the human never read, and that a dialog re-attested every ~10s never re-rings.
+func TestMarkPromptRaiseRefreshNoFlap(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // MarkPrompt/SetPrompt save() under $HOME/.bridge
+	r := &Registry{
+		contacts: map[string]*Contact{"c1": {ID: "c1", Name: "wolf", Status: "live", Health: "ok"}},
+		mailbox:  map[string][]MailMessage{},
+		flushing: map[string]bool{},
+	}
+	c := r.contacts["c1"]
+
+	// First detection RAISES a fresh card.
+	if got := r.MarkPrompt("c1", "Bash(git push)"); got != promptRaised {
+		t.Fatalf("first MarkPrompt = %v, want promptRaised", got)
+	}
+	if !c.PromptOpen || c.PromptSig != "Bash(git push)" || c.PromptSince == 0 {
+		t.Fatalf("after raise: open=%v sig=%q since=%d", c.PromptOpen, c.PromptSig, c.PromptSince)
+	}
+
+	// Same command re-detected: NO CHANGE — the anti-flap guarantee (no re-ring).
+	if got := r.MarkPrompt("c1", "Bash(git push)"); got != promptNoChange {
+		t.Fatalf("re-detect same command = %v, want promptNoChange", got)
+	}
+
+	// Pin an old open-time, then a DIFFERENT command: REFRESH, and the
+	// frozen-prompt clock must survive untouched (still one continuous wait).
+	c.PromptSince = 12345
+	if got := r.MarkPrompt("c1", "Bash(rm -rf build)"); got != promptRefreshed {
+		t.Fatalf("new command = %v, want promptRefreshed", got)
+	}
+	if c.PromptSig != "Bash(rm -rf build)" {
+		t.Fatalf("after refresh sig=%q, want the new command", c.PromptSig)
+	}
+	if c.PromptSince != 12345 {
+		t.Fatalf("refresh restamped PromptSince to %d: the frozen-prompt clock must not reset on a re-caption", c.PromptSince)
+	}
+	if !c.PromptOpen {
+		t.Fatal("refresh dropped PromptOpen: the approve gate must stay enabled across a re-caption")
+	}
+
+	// Clearing drops the caption so a later revival can't inherit a stale card.
+	r.SetPrompt("c1", false)
+	if c.PromptOpen || c.PromptSig != "" {
+		t.Fatalf("after clear: open=%v sig=%q, want closed with an empty caption", c.PromptOpen, c.PromptSig)
+	}
+
+	// MarkPrompt on an unknown contact is a safe no-op.
+	if got := r.MarkPrompt("ghost", "Bash(x)"); got != promptNoChange {
+		t.Fatalf("MarkPrompt(unknown) = %v, want promptNoChange", got)
+	}
+}

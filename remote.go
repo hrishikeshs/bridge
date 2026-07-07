@@ -440,30 +440,27 @@ func handleTransportAttest(w http.ResponseWriter, r *http.Request) {
 	}
 	remoteMu.Unlock()
 
-	// Raise a card for each agent that newly shows a dialog — the SAME ceremony
-	// applyHookEvent runs (local.go), so a remote card is indistinguishable from a
-	// tmux one downstream. Attest-time detection is the PRIMARY rung for a remote
-	// agent: the user-global Notification hook (cli.go installs it in
+	// Raise or refresh a card for each agent showing a dialog — the SAME shared
+	// judge (raiseOrRefreshPrompt) the tmux paths run, so a remote card is
+	// indistinguishable downstream. Attest-time detection is the PRIMARY rung for
+	// a remote agent: the user-global Notification hook (cli.go installs it in
 	// ~/.claude/settings.json, so even a vterm-hosted session fires it) judges
 	// transportFor(c).Capture(c) the instant it lands — but for a remote contact
 	// that is the LAST attested tail, up to an attest interval stale, so the hook
 	// usually sees no dialog yet and, firing exactly once, never retries. The
-	// attest that CARRIES the dialog is the reliable raise. This adds NO clear
-	// path: verifyPrompt owns the clear for remote contacts too.
+	// attest that CARRIES the dialog is the reliable raise. MarkPrompt (inside the
+	// helper) decides raise-vs-refresh-vs-nothing atomically, so re-attesting an
+	// unchanged dialog every ~10s never re-rings, and a dialog SWAPPED for a
+	// different command re-captions the card instead of leaving stale text under
+	// the approve buttons. No clear path here: verifyPrompt owns the clear.
+	// MUST run after remoteMu is released — the helper touches the registry and
+	// pushes (the load-bearing concurrency rule at the top of this file).
 	for _, pr := range raises {
 		c := registry.Resolve(pr.id)
-		// Transition-only: skip a gone/offline agent, and skip one whose card is
-		// already up. Re-attesting the same open dialog every ~10s must not re-ring,
-		// and the transition guard makes the Notification hook a harmless second
-		// raiser — whichever of the two lands first wins, the other is a no-op.
-		if c == nil || c.Status != "live" || c.PromptOpen {
+		if c == nil || c.Status != "live" {
 			continue
 		}
-		registry.SetPrompt(c.ID, true)
-		Emit("attention", c.ID, c.Name, pr.tail)
-		notifyPush(c.Name+" needs you", firstPromptLine(pr.tail), "attn-"+c.ID, c.ID)
-		markAttnPushed(c.ID)
-		dispatchPluginEvent("permission.prompt", c, map[string]any{"prompt": firstPromptLine(pr.tail)})
+		raiseOrRefreshPrompt(c, pr.tail)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ttl_s": remoteTTLSeconds()})

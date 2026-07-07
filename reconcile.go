@@ -81,12 +81,7 @@ func startSessionManager() {
 					// prompt is re-surfaced (card + push) instead of silently
 					// cleared — and so flushMailbox refuses to type into it
 					// (review 2026-07-06, criticals C2/C4).
-					if snap := transportFor(revived).Capture(revived); looksLikePrompt(snap) {
-						registry.SetPrompt(revived.ID, true)
-						Emit("attention", revived.ID, revived.Name, snap)
-						notifyPush(revived.Name+" needs you", firstPromptLine(snap), "attn-"+revived.ID, revived.ID)
-						markAttnPushed(revived.ID)
-					}
+					raiseOrRefreshPrompt(revived, transportFor(revived).Capture(revived))
 					flushMailbox(revived)
 				case c.Status == "live" && alive:
 					pollReplies(c)
@@ -149,8 +144,14 @@ func verifyPrompt(c *Contact) {
 		delete(promptStrikes, c.ID)
 		return
 	}
-	if looksLikePrompt(transportFor(c).Capture(c)) {
+	if snap := transportFor(c).Capture(c); looksLikePrompt(snap) {
 		delete(promptStrikes, c.ID)
+		// The dialog is still up — but it may be a DIFFERENT command than the one
+		// the card is captioned with (Claude answered one prompt and opened the
+		// next without a clean frame between them). raiseOrRefreshPrompt re-captions
+		// the card when the command changed and is a no-op when it didn't, so this
+		// per-tick re-check is also the tmux stale-caption fix.
+		raiseOrRefreshPrompt(c, snap)
 		return
 	}
 	promptStrikes[c.ID]++

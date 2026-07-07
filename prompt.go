@@ -122,4 +122,37 @@ func firstPromptLine(pane string) string {
 	return "wants your approval — tap to review"
 }
 
+// raiseOrRefreshPrompt is the single entry point for surfacing a permission
+// dialog to the phone — the one judge for RAISE and REFRESH (verifyPrompt owns
+// CLEAR). It is called wherever a dialog is detected on a contact's screen: the
+// tmux hook (local.go), the tmux re-check and revive (reconcile.go), and the
+// remote attest (remote.go). firstPromptLine is the card's caption AND its
+// identity: MarkPrompt compares it against the caption currently up and decides
+// atomically whether this is a new card, the same card re-captioned for a
+// different command (the stale-text bug this fixes: an approval must never land
+// on a command the human never read), or the same command re-detected — in
+// which case nothing fires, so re-attesting an unchanged dialog every ~10s can
+// never flap the card or re-ring the phone. The ceremony on a raise or refresh
+// is identical, and identical to what a tmux card always ran, so a refreshed
+// card is indistinguishable downstream from a freshly raised one.
+//
+// Caveat by construction: two DIFFERENT dialogs that both fall to
+// firstPromptLine's generic fallback share a caption and so won't refresh
+// between each other. Real dialogs are tool calls (captured verbatim); the
+// fallback is the rare unrecognized shape, and it fails safe toward the
+// existing behavior (no worse than today), never toward a wrong caption.
+func raiseOrRefreshPrompt(c *Contact, snapshot string) {
+	if !looksLikePrompt(snapshot) {
+		return
+	}
+	sig := firstPromptLine(snapshot)
+	switch registry.MarkPrompt(c.ID, sig) {
+	case promptRaised, promptRefreshed:
+		Emit("attention", c.ID, c.Name, snapshot)
+		notifyPush(c.Name+" needs you", sig, "attn-"+c.ID, c.ID)
+		markAttnPushed(c.ID)
+		dispatchPluginEvent("permission.prompt", c, map[string]any{"prompt": sig})
+	}
+}
+
 var toolCallRe = regexp.MustCompile(`^[A-Z][A-Za-z]*\(.+\)`)

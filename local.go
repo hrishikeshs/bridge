@@ -161,11 +161,10 @@ func applyHookEvent(c *Contact) {
 		snapshot = transportFor(c).Capture(c)
 	}
 	if looksLikePrompt(snapshot) {
-		registry.SetPrompt(c.ID, true)
-		Emit("attention", c.ID, c.Name, snapshot)
-		notifyPush(c.Name+" needs you", firstPromptLine(snapshot), "attn-"+c.ID, c.ID)
-		markAttnPushed(c.ID)
-		dispatchPluginEvent("permission.prompt", c, map[string]any{"prompt": firstPromptLine(snapshot)})
+		// Raise a fresh card, or re-caption an open one if the command changed
+		// (the shared judge; refresh included so a swapped dialog can't leave
+		// stale text under the approve buttons).
+		raiseOrRefreshPrompt(c, snapshot)
 	} else {
 		if c.PromptOpen {
 			registry.SetPrompt(c.ID, false)

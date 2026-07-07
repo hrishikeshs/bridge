@@ -14,15 +14,16 @@ import (
 // session churn. The Contact (and its thread and outbox) persists across daemon
 // restarts and reconnects, keyed by name+directory; its id never changes.
 type Contact struct {
-	ID          string `json:"id"`           // daemon-minted uuid for the agent; the immutable identity
-	Name        string `json:"name"`         // self-chosen address, unique among the living (a display name; may be suffixed)
-	Directory   string `json:"directory"`    // the agent's working directory
-	SessionID   string `json:"session_id"`   // Claude Code conversation id; `claude --resume` PRESERVES it (verified empirically), so it is stable across resume — the tail pins on it, falling back to the newest .jsonl only if it goes missing/stale (see sessionFileFor)
-	TmuxTarget  string `json:"tmux_target"`  // tmux window id ("@N") hosting the agent; legacy rows may hold "bridge:<name>"
-	Status      string `json:"status"`       // "live" | "offline"
-	Health      string `json:"health"`       // "ok" | "working" | "prompt" | "offline"
-	PromptOpen  bool   `json:"prompt_open"`  // a permission prompt is hook-attested open
-	PromptSince int64  `json:"prompt_since"` // unix seconds the current prompt opened; 0 when none (drives frozen-agent escalation)
+	ID          string `json:"id"`                   // daemon-minted uuid for the agent; the immutable identity
+	Name        string `json:"name"`                 // self-chosen address, unique among the living (a display name; may be suffixed)
+	Directory   string `json:"directory"`            // the agent's working directory
+	SessionID   string `json:"session_id"`           // Claude Code conversation id; `claude --resume` PRESERVES it (verified empirically), so it is stable across resume — the tail pins on it, falling back to the newest .jsonl only if it goes missing/stale (see sessionFileFor)
+	TmuxTarget  string `json:"tmux_target"`          // tmux window id ("@N") hosting the agent; legacy rows may hold "bridge:<name>"
+	Status      string `json:"status"`               // "live" | "offline"
+	Health      string `json:"health"`               // "ok" | "working" | "prompt" | "offline"
+	PromptOpen  bool   `json:"prompt_open"`          // a permission prompt is hook-attested open
+	PromptSince int64  `json:"prompt_since"`         // unix seconds the current prompt opened; 0 when none (drives frozen-agent escalation)
+	PromptSig   string `json:"prompt_sig,omitempty"` // firstPromptLine of the dialog CURRENTLY on the card; set/cleared with PromptOpen under the lock so a dialog swapped for a different command refreshes the card instead of showing stale text. "" when no card is up.
 
 	// Transport names the mechanism that physically reaches this agent
 	// (transport.go). Empty means "tmux" — every roster row registered before
@@ -401,7 +402,11 @@ func (r *Registry) Roster() []*Contact {
 }
 
 // SetPrompt marks whether a contact has an open (hook-attested) permission
-// prompt and updates its health to match.
+// prompt and updates its health to match. Closing a prompt also clears its
+// signature (PromptSig), so a later revival can never inherit a stale card
+// caption. RAISING and REFRESHING go through MarkPrompt instead — this method
+// is the CLEAR path (and the direct revive set); it never opens a card whose
+// caption text hasn't been recorded.
 func (r *Registry) SetPrompt(id string, open bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -410,12 +415,12 @@ func (r *Registry) SetPrompt(id string, open bool) {
 		return
 	}
 	// Stamp the moment a prompt opens (and clear it when it closes) so the
-	// frozen-agent watchdog can age it. Don't restamp an already-open prompt —
-	// re-attestation of the same dialog must not reset its clock.
+	// frozen-agent watchdog can age it. Don't restamp an already-open prompt.
 	if open && !c.PromptOpen {
 		c.PromptSince = timeNowUnix()
 	} else if !open {
 		c.PromptSince = 0
+		c.PromptSig = ""
 	}
 	c.PromptOpen = open
 	switch {
@@ -425,6 +430,49 @@ func (r *Registry) SetPrompt(id string, open bool) {
 		c.Health = "ok"
 	}
 	r.save()
+}
+
+// promptChange is what MarkPrompt decided: nothing, a fresh card, or the same
+// card re-captioned for a new command.
+type promptChange int
+
+const (
+	promptNoChange promptChange = iota
+	promptRaised
+	promptRefreshed
+)
+
+// MarkPrompt records that a dialog with caption `sig` (the command line) is
+// showing, and reports — atomically under the one lock — whether that NEWLY
+// raised the card (was closed), REFRESHED it (open, but a different command
+// than the caption it last carried), or changed nothing (same command). The
+// decision lives here, not in a caller reading a Contact copy, so two
+// goroutines detecting the same dialog (the hook handler and the reconcile
+// re-check) can never both "raise" it and double-ring the phone. PromptSince is
+// stamped only on a true raise — a refresh is still one continuous wait, so the
+// frozen-prompt clock must not reset when only the command text changes.
+func (r *Registry) MarkPrompt(id, sig string) promptChange {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.contacts[id]
+	if !ok {
+		return promptNoChange
+	}
+	switch {
+	case !c.PromptOpen:
+		c.PromptOpen = true
+		c.PromptSig = sig
+		c.PromptSince = timeNowUnix()
+		c.Health = "prompt"
+		r.save()
+		return promptRaised
+	case sig != c.PromptSig:
+		c.PromptSig = sig // a new command under the same open card; clock unchanged
+		r.save()
+		return promptRefreshed
+	default:
+		return promptNoChange
+	}
 }
 
 // SetOffline marks a contact offline (its managed tmux session ended).
@@ -438,6 +486,7 @@ func (r *Registry) SetOffline(id string) {
 	c.Status = "offline"
 	c.Health = "offline"
 	c.PromptOpen = false
+	c.PromptSig = "" // no card survives going offline; don't let a revival inherit its caption
 	r.save()
 }
 

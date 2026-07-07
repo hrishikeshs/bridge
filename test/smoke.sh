@@ -787,6 +787,37 @@ else
   fail_msg "attest-time card never raised prompt_open for sim-otter"
 fi
 
+# STALE-CAPTION FIX (#15): the card's caption (prompt_sig) is the COMMAND, and
+# it must FOLLOW a dialog swapped for a different command — else an approval
+# lands on a command the human never read. rt_sig reads sim-otter's prompt_sig.
+rt_sig() { curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts | python3 -c 'import json,sys
+try: data=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for c in (data.get("contacts") if isinstance(data,dict) else data) or []:
+    if c.get("name")=="sim-otter": print(c.get("prompt_sig") or "")'; }
+body_has "card caption is dialog A'\''s command"    "git push origin main" "$(rt_sig)"
+# Attest a DIFFERENT command under the same still-open card.
+RT_DIALOG_TAIL_B='Bash(rm -rf build)
+Do you want to proceed?
+ ❯ 1. Yes
+   2. No, and tell Claude what to do differently'
+RT_ATTEST_DIALOG_B=$(RT_L="$LEASE3" RT_C="$RCID" RT_T="$RT_DIALOG_TAIL_B" python3 -c 'import json,os
+print(json.dumps({"lease":os.environ["RT_L"],"states":[{"id":os.environ["RT_C"],"ready":True,"prompt_open":True,"screen_tail":os.environ["RT_T"]}]}))')
+RT_REFRESH=n
+for _ in $(seq 10); do
+  curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_DIALOG_B" $BASE/local/transport/attest
+  case "$(rt_sig 2>/dev/null)" in *"rm -rf build"*) RT_REFRESH=y; break;; esac
+  sleep 0.5
+done
+if [ "$RT_REFRESH" = y ]; then
+  pass_msg "card caption refreshed to the new command (no stale approval text)"
+else
+  fail_msg "card caption stayed stale after the dialog changed"
+fi
+[ "$(rt_card 2>/dev/null)" = open ] \
+  && pass_msg "prompt stayed open across the refresh (approve gate never dropped)" \
+  || fail_msg "prompt_open dropped during the caption refresh"
+
 # BELT: with the dialog still attested (Ready false), a phone send is HELD — the
 # trailing Enter must never blind-select the highlighted option (C2/C4, remote).
 curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_DIALOG" $BASE/local/transport/attest  # keepalive
