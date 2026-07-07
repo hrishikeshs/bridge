@@ -1,0 +1,12 @@
+{
+  "name": "bridge-pwa-harness",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Headless behaviour harness for the bridge PWA (loads pwa/index.html + pwa/app.js into jsdom and drives it through its real seams). Test-only; the shipped app stays build-free.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.1"
+  }
+}
