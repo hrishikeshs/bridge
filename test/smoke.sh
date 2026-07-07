@@ -960,6 +960,61 @@ else
   fail_msg "1:1 send never delivered on the unchanged path"
 fi
 
+# --- context gauge: the /compact action (WORK ITEM 2) ----------------------
+# The phone triggers /compact on an IDLE agent. The daemon types a COMPILE-TIME
+# CONSTANT "/compact" and nothing else — the request body carries no command
+# string (a fixed-vocabulary action, like the approve keys; never raw
+# passthrough). Gating: unknown/offline -> 400; not idle (a busy pane, or a
+# permission prompt open) -> 409 busy; idle live -> 200 and the EXACT literal
+# "/compact" is parked for the client. Live agents are the remote/sim transport
+# (a smoke daemon's only "live"), reusing the rt_* helpers. Placed before
+# lockdown, which stops the daemon these checks need alive.
+
+# unknown agent -> 400 offline (needs no agent state).
+check "compact unknown agent -> 400"           400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d '{"agent":"ghost-nobody"}' $BASE/api/compact)"
+
+# a fresh idle sim agent on its own lease.
+CO_HELLO_BODY="{\"transport\":\"sim\",\"agents\":[{\"name\":\"compact-owl\",\"directory\":\"$RT_DIR/co\",\"session_id\":\"\"}]}"
+CO_HELLO=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$CO_HELLO_BODY" $BASE/local/transport/hello)
+CO_LEASE=$(printf '%s' "$CO_HELLO" | rt_field lease)
+CO_ID=$(printf '%s' "$CO_HELLO" | rt_agent0)
+CO_ATTEST_READY="{\"lease\":\"$CO_LEASE\",\"states\":[{\"id\":\"$CO_ID\",\"ready\":true,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+CO_ATTEST_NOTREADY="{\"lease\":\"$CO_LEASE\",\"states\":[{\"id\":\"$CO_ID\",\"ready\":false,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+CO_BODY="{\"agent\":\"$CO_ID\"}"
+
+# IDLE happy path: attest ready+clean -> the agent is idle (Health ok, Ready
+# true). /api/compact then delivers the CONSTANT; remote Deliver blocks on the
+# client ack (like /api/approve), so background it, drain the parked line, assert
+# it is EXACTLY "/compact" (constant-only — nothing request-supplied), ack, reap.
+check "attest compact-owl ready -> 200"        200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$CO_ATTEST_READY" $BASE/local/transport/attest)"
+CO_CODE="$TESTDIR/co-code"
+( code "${DEV_AUTH[@]}" "${J[@]}" -d "$CO_BODY" $BASE/api/compact > "$CO_CODE" ) &
+CO_PID=$!
+CO_MAIL=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$CO_LEASE&wait=2")
+body_has "compact parks the EXACT literal /compact" '"text":"/compact"' "$CO_MAIL"
+CO_MID=$(printf '%s' "$CO_MAIL" | rt_deliv id)
+CO_ACK="{\"lease\":\"$CO_LEASE\",\"ids\":[\"$CO_MID\"]}"
+check "ack the compact command -> 200"         200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$CO_ACK" $BASE/local/transport/ack)"
+wait "$CO_PID"
+check "the idle compact returned 200"          200 "$(cat "$CO_CODE")"
+HIST_BODY=$(curl -s "${DEV_AUTH[@]}" "$BASE/api/history?since=0")
+body_has "history reflects the compact"        '"type":"compacted"' "$HIST_BODY"
+
+# BUSY (the Ready half of the gate): a not-ready attest means the pane is working
+# -> 409 busy, and nothing is typed. The attest refreshes the 3s lease.
+check "attest compact-owl not-ready -> 200"    200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$CO_ATTEST_NOTREADY" $BASE/local/transport/attest)"
+check "compact a not-ready (busy) agent -> 409" 409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$CO_BODY" $BASE/api/compact)"
+CO_MAIL_B=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$CO_LEASE&wait=1")
+body_has "the busy compact parked nothing"     '"deliveries":[]' "$CO_MAIL_B"
+
+# BUSY (the prompt half of the gate): a dialog tail opens a permission card
+# (Health -> prompt) AND makes Ready false via the belt -> 409 busy. Reuses
+# RT_DIALOG_TAIL (proven to satisfy looksLikePrompt in remote_test.go).
+CO_ATTEST_DIALOG=$(RT_L="$CO_LEASE" RT_C="$CO_ID" RT_T="$RT_DIALOG_TAIL" python3 -c 'import json,os
+print(json.dumps({"lease":os.environ["RT_L"],"states":[{"id":os.environ["RT_C"],"ready":True,"prompt_open":True,"screen_tail":os.environ["RT_T"]}]}))')
+check "attest compact-owl a dialog -> 200"     200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$CO_ATTEST_DIALOG" $BASE/local/transport/attest)"
+check "compact while a prompt is open -> 409"  409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$CO_BODY" $BASE/api/compact)"
+
 # --- lockdown (LAST: it stops the daemon) ---------------------------------
 check "lockdown -> 200"                    200 "$(code "${LOCAL_AUTH[@]}" -X POST $BASE/local/lockdown)"
 gone=n

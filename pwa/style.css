@@ -537,6 +537,101 @@ header {
 #stop-btn:active { color: var(--attn); }
 #stop-btn:disabled { opacity: 0.4; }
 
+/* ── context gauge ───────────────────────────────────────────────────────────
+   The agent's context-window meter, rendered UNDER the name/status line inside
+   .thread-id (renderContextGauge in app.js). The whole control is a button:
+   tappable only when the agent is idle, greyed + inert otherwise. Colours ramp
+   amber(--attn)→red(--danger), set inline in JS via color-mix — no new tokens. */
+.ctx-gauge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 5px;
+  padding: 5px 0;                 /* widens the touch target beyond the thin track */
+  background: none;
+  border: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.ctx-gauge-track {
+  flex: 1;
+  min-width: 0;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--hairline);
+  overflow: hidden;
+}
+.ctx-gauge-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--attn);        /* fallback amber; JS sets the amber→red ramp */
+  transition: width 0.4s ease, background 0.4s ease;
+}
+.ctx-gauge-label {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--header-dim);
+  white-space: nowrap;
+}
+/* Idle → tappable: a quiet press flash, echoing the row/action-item convention. */
+.ctx-gauge:not(:disabled):active .ctx-gauge-track { background: var(--dim); }
+/* Working / prompt / offline / compacting → visibly inert: dimmed, no pointer. */
+.ctx-gauge:disabled { opacity: 0.45; cursor: default; }
+/* The brief post-tap "compacting…" state pulses until the next poll drops it. */
+.ctx-gauge.ctx-busy .ctx-gauge-fill { animation: ctx-pulse 1.2s ease-in-out infinite; }
+@keyframes ctx-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* Confirm sheet — reuses .sheet / .sheet-panel chrome; only the message and the
+   two action buttons are new. Above the settings (50) and action (60) sheets. */
+#ctx-confirm { z-index: 70; }
+.ctx-confirm-panel { text-align: left; }
+.ctx-confirm-msg {
+  margin: 4px 0 18px;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--ink);
+}
+.ctx-confirm-actions { display: flex; flex-direction: column; gap: 10px; }
+.ctx-btn {
+  width: 100%;
+  padding: 13px 14px;
+  font-size: 16px;
+  font-weight: 600;
+  border-radius: 12px;
+  color: var(--ink);
+  background: var(--ground);
+  border: 1px solid var(--hairline);
+}
+.ctx-btn:active { background: var(--hairline); }
+.ctx-btn.primary {
+  color: var(--out-ink);
+  background: var(--attn);
+  border-color: var(--attn);
+}
+/* A quiet, self-dismissing toast for the gentle 409/400 messages. */
+.ctx-toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom) + 84px);
+  transform: translateX(-50%);
+  z-index: 80;
+  max-width: 82%;
+  padding: 10px 16px;
+  font-size: 14px;
+  line-height: 1.35;
+  text-align: center;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+}
+/* ── end context gauge ─────────────────────────────────────────────────────*/
+
 /* ---- feed ---- */
 
 #feed {

@@ -70,10 +70,15 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		// until now only /local/contacts told the truth.
 		Transport string `json:"transport,omitempty"`
 		Flavor    string `json:"transport_flavor,omitempty"`
+		// ContextPct is the agent's context-window usage, 0–100, derived passively
+		// from its session-JSONL usage line (context.go). Omitted (omitempty) when
+		// unknown — no usage parsed yet, or a sessionless agent — so the phone hides
+		// the bar rather than drawing a misleading 0%.
+		ContextPct int `json:"context_pct,omitempty"`
 	}
 	items := []item{}
 	for _, c := range registry.Roster() {
-		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Away, c.Fields, c.Transport, c.TransportFlavor})
+		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Away, c.Fields, c.Transport, c.TransportFlavor, contextPct(c.ContextTokens, c.ContextModel)})
 	}
 	// Clocks for phone-side presence truth (round 4): the phone compares `now`
 	// to its own clock and its last-contact timestamp to distinguish "my
@@ -480,6 +485,64 @@ func handleApprove(w http.ResponseWriter, r *http.Request, id string) {
 	// The lock-screen "needs you" notification is now stale; replace it with a
 	// same-tag ✓ so it can't sit there demanding attention it already got.
 	clearAttnPush(c.ID, c.Name)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// compactCommand is the ONLY line /api/compact ever types — a compile-time
+// constant. See handleCompact's safety invariant: no request-supplied text can
+// reach the transport, this string is the whole vocabulary.
+const compactCommand = "/compact"
+
+// handleCompact triggers a context-window /compact on an IDLE agent — the phone's
+// half of the context gauge. It is a FIXED-VOCABULARY action, exactly like the
+// approve keys (1/2/3/y/n/esc), NOT raw passthrough (the user explicitly declined
+// a raw shell).
+//
+// THE SAFETY INVARIANT (load-bearing): the request body carries NO command string
+// — only which agent to compact. The daemon delivers the compile-time constant
+// compactCommand ("/compact") and nothing else; there is no code path by which any
+// request-supplied text reaches the transport's send-keys. If this handler ever
+// grows a field that flows into Deliver, that is the one thing it must never do.
+//
+// Gate order, both required: the contact must be live (else 400 "offline"), and it
+// must be IDLE — Health "ok" (never "working", never "prompt") AND its transport
+// Ready this instant (a clean prompt, no open dialog) — else 409 "busy". Idle is
+// deliberately STRICTER than Ready: we only compact an agent that has put its pen
+// down, never one mid-turn or with a permission card up.
+func handleCompact(w http.ResponseWriter, r *http.Request, id string) {
+	data, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Agent string `json:"agent"` // the ONLY field — never a command string
+	}
+	_ = json.Unmarshal(data, &req)
+
+	c := registry.Resolve(req.Agent)
+	if c == nil || c.Status != "live" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offline"})
+		return
+	}
+	// Idle only. Health must be a settled "ok" (not "working", not "prompt") AND
+	// the transport must be Ready right now (clean prompt, no dialog). A working
+	// or prompting agent is busy: 409, retry once it settles.
+	if c.Health != "ok" || !transportFor(c).Ready(c) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "busy"})
+		return
+	}
+	// Deliver the CONSTANT, submitted, straight through the transport. This is a
+	// direct command, not a held chat message, so it does NOT route through the
+	// coalescing mailbox (holdInbound): for tmux it types "/compact"+Enter, for a
+	// remote client it parks "/compact" for the client to type, exactly as the
+	// client types any daemon-delivered line. Nothing request-supplied is here.
+	if err := transportFor(c).Deliver(c, compactCommand); err != nil {
+		audit("compact-failed", c.Name+": "+err.Error(), id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	audit("compact", c.Name, id)
+	Emit("compacted", c.ID, c.Name, "") // so the PWA/feed can reflect it
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
