@@ -154,6 +154,13 @@ const STATE_GLYPH = { sending: '🕐', sent: '✓', failed: '⚠️', queued: '�
 // (httpapi.go), which 400s anything outside it.
 const REACTIONS = ['👍', '❤️', '😂', '🎉', '👀', '🚀'];
 
+// How many of a thread's newest events the feed paints on entry. A 400-message
+// thread renders just this tail (instant); "↑ show earlier" widens the window a
+// step at a time. Only the DOM is windowed — resolveAttentions still walks the
+// FULL history, so an approval card resolved far below the fold still collapses
+// (perf round, 2026-07-06).
+const FEED_WINDOW = 60;
+
 const state = {
   contacts: [],          // roster from /api/status
   rooms: [],             // shared threads from /api/status (v1: just #crew)
@@ -164,6 +171,7 @@ const state = {
   quote: null,           // {name, excerpt} — the bubble the composer is replying to
   view: 'list',          // 'list' (conversation list) | 'thread' (one contact)
   selected: null,        // contact id of the open thread, or null on the list
+  feedWindow: FEED_WINDOW, // newest events the open thread renders (grows on "show earlier")
   myStatus: '',          // the human's away line, delivered to agents on reach-out
   lastEventId: 0,
   lastSeen: JSON.parse(localStorage.getItem('lastSeen') || '{}'),
@@ -177,6 +185,7 @@ const state = {
   seenWake: 0,           // newest wake_to the phone has already surfaced
   wakeNote: null,        // {from,to,until} — transient "Mac was asleep X–Y" banner
   wired: false,          // one-time listeners/intervals installed (init re-runs)
+  hydrated: false,       // eventCache replayed into state once (init re-runs)
 };
 
 /* Outbox: unsent/undelivered messages, persisted so they survive an app
@@ -222,6 +231,11 @@ setInterval(() => {                 // expire stale typing bubbles
 /* ---------- bootstrap ---------- */
 
 async function init() {
+  // Replay the local cache into state before the first network round-trip, so a
+  // warm open paints instantly and loadHistory only has to fetch the delta since
+  // the cached cursor. Guarded (once): init re-runs on pairing and the offline
+  // retry loop, but the cache must fold in exactly once.
+  hydrateCache();
   const res = await fetch('/api/status').catch(() => null);
   if (!res) return showOffline();          // unreachable: show cached feed
   if (res.status === 401) return showPairing();
@@ -291,27 +305,62 @@ async function init() {
 }
 
 /* Server unreachable (laptop asleep, daemon restarting): show the last
-   cached conversation read-only, and retry until the bridge is back. */
+   cached conversation read-only, and retry until the bridge is back. The cache
+   was already folded in at the top of init(); hydrateCache is idempotent (its
+   guard, and ingest's id guard, skip everything already seen), so this call is
+   a no-op that keeps the read-only-offline path honest on its own. */
 function showOffline() {
-  const cached = JSON.parse(localStorage.getItem('eventCache') || 'null');
-  if (cached) {
-    state.contacts = cached.contacts || [];
-    state.rooms = cached.rooms || [];
-    cached.events.forEach(ingest);
-  }
+  hydrateCache();
   showApp();
   setConnected(false);
   setTimeout(init, 5000);
 }
 
+/* Persist enough to reopen warm AND to fetch only the delta next time:
+   - events.slice(-300): the tail we replay into the feed offline.
+   - reactions: the folded badge map. Reactions (and status) events FOLD into
+     maps and never enter state.events, so they live ONLY in server history.
+     Once loadHistory stops replaying from since=0, a reload would lose every
+     badge older than the delta unless the map itself rides the cache — this
+     field is that lifeline. (Status/away needs no caching: it re-arrives on the
+     first /api/status fetch.)
+   - lastEventId: the SSE/history cursor. It can exceed the last cached event's
+     id — a reaction/status folded and advanced the cursor without being stored
+     — so it is cached explicitly rather than re-derived from events. */
 function cacheEvents() {
   try {
     localStorage.setItem('eventCache', JSON.stringify({
       contacts: state.contacts,
       rooms: state.rooms,
-      events: state.events.slice(-100),
+      events: state.events.slice(-300),
+      reactions: [...state.reactions],
+      lastEventId: state.lastEventId,
     }));
   } catch (e) { /* storage full — cache is best-effort */ }
+}
+
+/* Fold the persisted cache back into state, exactly once. Called at the top of
+   init() (which re-runs) and again from showOffline(); the hydrated guard makes
+   the second call a no-op. Ingesting with the SAME outbox reconcile loadHistory
+   does keeps a cached 'sent' from re-delivering its local echo. */
+function hydrateCache() {
+  if (state.hydrated) return;
+  state.hydrated = true;
+  const cached = JSON.parse(localStorage.getItem('eventCache') || 'null');
+  if (!cached) return;                       // cold start: nothing cached
+  state.contacts = cached.contacts || [];
+  state.rooms = cached.rooms || [];
+  (cached.events || []).forEach((e) => {
+    // Same reconcile as loadHistory's replay (H10): a cached 'sent' the phone
+    // never saw live must still drop its outbox echo, or flushOutbox re-sends it.
+    if (ingest(e) && e.type === 'sent') dropPendingEcho(e.agent, e.text, e.client_id);
+  });
+  // Reactions folded out of state.events at cache time — restore the badge map
+  // from the cached Map entries so pre-delta reactions survive the reload.
+  if (cached.reactions) state.reactions = new Map(cached.reactions);
+  // The cursor can sit past the newest cached event (a folded reaction/status
+  // advanced it), so trust the cached cursor over the ids ingest just replayed.
+  state.lastEventId = Math.max(state.lastEventId, cached.lastEventId || 0);
 }
 
 function showPairing() {
@@ -368,7 +417,10 @@ async function refreshStatus() {
 }
 
 async function loadHistory() {
-  const res = await fetch('/api/history?since=0').catch(() => null);
+  // Fetch only what's newer than the cached cursor — a warm open pulls the
+  // delta, not all 500 events. A cold start (no cache) leaves lastEventId at 0,
+  // so this naturally becomes since=0, the full history.
+  const res = await fetch('/api/history?since=' + state.lastEventId).catch(() => null);
   if (!res || !res.ok) return;
   const data = await res.json();
   (data.events || []).forEach((e) => {
@@ -628,6 +680,10 @@ function openThread(id) {
   clearDeliveredNotifications();
   updateThreadHeader();
   updateAttentionBanner();
+  // Every entry lands at the newest message, so the window resets to the tail —
+  // a thread you scrolled way back in last time reopens light, not wherever its
+  // "show earlier" left off.
+  state.feedWindow = FEED_WINDOW;
   renderFeed();
   // Entering a thread always lands on the newest message. renderFeed's sticky
   // logic only holds the bottom once you're already there; on entry the feed
@@ -1202,9 +1258,16 @@ function renderFeed() {
   const feed = $('feed');
   const stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
   feed.innerHTML = '';
-  const events = visibleEvents();
-  const resolutions = resolveAttentions(events);   // attn event id -> resolution
-  let lastDay = '';
+  const all = visibleEvents();
+  // resolveAttentions walks the FULL thread: a prompt's resolver (approve /
+  // clear / a superseding attention) can land many events after it, past the
+  // top edge of the window, and the card must still collapse.
+  const resolutions = resolveAttentions(all);   // attn event id -> resolution
+  // The DOM, though, only carries the newest slice — a 400-message thread paints
+  // its tail instantly. Older events wait behind a "show earlier" row at the top.
+  const events = all.slice(-state.feedWindow);
+  if (events.length < all.length) feed.appendChild(showEarlierButton(all.length - events.length));
+  let lastDay = '';   // day separators compute over the rendered window only
   for (const event of events) {
     const day = (event.ts || '').slice(0, 10);   // group by calendar day
     if (day && day !== lastDay) {
@@ -1244,6 +1307,26 @@ function renderFeed() {
   // Photos are a 1:1 feature in v1 — the room upload path has no fan-out, so a
   // photo to #crew would stick queued. Disable the attach button in a room.
   $('attach-btn').disabled = isRoomId(state.selected);
+}
+
+/* The "↑ show earlier" row at the top of a windowed feed. Widening the window
+   re-renders taller, so we pin the viewport to the messages the reader was
+   already looking at: record the height, grow, re-render, then push scrollTop
+   down by exactly how much taller it got. The reader sits at the top when this
+   fires (the button IS the top), so renderFeed's near-bottom stick can't trip,
+   and pinFeedBottom never runs from here — the view holds where the eye is. */
+function showEarlierButton(n) {
+  const btn = document.createElement('button');
+  btn.className = 'show-earlier';
+  btn.textContent = '↑ show earlier (' + n + ' more)';
+  btn.onclick = () => {
+    const feed = $('feed');
+    const before = feed.scrollHeight;
+    state.feedWindow += FEED_WINDOW;
+    renderFeed();
+    feed.scrollTop += feed.scrollHeight - before;
+  };
+  return btn;
 }
 
 /* Land the feed on its newest message — and KEEP it there as late content
@@ -1417,13 +1500,7 @@ function renderPending(msg) {
   if (msg.quote && (msg.quote.name || msg.quote.excerpt)) {
     el.appendChild(quoteInset(msg.quote.name, msg.quote.excerpt));
   }
-  if (msg.image) {
-    const thumb = document.createElement('img');
-    thumb.className = 'sent-thumb';
-    thumb.src = 'data:image/jpeg;base64,' + msg.image;
-    thumb.alt = '';
-    el.appendChild(thumb);
-  }
+  if (msg.image) el.appendChild(photoBox('data:image/jpeg;base64,' + msg.image));
   el.appendChild(richText(msg.text));
   if (msg.mstate === 'failed') {
     const retry = document.createElement('button');
@@ -1434,6 +1511,25 @@ function renderPending(msg) {
   }
   appendStamp(el, msg.ts);
   return el;
+}
+
+/* A photo in a fixed-size box (.photo-box owns the dimensions in CSS). The box
+   reserves its full space before the image decodes, so a loading photo can't
+   shift the feed — zero layout shift by construction. loading="lazy" keeps
+   offscreen history photos off the wire until scrolled near; decoding="async"
+   keeps the decode off the main thread. Tap toggles .full to lift the
+   cover-crop and show the whole photo (no lightbox, no new chrome). */
+function photoBox(src) {
+  const box = document.createElement('div');
+  box.className = 'photo-box';
+  const img = document.createElement('img');
+  img.src = src;
+  img.alt = '';
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  box.appendChild(img);
+  box.onclick = () => box.classList.toggle('full');
+  return box;
 }
 
 function typingBubble(name) {

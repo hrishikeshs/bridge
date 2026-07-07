@@ -565,12 +565,27 @@ header {
   border-radius: 8px;
 }
 
-.sent-thumb {
-  display: block;
-  max-width: 180px;
-  border-radius: 8px;
+/* A photo message rides in a fixed box that reserves its space before the
+   image decodes — so a loading photo never shoves the feed (zero layout shift
+   by construction). Collapsed it's a 4:3 cover-crop; tapping toggles .full to
+   lift the crop and show the whole photo at its natural height. The width stays
+   put across the toggle so the bubble doesn't jump. */
+.photo-box {
+  width: 240px;
+  max-width: 100%;
+  height: 180px;
   margin: 4px 0;
+  border-radius: 8px;
+  overflow: hidden;
 }
+.photo-box img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.photo-box.full { height: auto; }
+.photo-box.full img { height: auto; object-fit: contain; }
 
 .msg.mention,
 .msg.reply {
@@ -627,6 +642,22 @@ header {
   background: var(--pill-bg);
   border-radius: 999px;
 }
+
+/* "↑ show earlier (N more)" — the top-of-feed reveal for a windowed thread. A
+   quiet centered pill, feed furniture rather than a message; tapping widens the
+   render window and holds the reader's place (see showEarlierButton). */
+.show-earlier {
+  align-self: center;
+  margin: 2px 0 6px;
+  padding: 5px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+}
+.show-earlier:active { background: var(--hairline); }
 
 /* ---- rich text: thinking pills, show-more ---- */
 
