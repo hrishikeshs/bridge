@@ -1288,3 +1288,31 @@ footer {
   border: 1px solid var(--hairline);
   border-radius: 999px;
 }
+
+/* The Bridge Herald — the daemon's morning paper, rendered as a small
+   newspaper card in #crew. Serif masthead over a double rule; section heads
+   in tracked caps; body lines in quiet ink. Rides the theme tokens. */
+.msg.paper {
+  background: var(--surface);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 14px;
+  padding: 14px 16px;
+  max-width: 92%;
+}
+.paper-masthead {
+  font-family: ui-serif, 'New York', Georgia, serif;
+  font-size: 17px;
+  font-weight: 700;
+  text-align: center;
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+  border-bottom: 3px double var(--ink);
+}
+.paper-section {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--dim);
+  margin: 10px 0 4px;
+}
+.paper-line { font-size: 14px; line-height: 1.45; }

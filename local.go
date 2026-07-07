@@ -52,6 +52,11 @@ func handleLocal(w http.ResponseWriter, r *http.Request) {
 		handleLocalSend(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/local/status":
 		handleLocalStatus(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/local/paper":
+		// `bridge paper` — print an edition on demand. It counts as today's:
+		// the scheduled one stands down rather than repeating the news.
+		publishPaper(time.Now())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "edition": paper.Edition})
 	case r.Method == http.MethodGet && r.URL.Path == "/local/contacts":
 		cs := registry.Roster()
 		if cs == nil {

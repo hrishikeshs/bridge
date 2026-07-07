@@ -123,6 +123,7 @@ func runServe(port int) error {
 	// CLI/hook caller (they'd present a token no daemon knows).
 	defer removeOwnLockfile(localToken)
 
+	loadPaperState() // The Bridge Herald remembers its last edition (paper.go)
 	startHeartbeat()
 	startSessionManager() // reconcile.go: tail loops + liveness
 	if err := loadVAPID(); err != nil {

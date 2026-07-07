@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNeutralizeFrame(t *testing.T) {
@@ -239,5 +240,63 @@ func TestRoomCooldown(t *testing.T) {
 	roomHumanSpoke(room)
 	if !roomAgentMaySpeak(room, "agent-a") {
 		t.Error("a human message must reopen the room for everyone")
+	}
+}
+
+// The Bridge Herald's press schedule: due once past the configured hour,
+// never twice a day, silent when disabled, and printableLine keeps thinking
+// spans off the front page.
+func TestPaperDue(t *testing.T) {
+	savedCfg, savedState := authConfig, paper
+	defer func() { authConfig, paper = savedCfg, savedState }()
+	seven := 7
+	authConfig.PaperHour = &seven
+	loc := time.FixedZone("test", 0)
+	morning := time.Date(2026, 7, 7, 8, 0, 0, 0, loc)
+
+	paper.LastUnix = 0 // fresh install: the first check stamps the epoch, no boot edition
+	if paperDue(morning) {
+		t.Error("a fresh press must not fire at boot")
+	}
+	if paper.LastUnix != morning.Unix() {
+		t.Error("first check should stamp the install moment")
+	}
+	if paperDue(morning.Add(time.Minute)) {
+		t.Error("still today; the schedule starts tomorrow")
+	}
+	if !paperDue(morning.Add(24 * time.Hour)) {
+		t.Error("tomorrow past the hour should be due")
+	}
+	paper.LastUnix = morning.Add(-30 * time.Minute).Unix() // ran at 7:30 today
+	if paperDue(morning) {
+		t.Error("today's edition already ran; must not repeat")
+	}
+	paper.LastUnix = morning.Add(-24 * time.Hour).Unix() // ran yesterday
+	if !paperDue(morning) {
+		t.Error("yesterday's edition doesn't cover today")
+	}
+	if paperDue(time.Date(2026, 7, 7, 6, 59, 0, 0, loc)) {
+		t.Error("before the hour, hold the presses")
+	}
+	off := -1
+	authConfig.PaperHour = &off
+	paper.LastUnix = morning.Add(-48 * time.Hour).Unix()
+	if paperDue(morning) {
+		t.Error("paper_hour -1 disables the scheduled edition")
+	}
+}
+
+func TestPrintableLine(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"[thinking] secret reasoning [end-thinking]\nShipped the fix.", "Shipped the fix."},
+		{"**Bold headline** rest", "Bold headline rest"},
+		{"[thinking] only thoughts, no close", ""},
+		{"[response] tagged line\nplain words", "plain words"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := printableLine(c.in); got != c.want {
+			t.Errorf("printableLine(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

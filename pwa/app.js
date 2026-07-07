@@ -1386,6 +1386,26 @@ function renderEvent(event, resolution) {
     const label = isRoomId(event.agent) ? author
       : author + ' → ' + (contactName(event.agent) || 'agent');
     return replyBubbles(event, 'msg peer', who(label));
+  } else if (event.type === 'paper') {
+    // The Bridge Herald: the daemon's morning edition, a small newspaper in
+    // the #crew thread. Masthead in serif (the wordmark already spans the
+    // coasts), ALL-CAPS lines become section heads, bullets become copy.
+    el.className = 'msg paper';
+    const mast = document.createElement('div');
+    mast.className = 'paper-masthead';
+    mast.textContent = event.name || 'The Bridge Herald';
+    el.appendChild(mast);
+    const body = document.createElement('div');
+    body.className = 'paper-body';
+    for (const ln of (event.text || '').split('\n')) {
+      if (!ln.trim()) continue;
+      const div = document.createElement('div');
+      div.className = /^[A-Z][A-Z '&]+$/.test(ln.trim()) ? 'paper-section' : 'paper-line';
+      div.textContent = ln;
+      body.appendChild(div);
+    }
+    el.appendChild(body);
+    appendStamp(el, event.ts);
   } else if (event.type === 'interrupted') {
     el.className = 'msg system';
     el.textContent = '⏹ interrupted' + (localTime(event.ts) ? ' · ' + localTime(event.ts) : '');

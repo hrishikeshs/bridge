@@ -26,6 +26,12 @@ func startSessionManager() {
 			}
 			lastTick = now
 			drainPendingHooks()
+			// The morning edition: once past the configured hour, the first
+			// tick of the day goes to press (paper.go). Cheap check, runs on
+			// this goroutine like everything else that reads the roster.
+			if paperDue(now) {
+				publishPaper(now)
+			}
 			roster := registry.Roster()
 			for _, c := range roster {
 				alive := c.TmuxTarget != "" && tmuxAlive(c.TmuxTarget)

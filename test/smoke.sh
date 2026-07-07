@@ -431,6 +431,15 @@ ROOM_REOPEN_BODY='{"agent":"room:crew","text":"human speaks, room reopens"}'
 check "phone message reopens the room -> 200" 200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$ROOM_REOPEN_BODY" $BASE/api/send)"
 check "agent may speak again after human -> 200" 200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$ROOM_LOCAL_BODY" $BASE/local/send)"
 
+# --- The Bridge Herald (morning paper) --------------------------------------
+# `bridge paper` (POST /local/paper) publishes an on-demand edition: one
+# "paper" event keyed to the #crew thread, composed from recorded facts.
+PAPER_RESP=$(curl -s "${LOCAL_AUTH[@]}" -X POST $BASE/local/paper)
+body_has "paper publishes edition 1"          '"edition":1' "$PAPER_RESP"
+HIST_BODY=$(curl -s "${DEV_AUTH[@]}" "$BASE/api/history?since=0")
+body_has "history carries the paper in #crew" '"type":"paper","agent":"room:crew"' "$HIST_BODY"
+body_has "the edition reports the wire"        'THE OVERNIGHT WIRE' "$HIST_BODY"
+
 # --- web push -------------------------------------------------------------
 check "push key -> 200"                    200 "$(code "${DEV_AUTH[@]}" $BASE/api/push/key)"
 PUSH_KEY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/push/key | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')

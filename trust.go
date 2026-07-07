@@ -101,6 +101,10 @@ type bridgeConfig struct {
 	AllowedLogins   []string `json:"allowed_logins"`
 	RequireIdentity bool     `json:"require_identity"`
 	UserMention     string   `json:"user_mention"`
+	// PaperHour is the local hour The Bridge Herald publishes (paper.go).
+	// Unset means the default (7); a negative value disables the scheduled
+	// edition — `bridge paper` still prints one on demand.
+	PaperHour *int `json:"paper_hour"`
 }
 
 // authConfig holds the loaded policy; secure defaults apply until loadConfig runs.

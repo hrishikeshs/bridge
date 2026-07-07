@@ -48,8 +48,27 @@ pair' (put it on your phone).`,
 		hookCmd(),
 		lockdownCmd(),
 		installDaemonCmd(),
+		paperCmd(),
 	)
 	return root
+}
+
+// paperCmd asks the running daemon to publish a Bridge Herald edition now.
+func paperCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "paper",
+		Short: "Publish a Bridge Herald edition now (the daemon's morning digest)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var resp struct {
+				Edition int `json:"edition"`
+			}
+			if err := daemonRequest(http.MethodPost, "/local/paper", nil, &resp); err != nil {
+				return err
+			}
+			fmt.Printf("The Bridge Herald — Edition %d is out. It's on the #crew thread. ☕\n", resp.Edition)
+			return nil
+		},
+	}
 }
 
 // serveCmd runs the daemon.
