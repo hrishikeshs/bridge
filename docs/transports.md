@@ -107,26 +107,40 @@ send-key). `SendKey` shares Deliver's ack discipline.
 - **2a**: daemon side — remote transport type, lease table,
   hello/attest/mail/ack handlers, smoke coverage with a scripted fake
   client (a curl loop is a valid transport client; that is the point).
-- **2b**: `bridge transport-sim` hidden test verb OR pure smoke curls —
-  prove delivery/ack/redelivery and lease-death offline transitions.
+- **2b**: folded into 2a's smoke section — the curl client proves
+  delivery/ack, guard-rides-attests, lease-death offline transition,
+  durable redelivery with identity continuity, and ack-timeout
+  redelivery. No hidden test verb needed.
 - **3**: the Emacs client (elisp): hello on magnus start, attest timer,
   drain into vterm, prompt detection from buffer tail. magnus-bridge
   becomes this package — one daemon, one PWA, N environments.
 - **4**: the Magnus crew crosses; #crew gains quick-wolf.
 
-## Open questions (for review)
+## Decisions (2026-07-06 evening — lead dev; veto anytime)
 
-1. **Lease per client or per agent?** Per client (one Emacs = one lease)
-   is simpler and matches reality; a hung *single buffer* inside a live
-   Emacs is the client's problem to attest (`ready:false` per agent).
-2. **screen_tail privacy**: it transits localhost only and feeds the same
-   card/dialog logic as capture-pane; cap at ~4KB, strip nothing (same
-   trust as tmux capture today).
-3. **Who launches remote agents?** v1: the client does (Magnus already
-   manages its own vterms); `bridge connect`-style rehoming inside Emacs
-   is the client's ceremony. The daemon only ever *reaches*, never
-   *spawns*, remote agents.
-4. **Name**: "emacs" the transport vs "remote" the mechanism — propose
-   registering the *mechanism* as `remote` with a client-supplied flavor
-   label surfaced in `/api/status`, so one implementation serves every
-   future environment.
+1. **Lease per client.** One hello = one lease covering all its agents; a
+   hung *single buffer* inside a live Emacs is the client's problem to
+   attest (`ready:false` for that agent). A stale lease is dead forever —
+   attest against it returns 410 and the client re-hellos.
+2. **screen_tail: 4KB, tail end, strip nothing.** It transits localhost
+   only and feeds the same card/dialog logic as capture-pane (same trust);
+   the clamp keeps the *bottom* of the screen, where prompts live, and
+   never splits a rune.
+3. **The client launches remote agents.** Magnus already manages its own
+   vterms; rehoming inside Emacs is the client's ceremony. The daemon only
+   ever *reaches*, never *spawns*, remote agents — reconcile's revive
+   branch is tmux-only, and a remote contact's revival IS the re-hello.
+4. **The mechanism registers as `remote`** with a client-supplied flavor
+   label ("emacs", "sim") stored on the contact and surfaced in
+   `/api/status` — one implementation serves every future environment.
+
+Two implementation rulings the doc's first draft left implicit: `Deliver`
+*blocks* on the client ack (bounded by `remote_ack_timeout_s`, default
+10s) because flushMailbox's contract is synchronous — nil means typed,
+and only a real ack may license DropMailbox (M6). And an ack timeout
+marks the lease *suspect* — Ready reads false until the next attest — so
+a half-broken client (attesting but not draining) costs one bounded
+stall, not one per tick. Identity crosses environments: a hello matching
+an OFFLINE contact by name+directory adopts it (thread, mailbox, id) and
+flips its transport; a LIVE tmux contact is never hijacked — the hello
+gets a suffixed fresh identity instead.

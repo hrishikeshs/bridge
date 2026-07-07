@@ -25,7 +25,7 @@ HDRS="$TESTDIR/pair-headers"
 mkdir -p "$HOME_DIR/.bridge"
 # require_identity:false lets curl hit /api without a Tailscale-User-Login
 # header; per-device pairing tokens are still enforced.
-printf '%s\n' '{"require_identity": false}' > "$HOME_DIR/.bridge/config.json"
+printf '%s\n' '{"require_identity": false, "remote_ttl_s": 3, "remote_ack_timeout_s": 2}' > "$HOME_DIR/.bridge/config.json"
 
 # --- plugin runtime fixtures (installed BEFORE the daemon boots) ----------
 # docs/plugins.md: discovery scans ~/.bridge/plugins/ at daemon start and lazily
@@ -119,7 +119,7 @@ if ! (cd "$ROOT" && go build -o "$BIN" .); then
 fi
 
 # --- boot the isolated daemon (its own HOME, its own port) ----------------
-HOME="$HOME_DIR" "$BIN" serve --port "$PORT" >"$LOG" 2>&1 &
+HOME="$HOME_DIR" BRIDGE_COALESCE_MS=300 "$BIN" serve --port "$PORT" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 40); do
@@ -556,6 +556,175 @@ case "$CONTACTS_BODY" in
   *'"name":"twin-2"'*) fail_msg "retired contact still on roster" ;;
   *)                   pass_msg "retired contact gone from roster" ;;
 esac
+
+# --- remote transport (docs/transports.md) --------------------------------
+# An external client (here, curl) HELLOs its agents, ATTESTs their state, and
+# DRAINs/ACKs parked deliveries — the daemon answers the five Transport
+# questions from that attested state alone, never reaching into the client.
+# config.json set remote_ttl_s:3 + remote_ack_timeout_s:2 to keep lease/ack
+# timings smoke-fast; a real client attests on a ~10s timer, so this section
+# interleaves keepalive attests to hold the compressed 3s lease fresh across the
+# mandated sleeps (single-threaded curl can't attest concurrently). Placed
+# before lockdown, which stops the daemon these checks need alive. Bodies
+# pre-defined (the JSON-in-$(...) gotcha); mail parsed with python3.
+
+# rt_field <key>: a top-level string field of a JSON object on stdin.
+rt_field() { python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get(sys.argv[1],"") or "")
+except Exception: print("")' "$1"; }
+# rt_agent0: agents[0].id of a hello response on stdin.
+rt_agent0() { python3 -c 'import json,sys
+try:
+    a=json.load(sys.stdin).get("agents",[]); print(a[0]["id"] if a else "")
+except Exception: print("")'; }
+# rt_deliv <id|text|jsonids>: first delivery id/text, or all ids as JSON array
+# elements ("a","b"), from a mail response on stdin.
+rt_deliv() { python3 -c 'import json,sys
+try: d=json.load(sys.stdin).get("deliveries",[])
+except Exception: d=[]
+k=sys.argv[1]
+if k=="jsonids": print(",".join(json.dumps(x.get("id","")) for x in d))
+elif d:         print(d[0].get(k,""))' "$1"; }
+
+RT_DIR="$TESTDIR"
+
+# hello: register sim-otter under flavor "sim". session_id is empty and the dir
+# is the temp root — the outbound tail machinery no-ops on a live contact with
+# no resolvable session file, so nothing spurious reaches the phone thread.
+RT_HELLO_BODY="{\"transport\":\"sim\",\"agents\":[{\"name\":\"sim-otter\",\"directory\":\"$RT_DIR\",\"session_id\":\"\"}]}"
+RT_HELLO=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_HELLO_BODY" $BASE/local/transport/hello)
+LEASE=$(printf '%s' "$RT_HELLO" | rt_field lease)
+RCID=$(printf '%s' "$RT_HELLO" | rt_agent0)
+if [ -n "$LEASE" ] && [ -n "$RCID" ]; then
+  pass_msg "hello issued a lease + contact id ($RCID)"
+else
+  fail_msg "hello returned no lease+id: $RT_HELLO"
+fi
+body_has "hello reports the clamped ttl"       '"ttl_s":3'                 "$RT_HELLO"
+
+# the contact is live on the remote transport, tagged with the client's flavor
+CONTACTS_BODY=$(curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts)
+body_has "sim-otter registered live"           '"name":"sim-otter"'        "$CONTACTS_BODY"
+body_has "sim-otter uses the remote transport" '"transport":"remote"'      "$CONTACTS_BODY"
+body_has "sim-otter carries the sim flavor"    '"transport_flavor":"sim"'  "$CONTACTS_BODY"
+
+RT_ATTEST_READY="{\"lease\":\"$LEASE\",\"states\":[{\"id\":\"$RCID\",\"ready\":true,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+RT_ATTEST_NOTREADY="{\"lease\":\"$LEASE\",\"states\":[{\"id\":\"$RCID\",\"ready\":false,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+
+# --- A: happy path (attested ready -> park -> drain -> ack) ----------------
+check "attest ready -> 200"                    200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_READY" $BASE/local/transport/attest)"
+RT_SEND_A="{\"agent\":\"$RCID\",\"text\":\"remote hello there\"}"
+check "phone send to sim-otter -> 200"         200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$RT_SEND_A" $BASE/api/send)"
+sleep 1
+RT_MAIL_A=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE&wait=2")
+body_has "mail carries the daemon-authored frame" '[From ' "$RT_MAIL_A"
+body_has "mail carries the sent text"             'remote hello there' "$RT_MAIL_A"
+RT_MID_A=$(printf '%s' "$RT_MAIL_A" | rt_deliv id)
+if [ -n "$RT_MID_A" ]; then
+  pass_msg "mail delivery carries an id ($RT_MID_A)"
+else
+  fail_msg "mail returned no delivery id: $RT_MAIL_A"
+fi
+RT_ACK_A="{\"lease\":\"$LEASE\",\"ids\":[\"$RT_MID_A\"]}"
+check "ack the delivery -> 200"                200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ACK_A" $BASE/local/transport/ack)"
+RT_MAIL_A2=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE&wait=1")
+body_has "acked outbox drains to empty"        '"deliveries":[]' "$RT_MAIL_A2"
+HIST_BODY=$(curl -s "${DEV_AUTH[@]}" "$BASE/api/history?since=0")
+body_has "history records the phone send"      'remote hello there' "$HIST_BODY"
+
+# --- B: the guard rides attests (not-ready never types) --------------------
+check "attest not-ready -> 200"                200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_NOTREADY" $BASE/local/transport/attest)"
+RT_SEND_B="{\"agent\":\"$RCID\",\"text\":\"held while not ready\"}"
+curl -s -o /dev/null "${DEV_AUTH[@]}" "${J[@]}" -d "$RT_SEND_B" $BASE/api/send
+sleep 1
+RT_MAIL_B=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE&wait=1")
+body_has "nothing parked while not ready"      '"deliveries":[]' "$RT_MAIL_B"
+check "attest ready again -> 200"              200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_READY" $BASE/local/transport/attest)"
+RT_MAIL_B2=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE&wait=6")
+body_has "the retry flush parks the held line" 'held while not ready' "$RT_MAIL_B2"
+RT_MID_B=$(printf '%s' "$RT_MAIL_B2" | rt_deliv id)
+RT_ACK_B="{\"lease\":\"$LEASE\",\"ids\":[\"$RT_MID_B\"]}"
+check "ack the held line -> 200"               200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ACK_B" $BASE/local/transport/ack)"
+
+# --- C: lease death + durable redelivery ----------------------------------
+# Stop attesting: the lease goes stale (ttl 3s) and sim-otter strikes offline
+# (two ~2s reconcile ticks). A send while dead is durably queued (409); a
+# re-hello under the SAME name+dir returns the SAME contact id (identity
+# survives lease death) and the queued line delivers on the revived lease.
+RT_DEAD=n
+for _ in $(seq 60); do
+  case "$(curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts | python3 -c 'import json,sys
+data=json.load(sys.stdin)
+for c in (data.get("contacts") if isinstance(data,dict) else data) or []:
+    if c.get("name")=="sim-otter": print(c.get("status",""))' 2>/dev/null)" in
+    offline) RT_DEAD=y; break ;;
+  esac
+  sleep 0.25
+done
+if [ "$RT_DEAD" = y ]; then
+  pass_msg "sim-otter struck offline after its lease went stale"
+else
+  fail_msg "sim-otter never went offline after the lease died"
+fi
+RT_SEND_C="{\"agent\":\"$RCID\",\"text\":\"while dead\"}"
+check "phone send while dead queued -> 409"    409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$RT_SEND_C" $BASE/api/send)"
+RT_HELLO2=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_HELLO_BODY" $BASE/local/transport/hello)
+LEASE2=$(printf '%s' "$RT_HELLO2" | rt_field lease)
+RCID2=$(printf '%s' "$RT_HELLO2" | rt_agent0)
+check "re-hello returns the SAME contact id"   "$RCID" "$RCID2"
+RT_ATTEST_READY2="{\"lease\":\"$LEASE2\",\"states\":[{\"id\":\"$RCID\",\"ready\":true,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+check "attest ready on the new lease -> 200"   200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_READY2" $BASE/local/transport/attest)"
+RT_MAIL_C=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE2&wait=6")
+body_has "the queued line delivers on revival" 'while dead' "$RT_MAIL_C"
+RT_MID_C=$(printf '%s' "$RT_MAIL_C" | rt_deliv id)
+RT_ACK_C="{\"lease\":\"$LEASE2\",\"ids\":[\"$RT_MID_C\"]}"
+check "ack the revived delivery -> 200"        200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ACK_C" $BASE/local/transport/ack)"
+# The offline-queued line emits its "sent" event on DELIVERY (after the ack
+# wakes the blocked flush), not at queue time — poll for the sent-later bubble.
+RT_SENT_LATER=n
+for _ in $(seq 15); do
+  case "$(curl -s "${DEV_AUTH[@]}" "$BASE/api/history?since=0")" in
+    *'while dead'*) RT_SENT_LATER=y; break ;;
+  esac
+  sleep 0.2
+done
+if [ "$RT_SENT_LATER" = y ]; then
+  pass_msg "history shows the sent-later line"
+else
+  fail_msg "history never showed the sent-later 'while dead' line"
+fi
+
+# --- D: attesting the dead lease is 410 -----------------------------------
+# The OLD lease (superseded by the re-hello) is stale and spent: attesting it
+# tells the client to re-hello rather than silently accepting a zombie.
+check "attest with the dead lease -> 410"      410 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_READY" $BASE/local/transport/attest)"
+
+# --- E: ack-timeout redelivery (durable, NEW delivery id) -----------------
+# A parked line the client never acks times out after remote_ack_timeout_s (2s):
+# the entry is dropped and the lease marked suspect, but the mailbox retains the
+# message, so the next ready attest (which clears suspect) redelivers the SAME
+# TEXT under a NEW id. A keepalive attest mid-wait holds the 3s lease fresh while
+# the ack timeout fires.
+check "attest ready before probe -> 200"       200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_READY2" $BASE/local/transport/attest)"
+RT_SEND_E="{\"agent\":\"$RCID\",\"text\":\"timeout probe\"}"
+curl -s -o /dev/null "${DEV_AUTH[@]}" "${J[@]}" -d "$RT_SEND_E" $BASE/api/send
+sleep 1
+curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_READY2" $BASE/local/transport/attest  # keepalive
+RT_MAIL_E1=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE2&wait=2")
+body_has "the probe parks once"                'timeout probe' "$RT_MAIL_E1"
+RT_MID_E1=$(printf '%s' "$RT_MAIL_E1" | rt_deliv id)
+sleep 2   # past the 2s ack timeout: Deliver gives up, drops the entry, mailbox retains
+check "attest ready clears suspect -> 200"     200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_READY2" $BASE/local/transport/attest)"
+RT_MAIL_E2=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE2&wait=6")
+body_has "the probe is redelivered"            'timeout probe' "$RT_MAIL_E2"
+RT_MID_E2=$(printf '%s' "$RT_MAIL_E2" | rt_deliv id)
+if [ -n "$RT_MID_E2" ] && [ "$RT_MID_E2" != "$RT_MID_E1" ]; then
+  pass_msg "redelivery carries a NEW delivery id ($RT_MID_E1 -> $RT_MID_E2)"
+else
+  fail_msg "redelivery id not fresh (e1='$RT_MID_E1' e2='$RT_MID_E2')"
+fi
+RT_ACK_E="{\"lease\":\"$LEASE2\",\"ids\":[$(printf '%s' "$RT_MAIL_E2" | rt_deliv jsonids)]}"
+check "ack all redelivered ids -> 200"         200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ACK_E" $BASE/local/transport/ack)"
 
 # --- lockdown (LAST: it stops the daemon) ---------------------------------
 check "lockdown -> 200"                    200 "$(code "${LOCAL_AUTH[@]}" -X POST $BASE/local/lockdown)"

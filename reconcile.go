@@ -55,6 +55,15 @@ func startSessionManager() {
 					Emit("attention-clear", c.ID, c.Name, "")
 					clearAttnPush(c.ID, c.Name)
 				case c.Status != "live" && alive:
+					// Remote revival is hello's job, not the reconcile loop's:
+					// this branch is tmux-shaped (it migrates a legacy
+					// name-based target to a window id) and cannot legitimately
+					// fire for a remote contact — a stale lease is never alive.
+					// Guard anyway, belt-and-braces, so a remote row can never be
+					// sent through Connect() and blank-slated back onto tmux.
+					if c.Transport != "" && c.Transport != defaultTransport {
+						break
+					}
 					// Its window outlived a daemon restart: revive it so a
 					// restart never orphans a running agent. Migrate a legacy
 					// name-based target to the grammar-immune window id here.

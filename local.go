@@ -67,6 +67,14 @@ func handleLocal(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"code": issuePairingCode()})
 	case r.Method == http.MethodPost && r.URL.Path == "/local/retire":
 		handleLocalRetire(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/hello":
+		handleTransportHello(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/attest":
+		handleTransportAttest(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/local/transport/mail":
+		handleTransportMail(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/ack":
+		handleTransportAck(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/local/lockdown":
 		revokeAllDevices()
 		audit("lockdown", "revoke-all + shutdown", "local")

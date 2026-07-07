@@ -29,6 +29,12 @@ type Contact struct {
 	// the field existed migrates by doing nothing.
 	Transport string `json:"transport,omitempty"`
 
+	// TransportFlavor is the remote client's self-reported environment label
+	// ("emacs", "sim") — surfaced in /api/status so the phone can tell where an
+	// agent actually lives. "remote" is the MECHANISM (Transport); the flavor is
+	// the ENVIRONMENT riding it. Empty for tmux agents.
+	TransportFlavor string `json:"transport_flavor,omitempty"`
+
 	// Away is the agent's self-set AIM-style status line ("brb, compiling"),
 	// set by `bridge status` and shown beside its name on the phone. Empty when
 	// none. It is durable, agent-authored metadata — unlike Health (a live
@@ -228,6 +234,12 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 		r.contacts[c.ID] = c
 	} else {
 		c.Name = final
+		// Connect IS the tmux path: a contact that had been living on the remote
+		// transport and now reconnects via tmux must flip back, or it would keep
+		// Transport="remote" atop a fresh TmuxTarget and never deliver — the remote
+		// transport keys liveness off a lease this tmux reconnect has no part in.
+		c.Transport = ""
+		c.TransportFlavor = ""
 	}
 	if final != name {
 		reason = "suffixed"
@@ -237,6 +249,72 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 	c.Status = "live"
 	c.Health = "ok"
 	c.PromptOpen = false
+	r.save()
+	dispatchPluginEvent("agent.connect", c, map[string]any{"reason": reason})
+	return c.copy()
+}
+
+// ConnectRemote registers or revives a contact hosted by a remote client
+// (docs/transports.md) — the remote analogue of Connect. It shares Connect's
+// name+directory identity key and all its sanitization, but flips the contact
+// onto the remote transport and records the client's flavor label. The one rule
+// Connect never needs: a LIVE tmux contact under this name+directory is NEVER
+// adopted here — a hello that collides with a running tmux agent mints a fresh
+// suffixed identity (marvin-2) rather than hijacking the pane. Returns a copy.
+func (r *Registry) ConnectRemote(name, directory, sessionID, flavor string) *Contact {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var c *Contact
+	for _, existing := range r.contacts {
+		if existing.Name == name && existing.Directory == directory {
+			c = existing
+			break
+		}
+	}
+	// (a) A live tmux agent must not be hijacked by a remote hello: drop the
+	// match so the suffix loop below mints a NEW contact. (b) A live REMOTE match
+	// is the same client re-hello'ing — adopt it (keep the id, refresh the
+	// session). (c) An offline match of either transport is adopted and rehomed
+	// onto remote below (identity, thread and mailbox survive). (d) No match at
+	// all mints a new contact.
+	if c != nil && c.Status == "live" && c.Transport != "remote" {
+		c = nil
+	}
+	if c == nil {
+		// Sanitize a NEW registration at the choke point, exactly as Connect does:
+		// a numeric/relative name is a tmux target-grammar hazard even for a
+		// contact that starts life on the remote transport, because it may later
+		// rehome to tmux and /api addressing must stay unambiguous.
+		if !nameConnectRe.MatchString(name) {
+			name = generateName(r.liveNames())
+		}
+	}
+	// Unique among the living, the same suffix ladder Connect uses.
+	final := name
+	for n := 2; r.liveNameTaken(final, c); n++ {
+		final = fmt.Sprintf("%s-%d", name, n)
+	}
+	reason := "revive"
+	if c == nil {
+		reason = "hello"
+		c = &Contact{ID: newID(), Name: final, Directory: directory}
+		r.contacts[c.ID] = c
+	} else {
+		c.Name = final
+	}
+	if final != name {
+		reason = "suffixed"
+	}
+	c.SessionID = sessionID
+	c.Status = "live"
+	c.Health = "ok"
+	c.PromptOpen = false
+	// Rehome onto the remote transport: a formerly-tmux offline row flips here
+	// (keeping its id, thread and mailbox), and TmuxTarget is cleared so a stale
+	// window id can never route (tmuxAlive is false on "").
+	c.Transport = "remote"
+	c.TransportFlavor = flavor
+	c.TmuxTarget = ""
 	r.save()
 	dispatchPluginEvent("agent.connect", c, map[string]any{"reason": reason})
 	return c.copy()

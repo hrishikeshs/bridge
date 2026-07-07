@@ -105,6 +105,16 @@ type bridgeConfig struct {
 	// Unset means the default (7); a negative value disables the scheduled
 	// edition — `bridge paper` still prints one on demand.
 	PaperHour *int `json:"paper_hour"`
+	// RemoteTTLs is the freshness window (seconds) for a remote client's lease
+	// (docs/transports.md): a lease not re-attested within it reads as dead and
+	// its agents go offline through the normal two-strike path. Unset means the
+	// default (30); floored at 2s in remoteTTL().
+	RemoteTTLs *int `json:"remote_ttl_s"`
+	// RemoteAckTimeoutS is how long (seconds) a delivery to a remote agent blocks
+	// waiting for the client to ack the parked line before it is redelivered via
+	// the mailbox. Unset means the default (10); floored at 1s. Kept well under
+	// the 90s reconcile watchdog so a blocking flush never trips it.
+	RemoteAckTimeoutS *int `json:"remote_ack_timeout_s"`
 }
 
 // authConfig holds the loaded policy; secure defaults apply until loadConfig runs.
