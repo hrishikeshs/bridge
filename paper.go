@@ -86,7 +86,10 @@ func paperDue(now time.Time) bool {
 // double-tap replaces rather than stacks.
 func publishPaper(now time.Time) {
 	since := paper.LastUnix
-	if since == 0 {
+	if paper.Edition == 0 {
+		// The first edition EVER covers the last full day — not the seconds
+		// since paperDue stamped the fresh press's epoch at boot (that stamp
+		// exists to stop a boot-time edition, not to blank the first one).
 		since = now.Add(-24 * time.Hour).Unix()
 	}
 	paper.Edition++
