@@ -34,6 +34,10 @@ schedule by local time. The same list at golden hour:</i></sub>
   <img src="assets/screen-day.jpg" width="32%" alt="The same buddy list at golden hour — warm daylight palette, the Golden Gate in full sun through the rows">
 </p>
 
+<p align="center">
+  <img src="assets/screen-herald.jpg" width="32%" alt="The Bridge Herald">
+</p>
+
 ## How it works
 
 ```
