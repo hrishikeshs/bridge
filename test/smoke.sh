@@ -119,7 +119,10 @@ if ! (cd "$ROOT" && go build -o "$BIN" .); then
 fi
 
 # --- boot the isolated daemon (its own HOME, its own port) ----------------
-HOME="$HOME_DIR" BRIDGE_COALESCE_MS=300 "$BIN" serve --port "$PORT" >"$LOG" 2>&1 &
+# BRIDGE_FANOUT_STAGGER_MS=150: a tiny per-recipient stagger step so the fan-out
+# section below can watch a #crew message spread across live members fast (prod
+# defaults to 2500ms). It only affects the multi-recipient paths; 1:1 is untouched.
+HOME="$HOME_DIR" BRIDGE_COALESCE_MS=300 BRIDGE_FANOUT_STAGGER_MS=150 "$BIN" serve --port "$PORT" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 40); do
@@ -866,6 +869,95 @@ if [ "$RT_CLEARED" = y ]; then
   pass_msg "verifyPrompt cleared the card (prompt_open false again)"
 else
   fail_msg "the card never cleared after clean attests"
+fi
+
+# --- fan-out stagger: the thundering-herd fix (429 defence) ----------------
+# A #crew message and a plugin nudge storm are the two paths that deliver ONE
+# event to MANY live agents at once — N Claude processes then continue their turn
+# and hit the API in the same instant, the burst that drew the server-side 429s.
+# The daemon now STAGGERS those fan-outs: live recipient k's in-memory delivery
+# timer is armed at min(k*step,max)+jitter (step = BRIDGE_FANOUT_STAGGER_MS = 150ms
+# at boot, so the spread is observable fast). Two invariants under test:
+#   (a) NOTHING DROPPED — every live crew member still receives the message. The
+#       stagger delays only the in-memory timer; the durable mailbox is the buffer,
+#       so a fan-out to N live agents always reaches all N.
+#   (b) 1:1 UNCHANGED — a direct phone->agent send never routes through the fan-out
+#       path, so it delivers on the ordinary coalesce window, no added latency.
+# Live agents are simulated on the remote/sim transport (a smoke daemon's only
+# "live"), reusing the rt_* helpers above. Fresh contacts + leases, so this stands
+# apart from the section above. Placed before lockdown, which stops the daemon.
+
+# rt_agents: every agents[].id from a hello response on stdin, one per line.
+rt_agents() { python3 -c 'import json,sys
+try: a=json.load(sys.stdin).get("agents",[])
+except Exception: a=[]
+print("\n".join(x.get("id","") for x in a))'; }
+
+# hello THREE fresh sim agents on one lease — a simulated live crew.
+FO_HELLO_BODY="{\"transport\":\"sim\",\"agents\":[{\"name\":\"crew-ant\",\"directory\":\"$RT_DIR/fa\",\"session_id\":\"\"},{\"name\":\"crew-bee\",\"directory\":\"$RT_DIR/fb\",\"session_id\":\"\"},{\"name\":\"crew-cat\",\"directory\":\"$RT_DIR/fc\",\"session_id\":\"\"}]}"
+FO_HELLO=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$FO_HELLO_BODY" $BASE/local/transport/hello)
+FO_LEASE=$(printf '%s' "$FO_HELLO" | rt_field lease)
+FO_IDS=$(printf '%s' "$FO_HELLO" | rt_agents)
+check "fan-out hello registered 3 live agents" 3 "$(printf '%s\n' "$FO_IDS" | grep -c .)"
+
+# attest all three ready on the lease (build the states array with python3).
+FO_ATTEST=$(FO_L="$FO_LEASE" FO_I="$FO_IDS" python3 -c 'import json,os
+ids=[x for x in os.environ["FO_I"].split("\n") if x]
+print(json.dumps({"lease":os.environ["FO_L"],"states":[{"id":i,"ready":True,"prompt_open":False,"screen_tail":""} for i in ids]}))')
+check "attest 3 fan-out agents ready -> 200"   200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$FO_ATTEST" $BASE/local/transport/attest)"
+
+# Phone -> #crew: fans out to the whole roster; the 3 live members get staggered
+# delivery, everyone offline gets a durable queue. Accepts 200 (round-2 rule).
+FO_TEXT="crew fanout stagger marker"
+FO_ROOM_BODY="{\"agent\":\"room:crew\",\"text\":\"$FO_TEXT\"}"
+check "phone -> #crew fan-out accepted -> 200"  200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$FO_ROOM_BODY" $BASE/api/send)"
+
+# (a) Collect: drain the shared lease outbox, record which contact ids received the
+# marker, ack them, and keepalive-attest each turn (holds the 3s lease + clears any
+# ack-timeout suspect so a redelivery still lands). Every live member must appear —
+# proof the stagger drops nothing.
+FO_SEEN="$TESTDIR/fo-seen"; : > "$FO_SEEN"
+for _ in $(seq 40); do
+  curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$FO_ATTEST" $BASE/local/transport/attest
+  FO_MAIL=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$FO_LEASE&wait=1")
+  FO_ACK=$(printf '%s' "$FO_MAIL" | FO_T="$FO_TEXT" SEEN="$FO_SEEN" python3 -c 'import json,os,sys
+try: d=json.load(sys.stdin).get("deliveries",[])
+except Exception: d=[]
+with open(os.environ["SEEN"],"a") as f:
+    for x in d:
+        if os.environ["FO_T"] in (x.get("text") or ""): f.write((x.get("contact") or "")+"\n")
+print(",".join(json.dumps(x.get("id","")) for x in d if x.get("id")))')
+  [ -n "$FO_ACK" ] && curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "{\"lease\":\"$FO_LEASE\",\"ids\":[$FO_ACK]}" $BASE/local/transport/ack
+  [ "$(sort -u "$FO_SEEN" | grep -c .)" -ge 3 ] && break
+done
+check "every live crew member received the fan-out (nothing dropped)" 3 "$(sort -u "$FO_SEEN" | grep -c .)"
+
+# (b) A 1:1 phone->agent send is NOT staggered — it rides plain holdInbound (the
+# unchanged path) and delivers on the ordinary coalesce window. Fresh agent+lease,
+# registered AFTER the fan-out above so it was never a member of it.
+FO_SOLO_BODY="{\"transport\":\"sim\",\"agents\":[{\"name\":\"solo-elk\",\"directory\":\"$RT_DIR/solo\",\"session_id\":\"\"}]}"
+FO_SOLO=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$FO_SOLO_BODY" $BASE/local/transport/hello)
+FO_SLEASE=$(printf '%s' "$FO_SOLO" | rt_field lease)
+FO_SID=$(printf '%s' "$FO_SOLO" | rt_agent0)
+FO_SATTEST="{\"lease\":\"$FO_SLEASE\",\"states\":[{\"id\":\"$FO_SID\",\"ready\":true,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$FO_SATTEST" $BASE/local/transport/attest
+FO_11_BODY="{\"agent\":\"$FO_SID\",\"text\":\"one to one direct\"}"
+check "1:1 phone send accepted -> 200"          200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$FO_11_BODY" $BASE/api/send)"
+FO_11_OK=n
+for _ in $(seq 20); do
+  curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$FO_SATTEST" $BASE/local/transport/attest
+  FO_11_MAIL=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$FO_SLEASE&wait=1")
+  case "$FO_11_MAIL" in
+    *'one to one direct'*)
+      FO_11_MID=$(printf '%s' "$FO_11_MAIL" | rt_deliv id)
+      curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "{\"lease\":\"$FO_SLEASE\",\"ids\":[\"$FO_11_MID\"]}" $BASE/local/transport/ack
+      FO_11_OK=y; break ;;
+  esac
+done
+if [ "$FO_11_OK" = y ]; then
+  pass_msg "1:1 send delivered on the unchanged path (never staggered)"
+else
+  fail_msg "1:1 send never delivered on the unchanged path"
 fi
 
 # --- lockdown (LAST: it stops the daemon) ---------------------------------

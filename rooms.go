@@ -62,16 +62,22 @@ func roomList() []roomInfo {
 // " in #crew"), so the body never carries the room fragment.
 func fanoutRoom(from, via, text, skipID string) bool {
 	anyLive := false
+	liveIndex := 0 // counts LIVE recipients only — the stagger index (thundering-herd fix)
 	for _, c := range registry.Roster() {
 		if c.ID == skipID {
 			continue
 		}
 		m := MailMessage{From: from, Via: via, Text: text, TS: nowUTC(), Room: roomCrewName, Emitted: true}
 		if c.Status == "live" {
-			holdInbound(c, m)
+			// Spread live members' delivery timers so the crew's N Claude processes
+			// don't all continue their turn (and hit the API) at one instant — the
+			// server-side 429 the room fan-out caused live. Offset 0 == feature off
+			// == plain holdInbound, so this is a clean superset of the old behavior.
+			holdInboundStaggered(c, m, fanoutOffset(liveIndex))
+			liveIndex++
 			anyLive = true
 		} else {
-			registry.Queue(c.ID, m)
+			registry.Queue(c.ID, m) // offline: durable, delivered on revival — no herd
 		}
 	}
 	return anyLive
