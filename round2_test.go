@@ -300,3 +300,26 @@ func TestPrintableLine(t *testing.T) {
 		}
 	}
 }
+
+// The transport registry: legacy rows default to tmux, unknown names resolve
+// to the fail-safe null transport (never alive, never ready, delivery errors
+// — mail waits durably instead of typing anywhere on a guess).
+func TestTransportFor(t *testing.T) {
+	if _, ok := transportFor(&Contact{}).(tmuxTransport); !ok {
+		t.Error("empty Transport must default to tmux (legacy rows)")
+	}
+	if _, ok := transportFor(&Contact{Transport: "tmux"}).(tmuxTransport); !ok {
+		t.Error("explicit tmux must resolve to tmuxTransport")
+	}
+	nt := transportFor(&Contact{Transport: "hologram"})
+	if _, ok := nt.(nullTransport); !ok {
+		t.Fatal("unknown transport must resolve to nullTransport")
+	}
+	c := &Contact{Transport: "hologram"}
+	if nt.Alive(c) || nt.Ready(c) || nt.Capture(c) != "" {
+		t.Error("null transport must fail safe on every read")
+	}
+	if nt.Deliver(c, "hi") == nil || nt.SendKey(c, "1") == nil {
+		t.Error("null transport must refuse every action")
+	}
+}

@@ -147,10 +147,10 @@ func handleLocalEvent(w http.ResponseWriter, r *http.Request) {
 // The dialog may still be painting when the hook fires, so the capture retries
 // briefly until it looks like a prompt rather than grabbing a stale frame.
 func applyHookEvent(c *Contact) {
-	snapshot := capturePrompt(c)
+	snapshot := transportFor(c).Capture(c)
 	for i := 0; i < 5 && !looksLikePrompt(snapshot); i++ {
 		time.Sleep(150 * time.Millisecond)
-		snapshot = capturePrompt(c)
+		snapshot = transportFor(c).Capture(c)
 	}
 	if looksLikePrompt(snapshot) {
 		registry.SetPrompt(c.ID, true)

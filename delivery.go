@@ -1,9 +1,10 @@
 package main
 
-// delivery.go — how words reach a pane: the session-adapter seams tmux.go
-// fills in, send dedup by client_id, the provenance frame (and its H9
-// neutralizer), and flushMailbox — the one path every message takes, guarded
-// so nothing types into a bare shell or an open permission dialog.
+// delivery.go — how words reach an agent: send dedup by client_id, the
+// provenance frame (and its H9 neutralizer), and flushMailbox — the one path
+// every message takes, guarded so nothing types into a bare shell or an open
+// permission dialog. The physical typing itself goes through the contact's
+// Transport (transport.go); tmux is simply the first one.
 
 import (
 	"errors"
@@ -13,26 +14,9 @@ import (
 	"unicode"
 )
 
-// errSessionAdapter is returned by the session-adapter stubs until tmux.go
-// wires the real tmux implementation.
+// errSessionAdapter is returned when a contact's transport is unknown or not
+// loaded (nullTransport) — mail waits durably rather than guessing.
 var errSessionAdapter = errors.New("session adapter not loaded")
-
-// deliverToSession injects a message into a live contact's managed tmux session
-// (send-keys, literal, followed by Enter). tmux.go assigns the real
-// implementation at startup; until then the stub reports no adapter is loaded.
-var deliverToSession = func(c *Contact, text string) error { return errSessionAdapter }
-
-// capturePrompt returns a single tmux capture-pane snapshot of a contact's
-// terminal, used to render a permission card. tmux.go assigns the real
-// implementation; the stub returns the empty string.
-var capturePrompt = func(c *Contact) string { return "" }
-
-// sendKey delivers one whitelisted approval keystroke to a live contact:
-// "1"/"2"/"3"/"y"/"n" answered with Enter, or "esc" as a bare Escape. It is
-// separate from deliverToSession because approvals carry no sender prefix and
-// "esc" takes no Enter. tmux.go assigns the real implementation; the stub
-// reports no adapter is loaded.
-var sendKey = func(c *Contact, key string) error { return errSessionAdapter }
 
 // approveKeys is the closed set of keystrokes the approve endpoint will deliver.
 var approveKeys = map[string]bool{"1": true, "2": true, "3": true, "y": true, "n": true, "esc": true}
@@ -209,7 +193,7 @@ func flushMailbox(c *Contact) {
 		// Leave everything queued and re-arm; the reconcile loop retries every
 		// tick and coalesceRearm covers the fast path — the mailbox is durable,
 		// so a deferral is never a loss.
-		if !paneReadyForDelivery(c) {
+		if !transportFor(c).Ready(c) {
 			coalesceRearm(c.ID)
 			return
 		}
@@ -225,7 +209,7 @@ func flushMailbox(c *Contact) {
 			// key (PeekMailboxGroup), so every message in this run shares it.
 			text = formatInbound(group[0].From, group[0].Via, group[0].Room, text)
 		}
-		if err := deliverToSession(c, text); err != nil {
+		if err := transportFor(c).Deliver(c, text); err != nil {
 			return // leave the group (and the rest) queued for the next flush
 		}
 		for _, m := range group {

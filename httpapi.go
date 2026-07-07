@@ -421,7 +421,7 @@ func handleInterrupt(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
 		return
 	}
-	if err := sendKey(c, "esc"); err != nil {
+	if err := transportFor(c).SendKey(c, "esc"); err != nil {
 		audit("interrupt-failed", err.Error(), id)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -464,7 +464,7 @@ func handleApprove(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not-waiting"})
 		return
 	}
-	if err := sendKey(c, req.Key); err != nil {
+	if err := transportFor(c).SendKey(c, req.Key); err != nil {
 		audit("approve-failed", err.Error(), id)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

@@ -34,7 +34,7 @@ func startSessionManager() {
 			}
 			roster := registry.Roster()
 			for _, c := range roster {
-				alive := c.TmuxTarget != "" && tmuxAlive(c.TmuxTarget)
+				alive := transportFor(c).Alive(c)
 				if alive {
 					delete(aliveStrikes, c.ID)
 				}
@@ -72,7 +72,7 @@ func startSessionManager() {
 					// prompt is re-surfaced (card + push) instead of silently
 					// cleared — and so flushMailbox refuses to type into it
 					// (review 2026-07-06, criticals C2/C4).
-					if snap := tmuxCapturePane(revived); looksLikePrompt(snap) {
+					if snap := transportFor(revived).Capture(revived); looksLikePrompt(snap) {
 						registry.SetPrompt(revived.ID, true)
 						Emit("attention", revived.ID, revived.Name, snap)
 						notifyPush(revived.Name+" needs you", firstPromptLine(snap), "attn-"+revived.ID, revived.ID)
@@ -140,7 +140,7 @@ func verifyPrompt(c *Contact) {
 		delete(promptStrikes, c.ID)
 		return
 	}
-	if looksLikePrompt(capturePrompt(c)) {
+	if looksLikePrompt(transportFor(c).Capture(c)) {
 		delete(promptStrikes, c.ID)
 		return
 	}

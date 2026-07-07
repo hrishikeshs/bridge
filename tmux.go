@@ -11,14 +11,19 @@ import (
 	"strings"
 )
 
-// init wires the daemon's three session seams to the real tmux operations.
-// In a CLI process (connect/send/hook) these assignments are harmless: the
-// daemon never runs there, so the seams are never called.
-func init() {
-	deliverToSession = tmuxDeliver
-	capturePrompt = tmuxCapturePane
-	sendKey = tmuxSendKey
-}
+// tmuxTransport is the original mechanism: agents living in daemon-managed
+// tmux windows. It satisfies Transport (transport.go) by wrapping the free
+// functions below — registered at init, harmless in CLI processes where the
+// daemon (the only caller) never runs.
+type tmuxTransport struct{}
+
+func init() { registerTransport("tmux", tmuxTransport{}) }
+
+func (tmuxTransport) Alive(c *Contact) bool                 { return c.TmuxTarget != "" && tmuxAlive(c.TmuxTarget) }
+func (tmuxTransport) Ready(c *Contact) bool                 { return paneReadyForDelivery(c) }
+func (tmuxTransport) Deliver(c *Contact, text string) error { return tmuxDeliver(c, text) }
+func (tmuxTransport) Capture(c *Contact) string             { return tmuxCapturePane(c) }
+func (tmuxTransport) SendKey(c *Contact, key string) error  { return tmuxSendKey(c, key) }
 
 func tmux(args ...string) (string, error) {
 	var out bytes.Buffer

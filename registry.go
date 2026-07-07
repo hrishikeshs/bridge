@@ -24,6 +24,11 @@ type Contact struct {
 	PromptOpen  bool   `json:"prompt_open"`  // a permission prompt is hook-attested open
 	PromptSince int64  `json:"prompt_since"` // unix seconds the current prompt opened; 0 when none (drives frozen-agent escalation)
 
+	// Transport names the mechanism that physically reaches this agent
+	// (transport.go). Empty means "tmux" — every roster row registered before
+	// the field existed migrates by doing nothing.
+	Transport string `json:"transport,omitempty"`
+
 	// Away is the agent's self-set AIM-style status line ("brb, compiling"),
 	// set by `bridge status` and shown beside its name on the phone. Empty when
 	// none. It is durable, agent-authored metadata — unlike Health (a live
