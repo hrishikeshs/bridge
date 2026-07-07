@@ -220,3 +220,24 @@ func TestRoomMailboxGrouping(t *testing.T) {
 		t.Fatalf("same-room group = %d messages, want 2 coalesced", len(g3))
 	}
 }
+
+// The party-line cooldown: between human messages each agent speaks at most
+// once, so an agent-only exchange is bounded at one post per member — the
+// rule the crew converged on the room's first night.
+func TestRoomCooldown(t *testing.T) {
+	const room = "room:test-cooldown"
+	roomHumanSpoke(room) // clean slate
+	if !roomAgentMaySpeak(room, "agent-a") {
+		t.Fatal("first post should be allowed")
+	}
+	if roomAgentMaySpeak(room, "agent-a") {
+		t.Error("second consecutive post by the same agent must be refused")
+	}
+	if !roomAgentMaySpeak(room, "agent-b") {
+		t.Error("a different agent still has its own slot")
+	}
+	roomHumanSpoke(room)
+	if !roomAgentMaySpeak(room, "agent-a") {
+		t.Error("a human message must reopen the room for everyone")
+	}
+}

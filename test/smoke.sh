@@ -419,6 +419,18 @@ check "room send unknown sender -> 400"       400 "$(code "${J[@]}" "${LOCAL_AUT
 check "approve on the room rejected -> 400"   400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$ROOM_APPROVE_BODY" $BASE/api/approve)"
 check "interrupt on the room rejected -> 409" 409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$ROOM_INTERRUPT_BODY" $BASE/api/interrupt)"
 
+# --- room cooldown (the crew's own rule, 2026-07-06) ------------------------
+# Between human messages each agent speaks at most once. The agent send above
+# consumed the smoke contact's slot for the current human turn, so a second
+# post is refused 429 with a readable detail; a phone message reopens the room
+# and the agent may speak again.
+check "second agent post same turn -> 429"    429 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$ROOM_LOCAL_BODY" $BASE/local/send)"
+COOLDOWN_RESP=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$ROOM_LOCAL_BODY" $BASE/local/send)
+body_has "cooldown refusal carries a detail line" '"detail":"party-line cooldown' "$COOLDOWN_RESP"
+ROOM_REOPEN_BODY='{"agent":"room:crew","text":"human speaks, room reopens"}'
+check "phone message reopens the room -> 200" 200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$ROOM_REOPEN_BODY" $BASE/api/send)"
+check "agent may speak again after human -> 200" 200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$ROOM_LOCAL_BODY" $BASE/local/send)"
+
 # --- web push -------------------------------------------------------------
 check "push key -> 200"                    200 "$(code "${DEV_AUTH[@]}" $BASE/api/push/key)"
 PUSH_KEY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/push/key | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')

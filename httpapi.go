@@ -272,6 +272,7 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		fanoutRoom(authConfig.UserMention, "phone", deliverText, "")
 		releaseClientID(req.ClientID, true) // durably queued to every member: a retry is a safe duplicate ack
 		audit("send-room", req.Text, id)
+		roomHumanSpoke(req.Agent) // a human message reopens every agent's speaking slot
 		// Exactly one event carries the room message — the ORIGINAL text plus the
 		// structured quote fields (like a 1:1 "sent"), keyed to the room id so the
 		// phone folds it into the #crew thread. The fan-out mail is all

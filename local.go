@@ -296,6 +296,17 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 	// above. A durably-queued fan-out IS success, so queued:true is the only
 	// signal when every other member is offline.
 	if isRoomTarget(req.To) {
+		// The crew's cooldown rule (rooms.go): one post per agent per human
+		// turn. Refused sends are audited and carry a detail line the CLI
+		// prints, so the agent understands the room, not the daemon, is closed.
+		if !roomAgentMaySpeak(roomCrewID, senderID) {
+			audit("room-cooldown", senderName, "local")
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{
+				"error":  "cooldown",
+				"detail": "party-line cooldown: you've spoken since the last human message — #crew reopens when a human speaks",
+			})
+			return
+		}
 		anyLive := fanoutRoom(senderName, "bridge", req.Text, senderID)
 		audit("switchboard-room", senderName+": "+req.Text, "local")
 		Emit("peer", roomCrewID, senderName, req.Text)

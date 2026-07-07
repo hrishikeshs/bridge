@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -241,6 +242,21 @@ func daemonRequest(method, path string, body, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// Surface the daemon's own explanation when it sent one — a refusal
+		// like the room cooldown carries a human-readable detail line the
+		// calling agent should read, not just a bare status code.
+		var e struct {
+			Error  string `json:"error"`
+			Detail string `json:"detail"`
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if json.Unmarshal(body, &e) == nil {
+			if msg := e.Detail; msg != "" {
+				return fmt.Errorf("daemon returned %s: %s", resp.Status, msg)
+			} else if e.Error != "" {
+				return fmt.Errorf("daemon returned %s: %s", resp.Status, e.Error)
+			}
+		}
 		return fmt.Errorf("daemon returned %s", resp.Status)
 	}
 	if out != nil {

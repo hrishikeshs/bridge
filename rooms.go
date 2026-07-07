@@ -8,7 +8,10 @@ package main
 // it, which is what keeps the pane-keyed endpoints (approve/interrupt/react)
 // refusing it by construction.
 
-import "strings"
+import (
+	"strings"
+	"sync"
+)
 
 const (
 	// roomCrewID is the thread/event key for the one built-in party line. It is
@@ -72,4 +75,47 @@ func fanoutRoom(from, via, text, skipID string) bool {
 		}
 	}
 	return anyLive
+}
+
+// ---------------------------------------------------------------------------
+// Room cooldown — the crew's own rule, minted in #crew the night the room
+// demonstrated the problem live (eight agent messages in two minutes).
+// Proposed by Marvin ("no agent posts twice in a row without a human message
+// in between"), seconded by Ludwig, ordered by Hrishi ("👍 cooldown loop
+// please", 2026-07-06). Between human messages, each agent may speak in a
+// room AT MOST ONCE: any agent-only exchange is bounded at one post per
+// member, so the obligation spiral is structurally impossible rather than
+// merely impolite. State is in-memory by design — a daemon restart hands
+// everyone one fresh slot, which is harmless.
+// ---------------------------------------------------------------------------
+
+var (
+	roomCooldownMu  sync.Mutex
+	spokeSinceHuman = map[string]map[string]bool{} // room id -> contact id -> spoke this turn
+)
+
+// roomHumanSpoke resets a room's cooldown: a human message opens one new
+// speaking slot for every agent.
+func roomHumanSpoke(room string) {
+	roomCooldownMu.Lock()
+	delete(spokeSinceHuman, room)
+	roomCooldownMu.Unlock()
+}
+
+// roomAgentMaySpeak consumes an agent's speaking slot for the current human
+// turn. False means it already spoke — the send is refused until the next
+// human message reopens the room.
+func roomAgentMaySpeak(room, contact string) bool {
+	roomCooldownMu.Lock()
+	defer roomCooldownMu.Unlock()
+	m := spokeSinceHuman[room]
+	if m == nil {
+		m = map[string]bool{}
+		spokeSinceHuman[room] = m
+	}
+	if m[contact] {
+		return false
+	}
+	m[contact] = true
+	return true
 }
