@@ -1,9 +1,22 @@
 /* bridge — phone client.
-   Talks to the daemon over REST + Server-Sent Events. */
+   Talks to the daemon over REST + Server-Sent Events.
+
+   This file is the native-ESM entry (index.html loads it with
+   <script type="module">) AND the shared core. The peeled feature modules
+   imported just below pull the helpers/state they need ($, state, api, …) back
+   out of this core, and this core calls their entry points in turn. No build
+   step ships: the browser loads app.js and each ./*.js import as plain
+   same-origin files (see test/pwa/harness.js for how the tests bundle them). */
 
 'use strict';
 
-const $ = (id) => document.getElementById(id);
+// Peeled feature modules (round 1 of the ES-module split). Behaviour unchanged;
+// they import shared helpers/state from this core, and this core calls back into
+// them (a benign ESM cycle — every call is deferred to runtime, never eval-time).
+import { armScreensaver, wakeScreensaver, isMomentEvent, initScreensaver } from './screensaver.js';
+import { renderContextGauge } from './context-gauge.js';
+
+export const $ = (id) => document.getElementById(id);   // exported: shared by the feature modules
 
 /* ---------- theme ----------
    Every colour is a CSS custom property; three [data-theme] palettes live in
@@ -59,7 +72,7 @@ applyTheme(currentTheme());
 const WALLPAPERS = ['airy', 'whisper', 'off'];
 const WALLPAPER_NAMES = { airy: 'Bridge · airy veil', whisper: 'Bridge · whisper veil', off: 'Off' };
 
-function currentWallpaper() {
+export function currentWallpaper() {   // exported: screensaver.js reads it for eligibility
   const w = localStorage.getItem('wallpaper');
   return WALLPAPERS.includes(w) ? w : 'airy';
 }
@@ -161,7 +174,9 @@ const REACTIONS = ['👍', '❤️', '😂', '🎉', '👀', '🚀'];
 // (perf round, 2026-07-06).
 const FEED_WINDOW = 60;
 
-const state = {
+// Exported: the peeled feature modules read live app state through this object
+// (screensaver: state.view; context-gauge: state.contacts/selected/view).
+export const state = {
   contacts: [],          // roster from /api/status
   rooms: [],             // shared threads from /api/status (v1: just #crew)
   events: [],            // chronological event list
@@ -199,7 +214,7 @@ loadPending();
    "room:" id namespace, so every helper keyed on a string id (unreadCount,
    newestMessage, lastActivityMs, the lastSeen cursor) just works, while the
    contact-shaped lookups (health, presence, panes) are guarded to skip it. */
-function isRoomId(id) { return typeof id === 'string' && id.startsWith('room:'); }
+export function isRoomId(id) { return typeof id === 'string' && id.startsWith('room:'); }   // exported: context-gauge.js
 function roomById(id) { return state.rooms.find((r) => r.id === id) || null; }
 
 // A thread target is legitimate if it's a known contact OR a known room. A
@@ -211,7 +226,7 @@ function isValidTarget(id) {
 
 // Display name for a thread id — a contact's name or a room's ("#crew"). Used
 // wherever contactName() alone would return undefined for a room.
-function threadName(id) {
+export function threadName(id) {   // exported: context-gauge.js
   if (isRoomId(id)) { const r = roomById(id); return (r && r.name) || '#crew'; }
   return contactName(id);
 }
@@ -300,14 +315,7 @@ async function init() {
     });
     window.addEventListener('online', () => { connectEvents(); flushOutbox(); });
     window.addEventListener('offline', () => setConnected(false));
-    // #19(b): idle detection for the screensaver. Pointer/key events are
-    // non-passive so a waking tap can be swallowed (dismiss only); scroll-class
-    // events are passive (just re-arm) to keep scrolling smooth. All capture so
-    // they still fire while the dimmed list is pointer-events:none.
-    ['touchstart', 'pointerdown', 'mousedown', 'keydown'].forEach(
-      (t) => document.addEventListener(t, onUserActivity, { capture: true }));
-    ['scroll', 'touchmove', 'wheel', 'mousemove'].forEach(
-      (t) => document.addEventListener(t, onUserActivity, { capture: true, passive: true }));
+    initScreensaver();   // #19(b): wire the document-level idle detection (see ./screensaver.js)
   }
   clearDeliveredNotifications();
   updatePushButton();          // iOS only prompts on a tap, so offer a button
@@ -783,60 +791,9 @@ $('stop-btn').addEventListener('click', async () => {
 });
 
 /* ---------- feature #19(b): idle screensaver ----------
-   After IDLE_SCREENSAVER_MS of no interaction on the list, the list UI fades
-   down to reveal the full scenery (Golden Gate under the drifting marine-layer
-   fog, on its existing CSS animation). Any touch / scroll / key, a return to
-   the foreground, or an incoming attention/message restores it instantly.
-   Only the list view carries scenery, and only with a wallpaper set, so the
-   idle timer arms there alone — a thread (words over solid ground) never dims.
-   The class rides on <html>; the CSS fades #list-view and drops its pointer
-   events, and onUserActivity swallows the waking gesture so the first tap only
-   dismisses (it never also taps a row underneath). */
-const IDLE_SCREENSAVER_MS = 45000;
-let screensaverTimer = null;
-
-function screensaverEligible() {
-  return state.view === 'list' && currentWallpaper() !== 'off' && !document.hidden;
-}
-
-function armScreensaver() {
-  clearTimeout(screensaverTimer);
-  if (!screensaverEligible()) return;
-  screensaverTimer = setTimeout(engageScreensaver, IDLE_SCREENSAVER_MS);
-}
-
-function engageScreensaver() {
-  if (!screensaverEligible()) return;   // re-check: view/wallpaper may have changed
-  document.documentElement.classList.add('screensaver');
-}
-
-// Restore the UI (if dimmed) and restart the idle countdown. Safe to call from
-// anywhere — on a thread it just clears the timer (ineligible).
-function wakeScreensaver() {
-  document.documentElement.classList.remove('screensaver');
-  armScreensaver();
-}
-
-function onUserActivity(e) {
-  if (document.documentElement.classList.contains('screensaver')) {
-    document.documentElement.classList.remove('screensaver');
-    // Swallow the waking gesture: it only dismisses the screensaver, it must
-    // not also activate whatever sits under the finger. Only the pointer/key
-    // listeners are non-passive, so only they can (and do) preventDefault.
-    const swallow = e.type === 'touchstart' || e.type === 'pointerdown' ||
-                    e.type === 'mousedown' || e.type === 'keydown';
-    if (swallow && e.cancelable) { e.preventDefault(); e.stopPropagation(); }
-  }
-  armScreensaver();
-}
-
-// A "moment" worth waking for: a new attention card or an inbound message.
-// Heartbeats, typing, status and reactions never wake the screensaver.
-function isMomentEvent(event) {
-  return event.type === 'attention' || event.type === 'reply' ||
-         event.type === 'mention' || event.type === 'peer' || event.type === 'paper';
-}
-/* ---------- end #19(b) ---------- */
+   Peeled into ./screensaver.js (imported at the top of this file). This core
+   calls armScreensaver / wakeScreensaver / isMomentEvent / initScreensaver; the
+   module reads state.view + currentWallpaper() to decide eligibility. */
 
 /* ---------- settings sheet ---------- */
 
@@ -1294,7 +1251,7 @@ function plainPreview(text) {
     .trim();
 }
 
-function updateThreadHeader() {
+export function updateThreadHeader() {   // exported: context-gauge.js doCompact() re-renders through it
   // A room has no presence, health, or pane: fixed header "#crew · everyone",
   // and no interrupt button (there is nothing to Escape).
   if (isRoomId(state.selected)) {
@@ -1329,189 +1286,10 @@ function threadStatusText(contact) {
 }
 
 /* ── context gauge ───────────────────────────────────────────────────────────
-   The agent's context-window usage, shown in the thread header UNDER the
-   "vint · live · <status>" line, as a bar that IS a button. It appears only at
-   ≥70% (below that: no bar, no noise), fills to the actual %, and ramps
-   amber(--attn)→red(--danger) toward 100. It is tappable ONLY when the agent is
-   idle — health "ok" is the one idle state; working / prompt / offline render it
-   greyed and inert (you compact an agent who has put its pen down, not one
-   mid-thought). A tap opens a confirm sheet; only on confirm does it POST
-   /api/compact {agent:id} — never a typed command. Contract: /api/status may
-   carry contact.context_pct (int 0-100, omitted when unknown); the daemon
-   re-derives it after a compact, so the bar simply drops on the next poll.
-
-   All per-contact fields (health, away, context_pct, …) ride on the raw contact
-   objects assigned in refreshStatus/init — nothing to store separately. */
-
-// One-time capability check: color-mix lets the fill blend the theme's own
-// --attn/--danger so every palette stays native. Where it's absent, fall back
-// to solid amber (still palette-native, just no ramp).
-const CTX_COLOR_MIX = !!(window.CSS && CSS.supports &&
-  CSS.supports('background', 'color-mix(in srgb, red 50%, blue)'));
-
-// contact id -> ms until which an in-flight compact keeps the bar in its brief
-// "compacting…" state. Cleared when it expires or the next poll drops the bar.
-const compactState = new Map();
-const COMPACT_GRACE_MS = 30000;   // one status-poll cycle: a hard ceiling on "compacting…"
-
-let compactTarget = null;         // contact id the open confirm sheet acts on
-let ctxToastTimer = null;
-
-// Validate context_pct off a contact per the contract: an int 0-100, or null
-// when the field is absent / not a number (unknown / sessionless → no bar).
-function contextPct(contact) {
-  if (!contact) return null;
-  const v = contact.context_pct;
-  if (typeof v !== 'number' || !isFinite(v)) return null;
-  return Math.max(0, Math.min(100, Math.round(v)));
-}
-
-// Render (or remove) the header gauge for the selected contact. Called from
-// updateThreadHeader, so it re-runs on thread-open, every SSE frame, and every
-// status poll — the % moves and the enabled-state flips with health, live.
-function renderContextGauge(contact) {
-  const host = document.querySelector('.thread-header .thread-id');
-  if (!host) return;
-  let gauge = $('ctx-gauge');
-  const pct = contextPct(contact);
-  // No bar for rooms, unknown %, or anything below 70 — silence is the default.
-  if (!contact || isRoomId(contact.id) || pct === null || pct < 70) {
-    if (gauge) gauge.remove();
-    return;
-  }
-  const id = contact.id;
-  let busy = compactState.get(id) || 0;
-  if (busy && busy <= Date.now()) { compactState.delete(id); busy = 0; }
-  // health === "ok" is the ONLY idle state → the only time a compact is allowed.
-  const enabled = contact.health === 'ok' && contact.status !== 'offline' && !busy;
-
-  if (!gauge) {
-    gauge = document.createElement('button');
-    gauge.id = 'ctx-gauge';
-    gauge.className = 'ctx-gauge';
-    gauge.type = 'button';
-    const track = document.createElement('span');
-    track.className = 'ctx-gauge-track';
-    const fill = document.createElement('span');
-    fill.className = 'ctx-gauge-fill';
-    track.appendChild(fill);
-    const label = document.createElement('span');
-    label.className = 'ctx-gauge-label';
-    gauge.appendChild(track);
-    gauge.appendChild(label);
-    gauge.addEventListener('click', onGaugeTap);
-    host.appendChild(gauge);
-  }
-  const fill = gauge.querySelector('.ctx-gauge-fill');
-  const label = gauge.querySelector('.ctx-gauge-label');
-  fill.style.width = pct + '%';
-  // Amber at 70 → red toward 100: 0% danger at 70, 100% danger at 100. CSSOM
-  // writes are CSP-allowed (like avatarColor). var() resolves per active theme.
-  const mix = Math.max(0, Math.min(100, Math.round((pct - 70) / 30 * 100)));
-  fill.style.background = CTX_COLOR_MIX
-    ? 'color-mix(in srgb, var(--danger) ' + mix + '%, var(--attn))'
-    : 'var(--attn)';
-  label.textContent = busy ? 'compacting…' : (pct + '%');
-  gauge.classList.toggle('ctx-busy', !!busy);
-  gauge.disabled = !enabled;                       // a disabled button ignores taps
-  gauge.setAttribute('aria-disabled', enabled ? 'false' : 'true');
-  gauge.setAttribute('aria-label', busy
-    ? ('compacting ' + (contact.name || threadName(id)) + '’s context')
-    : ('context ' + pct + '% full' + (enabled ? ' — tap to compact' : '')));
-}
-
-// A tap on the bar. Disabled buttons don't fire click, but re-check the idle
-// gate defensively (the roster can flip between render and tap).
-function onGaugeTap() {
-  const c = state.contacts.find((x) => x.id === state.selected);
-  if (!c) return;
-  const pct = contextPct(c);
-  if (pct === null || pct < 70) return;
-  if (c.health !== 'ok' || c.status === 'offline') return;   // idle-only
-  if ((compactState.get(c.id) || 0) > Date.now()) return;    // already compacting
-  openCompactConfirm(c);
-}
-
-// Build the confirm sheet + toast once (index.html is not ours to edit). The
-// sheet reuses the settings-sheet chrome so it matches the app exactly.
-function ensureCompactUI() {
-  if ($('ctx-confirm')) return;
-  const root = $('app') || document.body;
-
-  const sheet = document.createElement('div');
-  sheet.id = 'ctx-confirm';
-  sheet.className = 'sheet hidden';
-  sheet.innerHTML =
-    '<div class="sheet-backdrop" id="ctx-confirm-backdrop"></div>' +
-    '<div class="sheet-panel ctx-confirm-panel">' +
-      '<div class="sheet-grip"></div>' +
-      '<div class="sheet-title">Compact context</div>' +
-      '<p class="ctx-confirm-msg" id="ctx-confirm-msg"></p>' +
-      '<div class="ctx-confirm-actions">' +
-        '<button type="button" class="ctx-btn primary" id="ctx-confirm-ok">Compact</button>' +
-        '<button type="button" class="ctx-btn" id="ctx-confirm-cancel">Cancel</button>' +
-      '</div>' +
-    '</div>';
-  root.appendChild(sheet);
-  $('ctx-confirm-backdrop').addEventListener('click', closeCompactConfirm);
-  $('ctx-confirm-cancel').addEventListener('click', closeCompactConfirm);
-  $('ctx-confirm-ok').addEventListener('click', () => doCompact(compactTarget));
-
-  const toast = document.createElement('div');
-  toast.id = 'ctx-toast';
-  toast.className = 'ctx-toast hidden';
-  root.appendChild(toast);
-}
-
-function openCompactConfirm(contact) {
-  ensureCompactUI();
-  compactTarget = contact.id;
-  const name = contact.name || threadName(contact.id) || 'this agent';
-  $('ctx-confirm-msg').textContent =
-    'Compact ' + name + '’s context? This summarizes the conversation so far to free up room.';
-  $('ctx-confirm').classList.remove('hidden');
-}
-
-function closeCompactConfirm() {
-  const el = $('ctx-confirm');
-  if (el) el.classList.add('hidden');
-  compactTarget = null;
-}
-
-// Confirmed: POST /api/compact (same device auth as every other /api/* POST via
-// api()). Show a brief optimistic "compacting…" state; on 200 the next poll
-// drops the bar; on 409/400/failure undo it and say so gently (never loudly).
-async function doCompact(id) {
-  closeCompactConfirm();
-  if (!id) return;
-  compactState.set(id, Date.now() + COMPACT_GRACE_MS);
-  if (state.view === 'thread') updateThreadHeader();
-  const res = await api('/api/compact', { agent: id });
-  const name = threadName(id) || 'the agent';
-  if (res && res.ok) return;                    // 200 {ok:true}: poll clears the bar
-  compactState.delete(id);                      // undo the optimistic state
-  if (state.view === 'thread') updateThreadHeader();
-  if (res && res.status === 409) {
-    showCompactToast(name + ' is working — try again in a moment');
-  } else if (res && res.status === 400) {
-    showCompactToast(name + ' is offline — try again in a moment');
-  } else {
-    showCompactToast('Couldn’t reach ' + name + ' — try again in a moment');
-  }
-}
-
-function showCompactToast(text) {
-  ensureCompactUI();
-  const el = $('ctx-toast');
-  if (!el) return;
-  el.textContent = text;
-  el.classList.remove('hidden');
-  clearTimeout(ctxToastTimer);
-  ctxToastTimer = setTimeout(() => el.classList.add('hidden'), 3200);
-}
-
-// Esc closes the confirm sheet (mirrors the action-sheet's dismissal).
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeCompactConfirm(); });
+   Peeled into ./context-gauge.js (imported at the top of this file). This core
+   calls renderContextGauge from updateThreadHeader; the module imports
+   $, state, isRoomId, threadName, api and updateThreadHeader back from here to
+   render the bar and run the compact confirm/POST flow. */
 /* ── end context gauge ─────────────────────────────────────────────────────*/
 
 // Total unread across contacts → app-icon badge (where supported) + a
@@ -2552,7 +2330,7 @@ $('quote-chip-remove').addEventListener('click', () => { state.quote = null; ren
 /* Every POST is bounded by a 10s timeout: a hung request aborts and returns
    null (a failed send, retryable). Returns the Response otherwise so callers
    can read res.ok / res.status. */
-async function api(path, payload) {
+export async function api(path, payload) {   // exported: context-gauge.js POSTs /api/compact through it
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
   try {

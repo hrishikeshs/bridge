@@ -33,27 +33,48 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM } = require('jsdom');
+const esbuild = require('esbuild'); // TEST-ONLY: bundles the module graph for jsdom (see SPLIT SEAM 2/2)
 
 const PWA_DIR = path.resolve(__dirname, '..', '..', 'pwa');
 const INDEX_HTML = path.join(PWA_DIR, 'index.html');
 
 // ⤵⤵⤵ SPLIT SEAM (1 of 2): the app entry the harness loads.
+// app.js is the native-ESM entry AND the shared core: index.html loads it with
+// <script type="module">, and it `import`s the peeled feature modules
+// (./screensaver.js, ./context-gauge.js), which in turn import shared helpers
+// back from it. esbuild follows this graph from APP_ENTRY at test time.
 const APP_ENTRY = path.join(PWA_DIR, 'app.js');
 // ⤴⤴⤴
 
 // ⤵⤵⤵ SPLIT SEAM (2 of 2): how that entry is put into the page.
-// Today app.js is one plain classic script, so we read it and inject it as a
-// <script> — exactly how index.html loads it in production, minus the network.
-// After the split, if the entry is an ES module with `import`s, jsdom can't
-// resolve the graph from disk on its own; the smallest reliable change is to
-// bundle at TEST time (e.g. esbuild buildSync → iife) and inject the bundle
-// string here. That keeps the SHIPPED app build-free (bundling happens only in
-// the test process) and keeps this the only line that changes.
+// The SHIPPED app is build-free native ES modules: the browser loads
+// `<script type="module" src="/app.js">` and resolves each `import './x.js'` as
+// a plain same-origin file over the network. jsdom, however, cannot resolve that
+// `import` graph from disk off a <script type=module src>. So for the TEST load
+// ONLY we bundle the graph with esbuild (buildSync → one classic IIFE, in-memory
+// via write:false, never touching disk) and inject that string as a classic
+// <script>. This keeps the shipped app build-free — esbuild runs only in this
+// test process and pwa/*.js never imports it — while handing jsdom a single
+// synchronous script, exactly as before the split. The bundle is memoised: the
+// module graph is static within a run, so we build it at most once per process.
+let _bundleCache = null;
+function bundleApp() {
+  if (_bundleCache === null) {
+    const out = esbuild.buildSync({
+      entryPoints: [APP_ENTRY],
+      bundle: true,
+      format: 'iife',
+      charset: 'utf8', // keep emoji / em-dashes / curly quotes verbatim in the injected source
+      write: false,
+    });
+    _bundleCache = out.outputFiles[0].text;
+  }
+  return _bundleCache;
+}
 function injectApp(win) {
-  const src = fs.readFileSync(APP_ENTRY, 'utf8');
   const script = win.document.createElement('script');
-  script.textContent = src;
-  win.document.body.appendChild(script); // classic scripts run synchronously here
+  script.textContent = bundleApp();
+  win.document.body.appendChild(script); // the IIFE bundle runs synchronously here
 }
 // ⤴⤴⤴
 
