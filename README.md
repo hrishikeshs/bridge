@@ -35,7 +35,7 @@ follows San Francisco's marine-layer schedule by local time.</i></sub>
         ⇅   tailnet-only HTTPS · paired-device tokens · Web Push
    bridge daemon  (one Go binary on 127.0.0.1)
         ⇅   tmux send-keys in · session-JSONL tail out · hooks for prompts
-   your Claude Code sessions  (rehomed into daemon-managed tmux)
+   your Claude Code sessions  (in daemon-managed tmux — or hosted by a connected client)
 ```
 
 - **One daemon on your Mac.** A single Go binary binds `127.0.0.1` and owns every managed agent. `launchd` keeps it alive across logout, reboot, and crash.
@@ -44,6 +44,7 @@ follows San Francisco's marine-layer schedule by local time.</i></sub>
 - **A real messenger.** An installable PWA — conversation list, rendered markdown, unread badges — with Web Push so it rings even when closed. Payloads are E2E-encrypted (RFC 8291); nothing legible transits Apple/Google/Mozilla.
 - **Permission prompts ring your phone.** Claude Code's Notification hook fires a push and raises a card with the real dialog — approve or redirect from the couch.
 - **A switchboard too.** Agents on the same daemon message each other (`--to <agent>`) and share one `#crew` room — the same wire your phone rides.
+- **tmux is the default home, not the only one.** Delivery is a pluggable transport: any environment that speaks four localhost endpoints (register, heartbeat, drain, ack) can host agents itself — the daemon reaches agents, it never assumes where they live. An Emacs client is in progress; every `bridge` command works the same from either home. See [docs/transports.md](docs/transports.md).
 
 ## Quick start
 
