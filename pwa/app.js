@@ -295,10 +295,19 @@ async function init() {
         // Returning to the foreground on an open thread clears its unread.
         if (state.view === 'thread' && state.selected) markSeen(state.selected);
         renderList();
+        wakeScreensaver();   // #19(b): come back to a lit UI, re-arm the timer
       }
     });
     window.addEventListener('online', () => { connectEvents(); flushOutbox(); });
     window.addEventListener('offline', () => setConnected(false));
+    // #19(b): idle detection for the screensaver. Pointer/key events are
+    // non-passive so a waking tap can be swallowed (dismiss only); scroll-class
+    // events are passive (just re-arm) to keep scrolling smooth. All capture so
+    // they still fire while the dimmed list is pointer-events:none.
+    ['touchstart', 'pointerdown', 'mousedown', 'keydown'].forEach(
+      (t) => document.addEventListener(t, onUserActivity, { capture: true }));
+    ['scroll', 'touchmove', 'wheel', 'mousemove'].forEach(
+      (t) => document.addEventListener(t, onUserActivity, { capture: true, passive: true }));
   }
   clearDeliveredNotifications();
   updatePushButton();          // iOS only prompts on a tap, so offer a button
@@ -500,6 +509,9 @@ function connectEvents() {
     if (state.view === 'thread') updateThreadHeader();
     updateAttentionBanner();
     maybeNotify(event);
+    // #19(b): a new attention card or message must never be eaten by the
+    // screensaver — wake the UI (also re-arms the idle countdown).
+    if (added && isMomentEvent(event)) wakeScreensaver();
   };
 }
 
@@ -668,6 +680,7 @@ function showList() {
   $('thread-view').classList.add('hidden');
   renderList();
   updateAttentionBanner();   // hidden on the list — rows carry the signal
+  armScreensaver();          // #19(b): the list is the only view with scenery
 }
 
 function openThread(id) {
@@ -695,6 +708,7 @@ function openThread(id) {
   restoreDraft();
   state.quote = null;   // a quote is a reply to THIS thread; don't carry it across
   renderQuoteChip();
+  wakeScreensaver();    // #19(b): a thread has no scenery — cancel the idle timer
 }
 
 /* iMessage behavior: opening the app clears its pile from Notification
@@ -767,6 +781,62 @@ $('stop-btn').addEventListener('click', async () => {
   await api('/api/interrupt', { agent: state.selected });
   btn.disabled = false;
 });
+
+/* ---------- feature #19(b): idle screensaver ----------
+   After IDLE_SCREENSAVER_MS of no interaction on the list, the list UI fades
+   down to reveal the full scenery (Golden Gate under the drifting marine-layer
+   fog, on its existing CSS animation). Any touch / scroll / key, a return to
+   the foreground, or an incoming attention/message restores it instantly.
+   Only the list view carries scenery, and only with a wallpaper set, so the
+   idle timer arms there alone — a thread (words over solid ground) never dims.
+   The class rides on <html>; the CSS fades #list-view and drops its pointer
+   events, and onUserActivity swallows the waking gesture so the first tap only
+   dismisses (it never also taps a row underneath). */
+const IDLE_SCREENSAVER_MS = 45000;
+let screensaverTimer = null;
+
+function screensaverEligible() {
+  return state.view === 'list' && currentWallpaper() !== 'off' && !document.hidden;
+}
+
+function armScreensaver() {
+  clearTimeout(screensaverTimer);
+  if (!screensaverEligible()) return;
+  screensaverTimer = setTimeout(engageScreensaver, IDLE_SCREENSAVER_MS);
+}
+
+function engageScreensaver() {
+  if (!screensaverEligible()) return;   // re-check: view/wallpaper may have changed
+  document.documentElement.classList.add('screensaver');
+}
+
+// Restore the UI (if dimmed) and restart the idle countdown. Safe to call from
+// anywhere — on a thread it just clears the timer (ineligible).
+function wakeScreensaver() {
+  document.documentElement.classList.remove('screensaver');
+  armScreensaver();
+}
+
+function onUserActivity(e) {
+  if (document.documentElement.classList.contains('screensaver')) {
+    document.documentElement.classList.remove('screensaver');
+    // Swallow the waking gesture: it only dismisses the screensaver, it must
+    // not also activate whatever sits under the finger. Only the pointer/key
+    // listeners are non-passive, so only they can (and do) preventDefault.
+    const swallow = e.type === 'touchstart' || e.type === 'pointerdown' ||
+                    e.type === 'mousedown' || e.type === 'keydown';
+    if (swallow && e.cancelable) { e.preventDefault(); e.stopPropagation(); }
+  }
+  armScreensaver();
+}
+
+// A "moment" worth waking for: a new attention card or an inbound message.
+// Heartbeats, typing, status and reactions never wake the screensaver.
+function isMomentEvent(event) {
+  return event.type === 'attention' || event.type === 'reply' ||
+         event.type === 'mention' || event.type === 'peer' || event.type === 'paper';
+}
+/* ---------- end #19(b) ---------- */
 
 /* ---------- settings sheet ---------- */
 
@@ -1072,14 +1142,24 @@ function makeRow(contact) {
 
   const top = document.createElement('span');
   top.className = 'row-top';
+  // ── feature #18: transport badge ──────────────────────────────────────────
+  // Name + an optional transport-flavor tag share one flex line, so the badge
+  // hugs the name while the timestamp still floats to the right edge. tmux
+  // contacts report no flavor and get no badge (see transportBadge).
+  const nameLine = document.createElement('span');
+  nameLine.className = 'name-line';
   const name = document.createElement('span');
   name.className = 'row-name';
   name.textContent = contact.name || 'contact';
+  nameLine.appendChild(name);
+  const badge = transportBadge(contact);
+  if (badge) nameLine.appendChild(badge);
+  // ── end #18 ───────────────────────────────────────────────────────────────
   const time = document.createElement('span');
   time.className = 'row-time';
   const ms = lastActivityMs(contact);
   time.textContent = ms ? listTime(ms) : '';
-  top.appendChild(name);
+  top.appendChild(nameLine);
   top.appendChild(time);
 
   main.appendChild(top);
@@ -1112,6 +1192,22 @@ function makeRow(contact) {
   main.appendChild(bottom);
   row.appendChild(main);
   return row;
+}
+
+/* ── feature #18: transport badge ──────────────────────────────────────────
+   A small, secondary tag after a contact's name naming its client-hosted
+   transport ("emacs" / "magnus" / …). The daemon sends contact.transport
+   ("remote") and contact.transport_flavor on /api/status (httpapi.go); a tmux
+   contact reports no flavor, so it gets nothing. Rooms build their own row
+   (makeRoomRow) and never call this. Palette-native and quieter than the name
+   or the presence dot, by design. */
+function transportBadge(contact) {
+  const flavor = contact && contact.transport_flavor;
+  if (!flavor) return null;
+  const badge = document.createElement('span');
+  badge.className = 'transport-badge';
+  badge.textContent = flavor;
+  return badge;
 }
 
 // Monogram + a deterministic colour derived from the name — stable across
@@ -1755,7 +1851,10 @@ function resolveAttentions(events) {
       if (open) res.set(open.id, { kind: 'cleared', ts: e.ts });   // superseded
       open = e;
     } else if (e.type === 'approved') {
-      if (open) { res.set(open.id, { kind: 'approved', ts: e.ts }); open = null; }
+      // #17: keep the answered key (the 'approved' event's text — "1"/"3"/"esc",
+      // per Emit in httpapi.go) so the collapsed card can show what was tapped
+      // when re-expanded. Additive field; existing consumers ignore it.
+      if (open) { res.set(open.id, { kind: 'approved', ts: e.ts, key: e.text }); open = null; }
     } else if (e.type === 'attention-clear') {
       if (open) { res.set(open.id, { kind: 'cleared', ts: e.ts }); open = null; }
     }
@@ -1794,6 +1893,8 @@ function attentionCard(event, resolution) {
       ? '✓ Approved from phone' : '✓ Resolved';
     done.textContent = resolution.ts ? label + ' · ' + localTime(resolution.ts) : label;
     el.appendChild(done);
+    // #17: make the collapsed card tap-to-expand (read-only history).
+    makeResolvedExpandable(el, event, resolution);
   } else {
     el.appendChild(who((event.name || '?') + ' needs your attention'));
     el.appendChild(promptExcerpt(event.text));
@@ -1801,6 +1902,67 @@ function attentionCard(event, resolution) {
   }
   return el;
 }
+
+/* ── feature #17: re-expand a resolved prompt ───────────────────────────────
+   Turn the collapsed (already-resolved) card into a tap-to-expand chip: tapping
+   reveals the original prompt snapshot (the 'attention' event's own text) and
+   what was answered (the key from the 'approved' event, mapped back to its
+   option label where possible), then tapping again re-collapses. Read-only —
+   no re-approving. A resolved card carries no interactive children, so a single
+   click handler on the whole card is unambiguous; the collapse/resolve
+   machinery in attentionCard/resolveAttentions is left exactly as it was. */
+function makeResolvedExpandable(card, event, resolution) {
+  const detail = document.createElement('div');
+  detail.className = 'attn-detail hidden';
+
+  const snap = document.createElement('pre');
+  snap.className = 'attn-detail-prompt';
+  snap.textContent = event.text || '(no prompt text captured)';
+  detail.appendChild(snap);
+
+  const answer = document.createElement('div');
+  answer.className = 'attn-detail-answer';
+  answer.textContent = resolutionAnswer(event, resolution);
+  detail.appendChild(answer);
+  card.appendChild(detail);
+
+  const hint = document.createElement('div');
+  hint.className = 'attn-expand-hint';
+  hint.textContent = 'tap to see details';
+  card.appendChild(hint);
+
+  card.classList.add('expandable');
+  card.setAttribute('role', 'button');
+  card.setAttribute('tabindex', '0');
+  card.setAttribute('aria-expanded', 'false');
+  const toggle = () => {
+    const open = !detail.classList.toggle('hidden');   // toggle returns true when re-hidden
+    card.setAttribute('aria-expanded', open ? 'true' : 'false');
+    hint.textContent = open ? 'tap to hide' : 'tap to see details';
+  };
+  card.addEventListener('click', toggle);
+  card.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+  });
+}
+
+// The human-readable "what was answered" line for a re-expanded card. An
+// approved digit is mapped back to its option's full label when the snapshot
+// still parses (so "3" reads "3. No, and tell Claude…"); 'esc' reads as a
+// dismissal; a desk-answered / timed-out resolution carries no key.
+function resolutionAnswer(event, resolution) {
+  if (resolution.kind === 'approved') {
+    const key = resolution.key;
+    if (key === 'esc') return 'You dismissed this (Esc)';
+    if (key) {
+      const opt = promptOptions(event.text).find((o) => o.key === key);
+      return 'You answered: ' + (opt ? opt.label : key);
+    }
+    return 'Answered from phone';
+  }
+  return 'Resolved at the desk, or it timed out';
+}
+/* ── end #17 ────────────────────────────────────────────────────────────────*/
 
 function promptExcerpt(text) {
   const pre = document.createElement('pre');
@@ -1825,53 +1987,60 @@ function promptExcerpt(text) {
   return pre;
 }
 
-/* Parse numbered options like "❯ 1. Yes" out of the prompt so buttons
-   carry labels instead of bare digits. */
+/* ── feature #16: labelled, stacked approval buttons ────────────────────────
+   Parse the dialog's own numbered options out of the captured snapshot
+   (protocol.md §5) and keep the FULL option text, not just the digit. Each
+   option becomes { key, label, deny }:
+     key   — the bare digit the dialog expects, sent verbatim to /api/approve
+             (layout/labels change here; the key on the wire never does)
+     label — the whole option line, digit and all ("2. No, and tell Claude
+             what to do differently"), so the phone button reads like the TUI
+     deny  — a "No…" choice: styled distinctly and wired to the guidance flow
+   Fallback when nothing parses: the canonical 1=Yes / 3=No pair, matching the
+   daemon's 1/3/esc contract (approveKeys always adds the esc button). */
 function promptOptions(text) {
   const options = [];
   for (const line of (text || '').split('\n')) {
     const m = line.match(/^\s*(?:❯\s*)?([123])\.\s*(.+?)\s*$/);
-    if (m) options.push({ key: m[1], label: normalizeOption(m[2]) });
+    if (m) {
+      const body = m[2].trim();
+      options.push({ key: m[1], label: m[1] + '. ' + body, deny: /^no\b/i.test(body) });
+    }
   }
   return options.length ? options : [
-    { key: '1', label: 'Yes' }, { key: '3', label: 'No' }];
+    { key: '1', label: '1. Yes', deny: false },
+    { key: '3', label: '3. No', deny: true }];
 }
 
-// Claude Code phrases its dialog options verbosely ("Yes, and don't ask
-// again this session", "No, and tell Claude what to do differently…").
-// On a phone card they normalize to the canonical trio; anything that
-// doesn't match stays as (truncated) dialog text, so unusual dialogs keep
-// their real choices. The tapped KEY is always the dialog's own number.
-function normalizeOption(label) {
-  if (/don'?t ask|always/i.test(label)) return 'Always';
-  if (/^yes/i.test(label)) return 'Yes';
-  if (/^no/i.test(label)) return 'No';
-  return label.slice(0, 28);
-}
-
+// The live card's buttons: one full-width button per option, stacked
+// vertically and labelled with the dialog's real text. Affirmative choices are
+// primary; the deny option and the Esc/dismiss button carry secondary/danger
+// styling so they never read as the default tap. The key each sends is
+// unchanged — only the label and the layout do.
 function approveKeys(event) {
   const keys = document.createElement('div');
   keys.className = 'keys';
   for (const opt of promptOptions(event.text)) {
     const btn = document.createElement('button');
+    btn.className = 'key-opt' + (opt.deny ? ' deny' : '');
     btn.textContent = opt.label;
     btn.onclick = () => {
       approve(event.agent, opt.key);
-      // "No" in Claude Code means "no — and tell me what to do instead":
-      // the agent opens a guidance input, and the next phone message lands
-      // straight in it. Teach that ("chat about this") instead of leaving
-      // the user wondering what No did.
-      if (opt.label === 'No') offerGuidance(event.agent, event.name);
+      // "No" in Claude Code means "no — and tell me what to do instead": the
+      // agent opens a guidance input, and the next phone message lands straight
+      // in it. Point the composer there instead of leaving the user wondering.
+      if (opt.deny) offerGuidance(event.agent, event.name);
     };
     keys.appendChild(btn);
   }
   const esc = document.createElement('button');
-  esc.textContent = '⎋';
-  esc.className = 'esc';
+  esc.className = 'key-opt esc';
+  esc.textContent = '⎋ Esc';
   esc.onclick = () => approve(event.agent, 'esc');
   keys.appendChild(esc);
   return keys;
 }
+/* ── end #16 ────────────────────────────────────────────────────────────────*/
 
 // After a No: the agent is waiting to hear what to do differently. Point the
 // composer at that conversation and say so; the hint expires quietly.

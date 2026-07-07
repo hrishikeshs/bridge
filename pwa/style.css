@@ -400,6 +400,41 @@ header {
   white-space: nowrap;
 }
 .row-time { flex: none; font-size: 12px; color: var(--dim); }
+
+/* ── feature #18: transport badge ──────────────────────────────────────────
+   The name and its optional flavor tag ride in one flex line so the badge
+   hugs the name (the tag shrinks/ellipses before the name does); the row
+   timestamp still floats right off row-top. Reuses existing scenery/palette
+   tokens (--pill-bg / --dim / --hairline) — no new colours, and quieter than
+   the name and the presence dot. Rooms don't use .name-line, so their
+   .row-name keeps its flex:1. */
+.name-line {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.name-line .row-name { flex: 0 1 auto; }
+.transport-badge {
+  flex: none;
+  max-width: 42%;
+  padding: 0 6px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  letter-spacing: 0.2px;
+  color: var(--dim);
+  background: var(--pill-bg);
+  border: 1px solid var(--hairline);
+  border-radius: 7px;
+  text-transform: lowercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* ── end #18 ───────────────────────────────────────────────────────────────*/
+
 /* away/status one-liner from fields.status; omitted entirely when absent */
 .row-status {
   font-size: 12px;
@@ -736,20 +771,32 @@ header {
   overflow: auto;
 }
 
-.attention .keys { display: flex; gap: 8px; }
+/* ── feature #16: labelled, vertically-stacked approval buttons ─────────────
+   Each option is its own full-width row reading the dialog's real text ("2.
+   No, and tell Claude what to do differently"), wrapping if long. Affirmative
+   options are primary (neutral ground); the deny option is danger-outlined and
+   the Esc/dismiss button is quiet secondary ink, so neither reads as the
+   default tap. */
+.attention .keys { display: flex; flex-direction: column; gap: 8px; }
 
-.attention .keys button {
-  flex: 1;
-  padding: 9px 0;
-  font-size: 15px;
+.attention .keys .key-opt {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 14px;
+  line-height: 1.35;
   font-weight: 600;
+  text-align: left;
   color: var(--ink);
   background: var(--ground);
   border: 1px solid var(--hairline);
   border-radius: 10px;
 }
-.attention .keys button:active { background: var(--hairline); }
-.attention .keys .esc { flex: 0 0 44px; }
+.attention .keys .key-opt:active { background: var(--hairline); }
+/* deny ("No…") — danger-tinted text + edge, still a full-width row */
+.attention .keys .key-opt.deny { color: var(--danger); border-color: var(--danger); }
+/* Esc / dismiss — the quietest control */
+.attention .keys .key-opt.esc { color: var(--dim); }
+/* ── end #16 ────────────────────────────────────────────────────────────────*/
 
 /* resolved (collapsed) attention card — no buttons, no fade */
 .attention.resolved { border-color: var(--hairline); }
@@ -767,6 +814,36 @@ header {
   font-size: 13px;
   font-weight: 600;
 }
+
+/* ── feature #17: re-expandable resolved card ──────────────────────────────
+   The collapsed chip taps open to show the original prompt snapshot and what
+   was answered (read-only). Reuses the live card's code tokens for the prompt
+   block and --resolved for the answer line — no new colours. */
+.attention.resolved.expandable { cursor: pointer; }
+.attn-expand-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--dim);
+  opacity: 0.8;
+}
+.attn-detail { margin-top: 8px; }
+.attn-detail-prompt {
+  font: 12px/1.5 ui-monospace, "SF Mono", monospace;
+  color: var(--code-ink);
+  background: var(--code-bg);
+  white-space: pre-wrap;
+  padding: 8px 10px;
+  border-radius: 10px;
+  margin: 0 0 8px;
+  max-height: 180px;
+  overflow: auto;
+}
+.attn-detail-answer {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--resolved);
+}
+/* ── end #17 ────────────────────────────────────────────────────────────────*/
 
 /* ---- composer ---- */
 
@@ -1080,18 +1157,23 @@ footer {
    --fog-density (set hourly in app.js). Dusk darkens the veil instead of
    lightening it. Tokens live here so the whole feature is one block. */
 
-:root { --glass: rgba(255,255,255,0.90); --fog-c: 250,245,236; --veil-c: 250,245,236; --fog-density: 0.7; }
-:root[data-theme="dusk"] { --glass: rgba(29,40,54,0.90); --fog-c: 138,170,201; --veil-c: 20,27,38; }
-:root[data-theme="international-orange"] { --glass: rgba(255,255,255,0.92); --veil-c: 255,253,248; }
+/* --glass is the list-row tint. Its alpha was lowered 0.90→0.72 (int-orange
+   0.92→0.74) for feature #19(a) so the Golden Gate + fog read THROUGH the rows
+   even when the list fills the screen; dark ink over the veiled scene stays far
+   past AA. Restore the alphas here (and in the four golden phases below) to
+   revert #19(a). */
+:root { --glass: rgba(255,255,255,0.72); --fog-c: 250,245,236; --veil-c: 250,245,236; --fog-density: 0.7; }
+:root[data-theme="dusk"] { --glass: rgba(29,40,54,0.72); --fog-c: 138,170,201; --veil-c: 20,27,38; }
+:root[data-theme="international-orange"] { --glass: rgba(255,255,255,0.74); --veil-c: 255,253,248; }
 
 /* Golden-Hour drift, scenery half: the veil, fog and list-row glass take on
    each phase's light (the palette half is near the top of this file). Golden
    Hour only; tints only — fog DENSITY still follows the marine-layer schedule,
    untouched. */
-:root[data-theme="golden-hour"][data-phase="dawn"]   { --glass: rgba(252,251,253,0.90); --veil-c: 240,240,246; --fog-c: 242,242,248; }
-:root[data-theme="golden-hour"][data-phase="golden"] { --glass: rgba(255,250,240,0.90); --veil-c: 250,238,218; --fog-c: 250,236,214; }
-:root[data-theme="golden-hour"][data-phase="dusk"]   { --glass: rgba(252,250,251,0.90); --veil-c: 238,228,230; --fog-c: 234,226,232; }
-:root[data-theme="golden-hour"][data-phase="night"]  { --glass: rgba(246,242,233,0.90); --veil-c: 236,230,218; --fog-c: 232,226,214; }
+:root[data-theme="golden-hour"][data-phase="dawn"]   { --glass: rgba(252,251,253,0.72); --veil-c: 240,240,246; --fog-c: 242,242,248; }
+:root[data-theme="golden-hour"][data-phase="golden"] { --glass: rgba(255,250,240,0.72); --veil-c: 250,238,218; --fog-c: 250,236,214; }
+:root[data-theme="golden-hour"][data-phase="dusk"]   { --glass: rgba(252,250,251,0.72); --veil-c: 238,228,230; --fog-c: 234,226,232; }
+:root[data-theme="golden-hour"][data-phase="night"]  { --glass: rgba(246,242,233,0.72); --veil-c: 236,230,218; --fog-c: 232,226,214; }
 
 #scenery { display: none; }
 :root[data-wallpaper="airy"][data-view="list"],
@@ -1159,9 +1241,27 @@ footer {
 #list-view { position: relative; }
 #list-view > header, #list-view > #my-status,
 #list-view > #contact-list, #list-view > #list-empty { position: relative; }
+/* #19(a): rows wear the translucent --glass tint (alpha lowered above) so the
+   scenery reads through the whole list, not just the thinning veil below it. */
 :root[data-wallpaper="airy"] .row, :root[data-wallpaper="whisper"] .row { background: var(--glass); }
 :root[data-wallpaper="airy"]:not([data-theme="international-orange"]) .list-header,
 :root[data-wallpaper="whisper"]:not([data-theme="international-orange"]) .list-header { background: transparent; }
+
+/* ── feature #19(b): idle screensaver ──────────────────────────────────────
+   .screensaver (set on <html> by app.js after IDLE_SCREENSAVER_MS of idle)
+   fades the whole list view down to reveal the scenery behind it — the body
+   veil, the Golden Gate photo and the sibling #scenery fog, which keeps
+   drifting on its existing animation. Fading #list-view (which carries no other
+   transition) rather than its children means this can't clobber the palette-
+   drift transitions on header/rows. pointer-events drop while dimmed so the
+   waking tap only dismisses (app.js swallows it too). Only the list view is
+   ever dimmed — a thread is display:none here, and the shared conn/push banners
+   sit outside #list-view so an alert still shows over the scene. */
+:root.screensaver #list-view { opacity: 0; pointer-events: none; }
+@media (prefers-reduced-motion: no-preference) {
+  #list-view { transition: opacity 1.1s ease; }
+}
+/* ── end #19(b) ─────────────────────────────────────────────────────────────*/
 
 /* ---- inline markdown in bubbles (appendRich) ---- */
 .plain strong { font-weight: 650; }
