@@ -115,6 +115,22 @@ type bridgeConfig struct {
 	// the mailbox. Unset means the default (10); floored at 1s. Kept well under
 	// the 90s reconcile watchdog so a blocking flush never trips it.
 	RemoteAckTimeoutS *int `json:"remote_ack_timeout_s"`
+	// FanoutStaggerMs is the per-recipient step (milliseconds) the daemon spreads
+	// a multi-recipient fan-out over — a #crew room message, or a plugin nudge that
+	// prods many agents in one tick — so N agents don't all fire their next Claude
+	// API call at the same instant and trip a server-side 429 (the thundering-herd
+	// fix). The k-th LIVE recipient's in-memory delivery timer is armed at
+	// min(k*step, max)+jitter; the durable mailbox is untouched, so nothing is ever
+	// delayed off disk or dropped. Unset means the default (2500); 0 turns
+	// staggering OFF (every recipient delivered at once, the pre-fix behavior), so
+	// the fix is reversible by config. Floored at 0 in fanoutStaggerStep().
+	// BRIDGE_FANOUT_STAGGER_MS overrides it (tests set a tiny step).
+	FanoutStaggerMs *int `json:"fanout_stagger_ms"`
+	// FanoutStaggerMaxMs caps the TOTAL spread (milliseconds) so a large crew's
+	// last recipient is never delayed unboundedly: the k*step term is clamped to
+	// this before jitter. Unset means the default (20000); floored at 0 in
+	// fanoutStaggerMax().
+	FanoutStaggerMaxMs *int `json:"fanout_stagger_max_ms"`
 }
 
 // authConfig holds the loaded policy; secure defaults apply until loadConfig runs.

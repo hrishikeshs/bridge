@@ -341,8 +341,9 @@ func (p *plugin) run(env pluginEnvelope) {
 			p.name, len(actions), pluginActionCap), "plugin")
 		actions = actions[:pluginActionCap]
 	}
+	nudgeIndex := 0 // per-batch stagger index; only LIVE nudge deliveries consume one
 	for _, a := range actions {
-		applyPluginAction(p.name, a)
+		applyPluginAction(p.name, a, &nudgeIndex)
 	}
 	audit("plugin-run", fmt.Sprintf("%s %s: %d action(s)", p.name, env.Event, len(actions)), "plugin")
 }
@@ -379,8 +380,13 @@ func parsePluginActions(out []byte) []json.RawMessage {
 }
 
 // applyPluginAction executes one action from the v1 vocabulary (docs/plugins.md).
-// Every apply and every refusal is audited with the plugin's name.
-func applyPluginAction(pname string, raw json.RawMessage) {
+// Every apply and every refusal is audited with the plugin's name. nudgeIndex is
+// the caller's per-batch counter: a "nudge" delivered to a LIVE agent staggers on
+// fanoutOffset(*nudgeIndex) and bumps it, so a plugin that prods many agents in
+// one tick doesn't fire N Claude API calls at one instant (the thundering-herd
+// fix, matched to fanoutRoom). Only live nudges consume an index — offline ones
+// queue durably with no herd, and no other action touches it.
+func applyPluginAction(pname string, raw json.RawMessage, nudgeIndex *int) {
 	var a struct {
 		Action  string `json:"action"`
 		Contact string `json:"contact"`
@@ -408,7 +414,11 @@ func applyPluginAction(pname string, raw json.RawMessage) {
 		// prods the agent, it isn't a user-facing message (unchanged behavior).
 		m := MailMessage{From: "plugin:" + pname, Via: "plugin", Text: a.Text, TS: nowUTC(), Emitted: true}
 		if c.Status == "live" {
-			holdInbound(c, m)
+			// Stagger this live nudge against the others in the same batch so a
+			// storm of nudges doesn't burst the crew's API calls at one instant
+			// (offset 0 == feature off == plain holdInbound).
+			holdInboundStaggered(c, m, fanoutOffset(*nudgeIndex))
+			*nudgeIndex++
 			audit("plugin-action", pname+" nudge -> "+c.Name, "plugin")
 		} else {
 			registry.Queue(c.ID, m)
