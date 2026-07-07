@@ -382,6 +382,43 @@ check "quote-send to offline queued -> 409" 409 "$(code "${DEV_AUTH[@]}" "${J[@]
 QUOTE_DUP=$(curl -s "${DEV_AUTH[@]}" "${J[@]}" -d "$QUOTE_SEND_BODY" $BASE/api/send)
 body_has "quote-send accepted -> 200" '"duplicate":true' "$QUOTE_DUP"
 
+# --- party line (#crew room) ----------------------------------------------
+# The one built-in room fans a message out to every registered contact and
+# records exactly ONE event keyed to the room id ("room:crew"). Membership here
+# is the (offline) smoke contacts, so every fan-out is a durable mailbox queue —
+# which IS success (the round-2 rule): a phone send to the room acks 200 with no
+# live member. Bodies pre-defined (the JSON-in-$(...) gotcha).
+ROOM_SEND_BODY='{"agent":"room:crew","text":"party line hello"}'
+ROOM_LOCAL_BODY="{\"contact\":\"$CNAME\",\"text\":\"crew, standup in 5\",\"to\":\"#crew\"}"
+ROOM_BADSENDER_BODY='{"contact":"nobody-here","text":"hi","to":"#crew"}'
+ROOM_APPROVE_BODY='{"agent":"room:crew","key":"1"}'
+ROOM_INTERRUPT_BODY='{"agent":"room:crew"}'
+
+# /api/status advertises the room so the phone renders its row without hardcoding.
+STATUS_BODY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/status)
+body_has "status advertises the rooms array" '"rooms":'            "$STATUS_BODY"
+body_has "status carries the #crew room"      '"id":"room:crew","name":"#crew"' "$STATUS_BODY"
+
+# Phone -> room: 200 even with no live member, and history records one 'sent'
+# keyed to the room id (struct field order pins type before agent).
+check "phone send to #crew -> 200"            200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$ROOM_SEND_BODY" $BASE/api/send)"
+HIST_BODY=$(curl -s "${DEV_AUTH[@]}" "$BASE/api/history?since=0")
+body_has "history shows a room 'sent' event"  '"type":"sent","agent":"room:crew"' "$HIST_BODY"
+
+# Agent -> room via /local/send: the smoke contact resolves as sender, fans out
+# to the other (offline) members, and records a 'peer' keyed to the room.
+check "agent send --to #crew -> 200"          200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$ROOM_LOCAL_BODY" $BASE/local/send)"
+HIST_BODY=$(curl -s "${DEV_AUTH[@]}" "$BASE/api/history?since=0")
+body_has "history shows a room 'peer' event"  '"type":"peer","agent":"room:crew"' "$HIST_BODY"
+
+# H9 still holds on the room path: the sender must resolve to a registered
+# contact (it becomes the frame's author), so an unknown sender is a 400.
+check "room send unknown sender -> 400"       400 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$ROOM_BADSENDER_BODY" $BASE/local/send)"
+
+# A room is a fan-out thread, not a pane: approve/interrupt have nothing to key.
+check "approve on the room rejected -> 400"   400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$ROOM_APPROVE_BODY" $BASE/api/approve)"
+check "interrupt on the room rejected -> 409" 409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$ROOM_INTERRUPT_BODY" $BASE/api/interrupt)"
+
 # --- web push -------------------------------------------------------------
 check "push key -> 200"                    200 "$(code "${DEV_AUTH[@]}" $BASE/api/push/key)"
 PUSH_KEY=$(curl -s "${DEV_AUTH[@]}" $BASE/api/push/key | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')

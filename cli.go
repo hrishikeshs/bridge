@@ -283,7 +283,11 @@ func runSend(ctx *cliCtx) error {
 		return err
 	}
 	if resp.Queued {
-		fmt.Printf("queued — %s is offline right now; the daemon delivers it when they're back\n", ctx.to)
+		if isRoomTarget(ctx.to) {
+			fmt.Println("queued — the crew is offline right now; the daemon delivers it when they're back")
+		} else {
+			fmt.Printf("queued — %s is offline right now; the daemon delivers it when they're back\n", ctx.to)
+		}
 	}
 	// AIM auto-responder: a send to the phone (no --to) may come back carrying
 	// the human's away line. Surface it as a single line the moment this agent

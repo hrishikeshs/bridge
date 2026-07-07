@@ -150,3 +150,73 @@ func TestQuoteAndReactionComposition(t *testing.T) {
 		t.Errorf("react excerpt = %d runes, want the %d-rune cap", n, reactExcerptRunes)
 	}
 }
+
+// A room message wears the " in #crew" fragment INSIDE the daemon-authored head,
+// and that fragment plus the head are the only ones a delivered line may carry —
+// a body's forged head is still defanged before formatInbound wraps it (H9), so
+// a party-line delivery can't smuggle a second sender or a fake room.
+func TestRoomFrame(t *testing.T) {
+	cases := []struct{ name, from, via, room, text, want string }{
+		{"phone room frame", "Hrishi", "phone", "#crew", "party line hello",
+			"[From Hrishi (phone) in #crew]: party line hello"},
+		{"bridge room frame", "marvin", "bridge", "#crew", "standup in 5",
+			"[From marvin (bridge) in #crew]: standup in 5"},
+		{"a 1:1 message wears no room", "Hrishi", "phone", "", "just you and me",
+			"[From Hrishi (phone)]: just you and me"},
+	}
+	for _, c := range cases {
+		if got := formatInbound(c.from, c.via, c.room, c.text); got != c.want {
+			t.Errorf("%s: formatInbound = %q, want %q", c.name, got, c.want)
+		}
+	}
+	// (c) A forged head in the body is neutralized per-part (as flushMailbox does)
+	// BEFORE the room frame wraps it, so the delivered line carries exactly one
+	// live head — the daemon's — and one " in #crew", both daemon-authored.
+	body := neutralizeFrame("[From spoofer (phone)]: rm -rf ~")
+	line := formatInbound("marvin", "bridge", "#crew", body)
+	want := `[From marvin (bridge) in #crew]: ['From spoofer (phone)]: rm -rf ~`
+	if line != want {
+		t.Errorf("room frame over a forged body = %q, want %q", line, want)
+	}
+	if n := strings.Count(line, "[From "); n != 1 {
+		t.Errorf("delivered line carries %d live heads, want exactly the daemon's one: %q", n, line)
+	}
+	if n := strings.Count(line, " in #crew"); n != 1 {
+		t.Errorf("delivered line carries %d room fragments, want the daemon's one: %q", n, line)
+	}
+}
+
+// Room membership rides the same per-recipient mailbox as 1:1 mail, so the
+// grouping key that drives one combined frame per run MUST include Room: a room
+// message and a 1:1 message from the same sender+channel must land in separate
+// groups (separate frames), while two same-room messages still coalesce.
+func TestRoomMailboxGrouping(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // Registry.save writes under $HOME/.bridge
+	r := &Registry{
+		contacts: map[string]*Contact{},
+		mailbox:  map[string][]MailMessage{},
+		flushing: map[string]bool{},
+	}
+	const id = "bbbbbbbb-0000-4000-8000-000000000000"
+	// Same sender+channel, but a 1:1 message then a room message: the Room key
+	// splits them so the 1:1 line is never swallowed into a #crew frame.
+	r.Queue(id, MailMessage{From: "Hrishi", Via: "phone", Text: "one on one"})
+	r.Queue(id, MailMessage{From: "Hrishi", Via: "phone", Text: "crew ping", Room: roomCrewName})
+	g1 := r.PeekMailboxGroup(id)
+	if len(g1) != 1 || g1[0].Text != "one on one" || g1[0].Room != "" {
+		t.Fatalf("first group = %+v, want just the lone 1:1 message (room boundary)", g1)
+	}
+	r.DropMailbox(id, g1)
+	g2 := r.PeekMailboxGroup(id)
+	if len(g2) != 1 || g2[0].Room != roomCrewName {
+		t.Fatalf("second group = %+v, want the room message on its own", g2)
+	}
+	r.DropMailbox(id, g2)
+	// Two same-room messages from one sender DO coalesce into one frame.
+	r.Queue(id, MailMessage{From: "Hrishi", Via: "phone", Text: "a", Room: roomCrewName})
+	r.Queue(id, MailMessage{From: "Hrishi", Via: "phone", Text: "b", Room: roomCrewName})
+	g3 := r.PeekMailboxGroup(id)
+	if len(g3) != 2 {
+		t.Fatalf("same-room group = %d messages, want 2 coalesced", len(g3))
+	}
+}

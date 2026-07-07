@@ -54,6 +54,12 @@ type MailMessage struct {
 	Via  string `json:"via"`  // channel it arrived on ("phone" | "bridge")
 	Text string `json:"text"`
 	TS   string `json:"ts"`
+	// Room is the room this message was fanned out to ("#crew"), empty for a 1:1
+	// message. It authors the " in #crew" fragment of the delivered frame
+	// (formatInbound) and is part of the mailbox grouping key (PeekMailboxGroup),
+	// so a room message and a 1:1 message from the same sender never merge into
+	// one frame. Additive and omitempty — a pre-rooms mailbox file loads unchanged.
+	Room string `json:"room,omitempty"`
 	// Emitted marks a message whose "sent" event was already emitted at accept
 	// time (the live/coalescing path), so the flush must not emit it again.
 	Emitted bool `json:"emitted,omitempty"`
@@ -436,7 +442,10 @@ func (r *Registry) PeekMailboxGroup(id string) []MailMessage {
 	out := []MailMessage{q[0]}
 	total := len(q[0].Text)
 	for _, m := range q[1:] {
-		if m.From != q[0].From || m.Via != q[0].Via {
+		// Room joins From+Via in the same-group predicate: the frame is applied
+		// once per group from group[0], so a 1:1 message must never be swallowed
+		// into a room frame (or a room message into a 1:1 one).
+		if m.From != q[0].From || m.Via != q[0].Via || m.Room != q[0].Room {
 			break
 		}
 		if len(out) >= mailGroupMaxMsgs || total+len(m.Text) > mailGroupMaxBytes {

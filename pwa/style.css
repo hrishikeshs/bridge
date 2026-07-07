@@ -375,6 +375,13 @@ header {
 .status-dot.prompt { background: var(--attn); }
 .status-dot.offline { background: var(--dim); }
 
+/* The #crew room avatar: a neutral themed disc with the 📢 monogram. A room has
+   no name-hashed colour (makeRoomRow sets none inline) and no presence dot. */
+.room-avatar {
+  background: linear-gradient(135deg, var(--accent), var(--in-ink));
+  font-size: 22px;
+}
+
 .row-main {
   flex: 1;
   min-width: 0;

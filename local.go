@@ -289,6 +289,25 @@ func handleLocalSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Party line: `bridge send --to '#crew'` fans out to every OTHER registered
+	// contact (never echoing the sender). The room thread wears the AUTHOR — a
+	// "peer" keyed to the room id, not to any one recipient — and a closed phone
+	// rings for crew traffic, mirroring the agent->phone push in the no-to branch
+	// above. A durably-queued fan-out IS success, so queued:true is the only
+	// signal when every other member is offline.
+	if isRoomTarget(req.To) {
+		anyLive := fanoutRoom(senderName, "bridge", req.Text, senderID)
+		audit("switchboard-room", senderName+": "+req.Text, "local")
+		Emit("peer", roomCrewID, senderName, req.Text)
+		notifyPush(senderName+" in "+roomCrewName, req.Text, "msg-"+roomCrewID, roomCrewID)
+		resp := map[string]any{"ok": true}
+		if !anyLive {
+			resp["queued"] = true
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
 	target := registry.Resolve(req.To)
 	if target == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such agent"})

@@ -156,6 +156,7 @@ const REACTIONS = ['👍', '❤️', '😂', '🎉', '👀', '🚀'];
 
 const state = {
   contacts: [],          // roster from /api/status
+  rooms: [],             // shared threads from /api/status (v1: just #crew)
   events: [],            // chronological event list
   attentions: new Map(), // contact id -> latest unresolved attention event
   reactions: new Map(),  // target event id -> array of emoji (folded from 'reaction' events)
@@ -183,6 +184,29 @@ const state = {
    "queued" until a flush retries it. */
 loadPending();
 
+/* ---------- rooms (party line) ----------
+   A room is a shared thread everyone sees; v1 ships exactly one, #crew. It is
+   not a contact — it comes from /api/status `rooms` and lives in its own
+   "room:" id namespace, so every helper keyed on a string id (unreadCount,
+   newestMessage, lastActivityMs, the lastSeen cursor) just works, while the
+   contact-shaped lookups (health, presence, panes) are guarded to skip it. */
+function isRoomId(id) { return typeof id === 'string' && id.startsWith('room:'); }
+function roomById(id) { return state.rooms.find((r) => r.id === id) || null; }
+
+// A thread target is legitimate if it's a known contact OR a known room. A
+// notification tap deep-links with contact="room:crew", so navigation must
+// validate against both (never trust an id from outside to pick a target).
+function isValidTarget(id) {
+  return state.contacts.some((c) => c.id === id) || state.rooms.some((r) => r.id === id);
+}
+
+// Display name for a thread id — a contact's name or a room's ("#crew"). Used
+// wherever contactName() alone would return undefined for a room.
+function threadName(id) {
+  if (isRoomId(id)) { const r = roomById(id); return (r && r.name) || '#crew'; }
+  return contactName(id);
+}
+
 let reconnectDelay = 1000;   // capped exponential backoff for SSE
 let reconnectTimer = null;
 
@@ -203,6 +227,7 @@ async function init() {
   if (res.status === 401) return showPairing();
   const data = await res.json();
   state.contacts = data.contacts || [];
+  state.rooms = data.rooms || [];
   state.myStatus = data.my_status || '';
   noteServerClocks(data);
   setConnected(true);
@@ -271,6 +296,7 @@ function showOffline() {
   const cached = JSON.parse(localStorage.getItem('eventCache') || 'null');
   if (cached) {
     state.contacts = cached.contacts || [];
+    state.rooms = cached.rooms || [];
     cached.events.forEach(ingest);
   }
   showApp();
@@ -282,6 +308,7 @@ function cacheEvents() {
   try {
     localStorage.setItem('eventCache', JSON.stringify({
       contacts: state.contacts,
+      rooms: state.rooms,
       events: state.events.slice(-100),
     }));
   } catch (e) { /* storage full — cache is best-effort */ }
@@ -326,6 +353,7 @@ async function refreshStatus() {
   const data = await res.json();
   const wasOffline = new Map(state.contacts.map((c) => [c.id, c.status === 'offline']));
   state.contacts = data.contacts || [];
+  state.rooms = data.rooms || [];
   state.myStatus = data.my_status || '';
   noteServerClocks(data);
   setConnected(true);
@@ -634,7 +662,7 @@ function navigateToThread(id) {
 function routeFromLocation() {
   const m = (location.hash || '').match(/^#\/c\/(.+)$/);
   const id = m ? decodeURIComponent(m[1]) : null;
-  if (id && state.contacts.some((c) => c.id === id)) openThread(id);
+  if (id && isValidTarget(id)) openThread(id);
   else showList();
 }
 
@@ -648,7 +676,7 @@ function restoreView() {
   const param = new URLSearchParams(location.search).get('contact');
   const id = m ? decodeURIComponent(m[1]) : param;
   history.replaceState({ view: 'list' }, '', '#/');
-  if (id && state.contacts.some((c) => c.id === id)) navigateToThread(id);
+  if (id && isValidTarget(id)) navigateToThread(id);
   else showList();
 }
 
@@ -657,7 +685,7 @@ window.addEventListener('popstate', routeFromLocation);
 // Notification deep-link (SW postMessage, app already open). Validate the id
 // against the roster so an unknown/crafted value can't select a real target.
 function selectContactIfValid(id) {
-  if (id && state.contacts.some((c) => c.id === id)) navigateToThread(id);
+  if (id && isValidTarget(id)) navigateToThread(id);
 }
 
 $('back-btn').addEventListener('click', () => history.back());
@@ -867,6 +895,10 @@ function renderList() {
   renderMyStatus();
   const list = $('contact-list');
   const empty = $('list-empty');
+  // Onboarding holds until the first agent connects: a lone #crew row (a party
+  // line with nobody in it) would only bury the "use bridge" hint. Once there's
+  // at least one contact, the room joins the roster and sorts by activity like
+  // any other row.
   if (!state.contacts.length) {
     list.innerHTML = '';
     empty.classList.remove('hidden');
@@ -874,10 +906,81 @@ function renderList() {
     return;
   }
   empty.classList.add('hidden');
-  const rows = state.contacts.slice().sort(listSort);
+  const rows = state.contacts.slice();
+  for (const r of state.rooms) rows.push({ id: r.id, name: r.name, room: true });
+  rows.sort(listSort);
   list.innerHTML = '';
-  for (const c of rows) list.appendChild(makeRow(c));
+  for (const c of rows) list.appendChild(c.room ? makeRoomRow(c) : makeRow(c));
   updateUnreadTotals();
+}
+
+// The #crew row: a 📢 monogram (no presence dot — a room has no health), a
+// persistent "everyone — party line" subtitle in place of an away line, the
+// newest-message preview, and an unread badge — all from the same helpers a
+// contact row uses, keyed on the room's string id.
+function makeRoomRow(room) {
+  const id = room.id;
+  const row = document.createElement('button');
+  row.className = 'row room';
+  row.onclick = () => navigateToThread(id);
+
+  const av = document.createElement('span');
+  av.className = 'avatar room-avatar';
+  av.textContent = '📢';
+  row.appendChild(av);
+
+  const main = document.createElement('span');
+  main.className = 'row-main';
+
+  const top = document.createElement('span');
+  top.className = 'row-top';
+  const name = document.createElement('span');
+  name.className = 'row-name';
+  name.textContent = room.name || '#crew';
+  const time = document.createElement('span');
+  time.className = 'row-time';
+  const ms = lastActivityMs(room);
+  time.textContent = ms ? listTime(ms) : '';
+  top.appendChild(name);
+  top.appendChild(time);
+  main.appendChild(top);
+
+  const st = document.createElement('span');
+  st.className = 'row-status';
+  st.textContent = 'everyone — party line';
+  main.appendChild(st);
+
+  const bottom = document.createElement('span');
+  bottom.className = 'row-bottom';
+  const preview = document.createElement('span');
+  preview.className = 'row-preview';
+  const p = roomPreview(id);
+  if (p.cls) preview.classList.add(p.cls);
+  preview.textContent = p.text;
+  bottom.appendChild(preview);
+  const n = unreadCount(id);
+  if (n > 0) {
+    const badge = document.createElement('span');
+    badge.className = 'row-badge';
+    badge.textContent = n > 99 ? '99+' : String(n);
+    bottom.appendChild(badge);
+  }
+  main.appendChild(bottom);
+  row.appendChild(main);
+  return row;
+}
+
+// The room's own preview derivation — the newest room message, reusing the same
+// helpers previewFor leans on. In a room an inbound bubble wears its author, so
+// the preview prefixes the author's name (yours says "You:"). Empty when the
+// room has no messages yet (the subtitle already says what it is).
+function roomPreview(id) {
+  const item = newestMessage(id);
+  if (!item) return { text: '', cls: 'muted' };
+  const out = item.type === 'sent' || item.mstate !== undefined;   // event vs outbox echo
+  const body = item.image ? '📷 photo' : (plainPreview(item.text) || '📷 photo');
+  const prefix = out ? 'You: ' : ((item.name || 'agent') + ': ');
+  return { text: prefix + body };
 }
 
 function makeRow(contact) {
@@ -1029,6 +1132,15 @@ function plainPreview(text) {
 }
 
 function updateThreadHeader() {
+  // A room has no presence, health, or pane: fixed header "#crew · everyone",
+  // and no interrupt button (there is nothing to Escape).
+  if (isRoomId(state.selected)) {
+    const r = roomById(state.selected);
+    $('thread-name').textContent = (r && r.name) || '#crew';
+    $('thread-status').textContent = 'everyone';
+    $('stop-btn').classList.add('hidden');
+    return;
+  }
   const c = state.contacts.find((x) => x.id === state.selected);
   $('thread-name').textContent = (c && c.name) || 'contact';
   $('thread-status').textContent = threadStatusText(c);
@@ -1056,6 +1168,7 @@ function threadStatusText(contact) {
 function updateUnreadTotals() {
   let total = 0;
   for (const c of state.contacts) total += unreadCount(c.id);
+  for (const r of state.rooms) total += unreadCount(r.id);   // #crew unreads count too
   document.title = total > 0 ? '(' + total + ') bridge' : 'bridge';
   if ('setAppBadge' in navigator) {
     if (total > 0) navigator.setAppBadge(total).catch(() => {});
@@ -1114,10 +1227,12 @@ function renderFeed() {
   if (!document.hidden) { markSeen(state.selected); updateUnreadTotals(); }
   const g = state.guidance;
   $('msg-input').placeholder = (g && g.agent === state.selected && g.until > Date.now())
-    ? 'Tell ' + (contactName(state.selected) || 'the agent') + ' what to do differently…'
-    : 'Message ' + (contactName(state.selected) || 'contact') + '…';
+    ? 'Tell ' + (threadName(state.selected) || 'the agent') + ' what to do differently…'
+    : 'Message ' + (threadName(state.selected) || 'contact') + '…';
   $('send-btn').disabled = false;
-  $('attach-btn').disabled = false;
+  // Photos are a 1:1 feature in v1 — the room upload path has no fan-out, so a
+  // photo to #crew would stick queued. Disable the attach button in a room.
+  $('attach-btn').disabled = isRoomId(state.selected);
 }
 
 function contactName(id) {
@@ -1143,8 +1258,12 @@ function renderEvent(event, resolution) {
   } else if (event.type === 'peer') {
     // Agent-to-agent (switchboard) message in this thread: it wears its
     // AUTHOR — event.name is the sender, event.agent the thread it landed in.
-    return replyBubbles(event, 'msg peer',
-      who((event.name || 'agent') + ' → ' + (contactName(event.agent) || 'agent')));
+    // In a room the bubble is just its author ("marvin"); a 1:1 peer keeps the
+    // routing arrow ("marvin → recipient", the thread it was relayed into).
+    const author = event.name || 'agent';
+    const label = isRoomId(event.agent) ? author
+      : author + ' → ' + (contactName(event.agent) || 'agent');
+    return replyBubbles(event, 'msg peer', who(label));
   } else if (event.type === 'interrupted') {
     el.className = 'msg system';
     el.textContent = '⏹ interrupted' + (localTime(event.ts) ? ' · ' + localTime(event.ts) : '');
@@ -1722,8 +1841,8 @@ function sendMessage() {
   const quote = image ? null : state.quote;
   const msg = {
     clientId: crypto.randomUUID(),
-    agent: state.selected,               // always the contact id
-    name: contactName(state.selected) || '?',
+    agent: state.selected,               // a contact id, or a room id ("room:crew")
+    name: threadName(state.selected) || '?',
     text: body,
     image: image || null,
     quote: quote || null,
@@ -2092,7 +2211,10 @@ function maybeNotify(event) {
     body = (event.text || '').slice(-120);
     tag = 'attn-' + event.agent;
   } else if (event.type === 'mention' || event.type === 'reply' || event.type === 'peer') {
-    title = event.name || 'bridge';
+    // A room peer already flows here; its agent id is the room, so the tag is
+    // "msg-room:crew" (matching the daemon's push) and the title names the
+    // author "in #crew" so a lock-screen banner says who and where.
+    title = isRoomId(event.agent) ? (event.name || 'agent') + ' in #crew' : (event.name || 'bridge');
     body = (event.text || '').slice(0, 160);
     tag = 'msg-' + event.agent;
   } else {

@@ -119,9 +119,15 @@ func stripControl(text string) string {
 
 // formatInbound builds the prefix a delivered message wears in the agent's
 // terminal, collapsing whitespace so it lands as a single send-keys line and
-// stripping control bytes (stripControl, L4).
-func formatInbound(from, via, text string) string {
-	return fmt.Sprintf("[From %s (%s)]: %s", from, via, strings.TrimSpace(stripControl(text)))
+// stripping control bytes (stripControl, L4). A room message carries " in #crew"
+// inside the head — daemon-authored from MailMessage.Room, never from body text
+// — so a party-line delivery reads `[From marvin (bridge) in #crew]: text`.
+func formatInbound(from, via, room, text string) string {
+	in := ""
+	if room != "" {
+		in = " in " + room
+	}
+	return fmt.Sprintf("[From %s (%s)%s]: %s", from, via, in, strings.TrimSpace(stripControl(text)))
 }
 
 // neutralizeFrame rewrites the daemon's framing alphabet out of a message
@@ -215,7 +221,9 @@ func flushMailbox(c *Contact) {
 		}
 		text := strings.Join(parts, " ⏎ ")
 		if group[0].From != "" {
-			text = formatInbound(group[0].From, group[0].Via, text)
+			// The frame is authored once from group[0]; Room is part of the group
+			// key (PeekMailboxGroup), so every message in this run shares it.
+			text = formatInbound(group[0].From, group[0].Via, group[0].Room, text)
 		}
 		if err := deliverToSession(c, text); err != nil {
 			return // leave the group (and the rest) queued for the next flush

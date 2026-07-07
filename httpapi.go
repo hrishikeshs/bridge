@@ -77,6 +77,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	// "unreachable".
 	resp := map[string]any{
 		"contacts":  items,
+		"rooms":     roomList(), // static for v1: the one built-in #crew party line
 		"version":   version,
 		"now":       timeNowUnix(),
 		"started":   daemonStartUnix,
@@ -255,6 +256,31 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 		qExcerpt = sanitizeExcerpt(req.Quote.Excerpt, quoteMaxExcerptRunes)
 	}
 	deliverText := decorateQuote(qName, qExcerpt, req.Text)
+
+	// Party line: a send to a room fans out to every registered contact instead
+	// of resolving one. The client_id claim/commit is identical to the 1:1 path
+	// (a racing retry is a safe duplicate ack), and a durably-queued fan-out IS
+	// success — so an all-offline crew still acks 200 (the round-2 rule); there
+	// is no per-member "offline" 409 here. Branched before registry.Resolve
+	// because a room is never a registered contact.
+	if isRoom(req.Agent) {
+		if !claimClientID(req.ClientID) {
+			audit("send-duplicate-dropped", req.Text, id)
+			writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "duplicate": true})
+			return
+		}
+		fanoutRoom(authConfig.UserMention, "phone", deliverText, "")
+		releaseClientID(req.ClientID, true) // durably queued to every member: a retry is a safe duplicate ack
+		audit("send-room", req.Text, id)
+		// Exactly one event carries the room message — the ORIGINAL text plus the
+		// structured quote fields (like a 1:1 "sent"), keyed to the room id so the
+		// phone folds it into the #crew thread. The fan-out mail is all
+		// Emitted:true, so no member's flush emits a second bubble.
+		emitEvent(Event{Type: "sent", Agent: roomCrewID, Name: roomCrewName, Text: req.Text, ClientID: req.ClientID, QuoteName: qName, QuoteExcerpt: qExcerpt})
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+
 	// Reserve the client_id before delivering: a completed send, or a racing
 	// retry whose original delivery is still in flight, is acked as a duplicate
 	// without re-delivering — closing the window where the phone's 10s-timeout
@@ -382,6 +408,13 @@ func handleInterrupt(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	_ = json.Unmarshal(data, &req)
 
+	// A room is a fan-out thread, not a pane — there is no window to Escape.
+	// (Resolve would 409 it anyway since rooms aren't registered; refuse
+	// explicitly so the reason is "no-room", not a misleading "offline".)
+	if isRoom(req.Agent) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "no-room-interrupt"})
+		return
+	}
 	c := registry.Resolve(req.Agent)
 	if c == nil || c.Status != "live" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
@@ -413,6 +446,12 @@ func handleApprove(w http.ResponseWriter, r *http.Request, id string) {
 
 	if !approveKeys[req.Key] {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key-not-allowed"})
+		return
+	}
+	// A room has no pane to key an approval into (and Resolve would 400 it anyway,
+	// since rooms aren't registered) — refuse it explicitly.
+	if isRoom(req.Agent) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no-room-approve"})
 		return
 	}
 	c := registry.Resolve(req.Agent)
