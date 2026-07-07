@@ -9,6 +9,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -201,5 +202,67 @@ func TestTransportForRemote(t *testing.T) {
 	// before any parking.
 	if rt.SendKey(c, "q") == nil {
 		t.Error("SendKey must reject a non-whitelisted key")
+	}
+}
+
+// rtDialogTail is the permission-dialog screen_tail the smoke section attests to
+// exercise the attest-time card raise and the delivery belt. It is duplicated
+// VERBATIM in test/smoke.sh (RT_DIALOG_TAIL); these asserts pin its shape so an
+// edit to the whitespace, the ❯ selector, the numbered option, or the proceed
+// vocabulary on either side can't silently rot it into a tail looksLikePrompt no
+// longer recognizes — which would make the smoke card/belt checks pass vacuously.
+const rtDialogTail = "Bash(git push origin main)\n" +
+	"Do you want to proceed?\n" +
+	" ❯ 1. Yes\n" +
+	"   2. No, and tell Claude what to do differently"
+
+func TestRemoteDialogFixtureIsARealPrompt(t *testing.T) {
+	if !looksLikePrompt(rtDialogTail) {
+		t.Error("rtDialogTail must satisfy looksLikePrompt — the smoke card raise depends on it")
+	}
+	if !paneShowsDialog(rtDialogTail) {
+		t.Error("rtDialogTail must satisfy paneShowsDialog — the smoke delivery belt depends on it")
+	}
+}
+
+// The delivery dialog belt (remoteTransport.Ready, work item 2): a client that
+// attests ready:true with a dialog still on its screen must read NOT ready, so
+// the guarded flush defers instead of typing a line whose trailing Enter would
+// blind-select the highlighted option (C2/C4, remote edition). A clean tail
+// leaves the client's ready:true intact. Injects a scratch lease into the
+// globals under remoteMu and cleans it up, matching the file's existing patterns.
+func TestRemoteReadyDialogBelt(t *testing.T) {
+	const cid = "belt-contact-0000"
+	const token = "belt-lease-token-0000"
+	remoteMu.Lock()
+	remoteLeases[token] = &remoteLease{
+		token:    token,
+		lastSeen: time.Now(),
+		agents:   map[string]bool{cid: true},
+		states:   map[string]remoteState{cid: {Ready: true, ScreenTail: rtDialogTail}},
+	}
+	remoteLeaseByContact[cid] = token
+	remoteMu.Unlock()
+	defer func() {
+		remoteMu.Lock()
+		remoteDeleteLeaseLocked(token)
+		remoteMu.Unlock()
+	}()
+
+	rt := remoteTransport{}
+	c := &Contact{ID: cid, Name: "belt-otter", Transport: "remote"}
+	// Alive is dialog-agnostic — the lease is fresh regardless of what's on screen.
+	if !rt.Alive(c) {
+		t.Error("Alive must be true for a fresh lease regardless of the dialog belt")
+	}
+	if rt.Ready(c) {
+		t.Error("Ready must be false while the attested tail shows a dialog (belt held)")
+	}
+	// Swap in a clean tail: the same ready:true now reads deliverable.
+	remoteMu.Lock()
+	remoteLeases[token].states[cid] = remoteState{Ready: true, ScreenTail: ""}
+	remoteMu.Unlock()
+	if !rt.Ready(c) {
+		t.Error("Ready must be true with ready:true and no dialog on a clean tail")
 	}
 }

@@ -726,6 +726,111 @@ fi
 RT_ACK_E="{\"lease\":\"$LEASE2\",\"ids\":[$(printf '%s' "$RT_MAIL_E2" | rt_deliv jsonids)]}"
 check "ack all redelivered ids -> 200"         200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ACK_E" $BASE/local/transport/ack)"
 
+# --- F: attest-time permission cards + the delivery dialog belt (Phase 3) --
+# An attest whose screen_tail shows a permission dialog RAISES the attention card
+# — judged by looksLikePrompt on the ATTESTED tail (not the client's advisory
+# prompt_open flag), the primary rung for a remote agent. That same dialog makes
+# Ready() false (the paneShowsDialog belt), so nothing is typed into it; an
+# approval is keyed through the same drain/ack as a delivery; and verifyPrompt
+# clears the card once clean tails are attested. The dialog tail below is
+# duplicated in remote_test.go (rtDialogTail), which asserts it genuinely
+# satisfies looksLikePrompt so this fixture can never silently rot.
+
+# Re-hello for a guaranteed-fresh lease: E's ack-timeout dance leaves LEASE2 at
+# the edge of the 3s TTL, and a live-remote re-hello returns the SAME contact id
+# (identity survives) on a brand-new lease — the client's ordinary reconnect.
+RT_HELLO3=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_HELLO_BODY" $BASE/local/transport/hello)
+LEASE3=$(printf '%s' "$RT_HELLO3" | rt_field lease)
+RCID3=$(printf '%s' "$RT_HELLO3" | rt_agent0)
+check "live re-hello keeps the same contact id" "$RCID" "$RCID3"
+
+# A dialog tail that GENUINELY satisfies looksLikePrompt: the ❯ selector, a
+# line-anchored numbered option (" ❯ 1. Yes"), and proceed vocabulary ("Do you
+# want to proceed?"). Built with python3 so the newlines and multibyte ❯ survive
+# JSON encoding intact. prompt_open:true here is the client's ADVISORY flag — the
+# daemon ignores it and judges the tail itself.
+RT_DIALOG_TAIL='Bash(git push origin main)
+Do you want to proceed?
+ ❯ 1. Yes
+   2. No, and tell Claude what to do differently'
+RT_ATTEST_DIALOG=$(RT_L="$LEASE3" RT_C="$RCID" RT_T="$RT_DIALOG_TAIL" python3 -c 'import json,os
+print(json.dumps({"lease":os.environ["RT_L"],"states":[{"id":os.environ["RT_C"],"ready":True,"prompt_open":True,"screen_tail":os.environ["RT_T"]}]}))')
+RT_ATTEST_CLEAN3="{\"lease\":\"$LEASE3\",\"states\":[{\"id\":\"$RCID\",\"ready\":true,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+
+# rt_card: sim-otter's prompt_open off /local/contacts as open|shut (blank if gone).
+rt_card() { curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts | python3 -c 'import json,sys
+try: data=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for c in (data.get("contacts") if isinstance(data,dict) else data) or []:
+    if c.get("name")=="sim-otter": print("open" if c.get("prompt_open") else "shut")'; }
+
+# The dialog attest both raises the card and (belt) makes Ready() false.
+check "attest the dialog tail -> 200"          200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_DIALOG" $BASE/local/transport/attest)"
+
+# CARD: the daemon raised prompt_open from the ATTESTED tail. Poll the roster;
+# keepalive-attest the dialog each turn to hold the 3s lease and the card together.
+RT_CARD=n
+for _ in $(seq 10); do
+  [ "$(rt_card 2>/dev/null)" = open ] && { RT_CARD=y; break; }
+  curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_DIALOG" $BASE/local/transport/attest
+  sleep 0.5
+done
+if [ "$RT_CARD" = y ]; then
+  pass_msg "attest-time card raised (sim-otter prompt_open true)"
+else
+  fail_msg "attest-time card never raised prompt_open for sim-otter"
+fi
+
+# BELT: with the dialog still attested (Ready false), a phone send is HELD — the
+# trailing Enter must never blind-select the highlighted option (C2/C4, remote).
+curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_DIALOG" $BASE/local/transport/attest  # keepalive
+RT_SEND_F="{\"agent\":\"$RCID\",\"text\":\"belt held by dialog\"}"
+curl -s -o /dev/null "${DEV_AUTH[@]}" "${J[@]}" -d "$RT_SEND_F" $BASE/api/send
+sleep 1
+curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_DIALOG" $BASE/local/transport/attest  # keepalive
+RT_MAIL_F=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE3&wait=1")
+body_has "dialog belt holds the send (nothing parked)" '"deliveries":[]' "$RT_MAIL_F"
+
+# APPROVE LOOP: with the card up, /api/approve keys "1". Remote SendKey shares
+# Deliver's ack discipline, so the endpoint BLOCKS until the client acks — run it
+# backgrounded, drain the parked key, ack it, then reap and assert 200.
+curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_DIALOG" $BASE/local/transport/attest  # keepalive: fresh lease for the blocking key
+RT_APPROVE_F="{\"agent\":\"$RCID\",\"key\":\"1\"}"
+RT_APPROVE_CODE="$TESTDIR/rt-approve-code"
+( code "${DEV_AUTH[@]}" "${J[@]}" -d "$RT_APPROVE_F" $BASE/api/approve > "$RT_APPROVE_CODE" ) &
+RT_APPROVE_PID=$!
+RT_KEY_MAIL=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE3&wait=2")
+body_has "approve parks the key delivery"      '"key":"1"' "$RT_KEY_MAIL"
+RT_KEY_ID=$(printf '%s' "$RT_KEY_MAIL" | rt_deliv id)
+RT_KEY_ACK="{\"lease\":\"$LEASE3\",\"ids\":[\"$RT_KEY_ID\"]}"
+check "ack the approval key -> 200"            200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_KEY_ACK" $BASE/local/transport/ack)"
+wait "$RT_APPROVE_PID"
+check "the blocked approve returned 200"       200 "$(cat "$RT_APPROVE_CODE")"
+
+# BELT part 2 + CLEAR: a clean attest flips Ready() true (the held line now parks
+# and delivers) AND starts verifyPrompt's two-strike clear of the card.
+check "attest a clean tail -> 200"             200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_CLEAN3" $BASE/local/transport/attest)"
+RT_MAIL_F2=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$LEASE3&wait=6")
+body_has "the held line delivers once the belt lifts" 'belt held by dialog' "$RT_MAIL_F2"
+RT_MID_F2=$(printf '%s' "$RT_MAIL_F2" | rt_deliv id)
+RT_ACK_F2="{\"lease\":\"$LEASE3\",\"ids\":[\"$RT_MID_F2\"]}"
+check "ack the freed line -> 200"              200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ACK_F2" $BASE/local/transport/ack)"
+
+# CLEAR: keep attesting clean tails — verifyPrompt clears the card via the SAME
+# looksLikePrompt judge that raised it (two misses at ~2s ticks). The keepalive
+# holds the lease so this exercises the verifyPrompt clear, not an offline strike.
+RT_CLEARED=n
+for _ in $(seq 20); do
+  curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$RT_ATTEST_CLEAN3" $BASE/local/transport/attest
+  [ "$(rt_card 2>/dev/null)" = shut ] && { RT_CLEARED=y; break; }
+  sleep 0.5
+done
+if [ "$RT_CLEARED" = y ]; then
+  pass_msg "verifyPrompt cleared the card (prompt_open false again)"
+else
+  fail_msg "the card never cleared after clean attests"
+fi
+
 # --- lockdown (LAST: it stops the daemon) ---------------------------------
 check "lockdown -> 200"                    200 "$(code "${LOCAL_AUTH[@]}" -X POST $BASE/local/lockdown)"
 gone=n

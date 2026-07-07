@@ -193,9 +193,10 @@ func (remoteTransport) Alive(c *Contact) bool {
 	return remoteFreshLeaseLocked(c.ID) != nil
 }
 
-// Ready: fresh AND not suspect AND the last attestation said ready. No attest
-// yet, a stale lease, or a Deliver that just timed out all read false — the
-// guarded flush then defers and the durable mailbox retries, never a blind type.
+// Ready: fresh AND not suspect AND the last attestation said ready AND no dialog
+// on the attested screen. No attest yet, a stale lease, or a Deliver that just
+// timed out all read false — the guarded flush then defers and the durable
+// mailbox retries, never a blind type.
 func (remoteTransport) Ready(c *Contact) bool {
 	remoteMu.Lock()
 	defer remoteMu.Unlock()
@@ -204,7 +205,16 @@ func (remoteTransport) Ready(c *Contact) bool {
 		return false
 	}
 	st, ok := l.states[c.ID]
-	return ok && st.Ready
+	// The delivery dialog belt. A naive client attesting ready:true with a dialog
+	// still on screen must NOT get text typed into it — the composed line's
+	// trailing Enter would blind-select whatever option is highlighted (the C2/C4
+	// critical, remote edition). So the daemon overrules the client's boolean on
+	// the evidence of a dialog it can see in the attested tail, exactly as the tmux
+	// guard refuses on paneShowsDialog(capture-pane). paneShowsDialog is a pure
+	// in-memory string parse — fine under remoteMu — and paneShowsDialog("") is
+	// false, so a client that attests no screen_tail keeps its boolean's word: the
+	// belt only ever SUBTRACTS, and only on a dialog it actually has bytes for.
+	return ok && st.Ready && !paneShowsDialog(st.ScreenTail)
 }
 
 // Capture: the last attested screen tail while fresh, "" when stale — callers
@@ -399,17 +409,62 @@ func handleTransportAttest(w http.ResponseWriter, r *http.Request) {
 	}
 	l.lastSeen = time.Now()
 	l.suspect = false
+	// Attest-time prompt cards — the Phase 3 raise. While storing each agent's
+	// state, judge the CLAMPED tail (the exact bytes Capture will later hand
+	// verifyPrompt) and collect the agents newly showing a permission dialog. The
+	// raise itself must run AFTER the lock: it calls registry.SetPrompt, which
+	// takes the registry mutex AND saves to disk, and notifyPush/dispatchPluginEvent
+	// do I/O — all three are forbidden under remoteMu by the load-bearing rule at
+	// the top of this file. So collect here, act below.
+	type promptRaise struct{ id, tail string }
+	var raises []promptRaise
 	for _, s := range req.States {
 		if !l.agents[s.ID] {
 			continue // only agents this lease hosts
 		}
+		tail := clampScreenTail(s.ScreenTail)
 		l.states[s.ID] = remoteState{
 			Ready:      s.Ready,
 			PromptOpen: s.PromptOpen,
-			ScreenTail: clampScreenTail(s.ScreenTail),
+			ScreenTail: tail,
+		}
+		// The raise is judged by looksLikePrompt on the ATTESTED tail, never by the
+		// client's advisory prompt_open boolean. verifyPrompt (reconcile.go) already
+		// clears remote cards via the SAME two-strike looksLikePrompt(Capture) — and
+		// raise and clear MUST share one judge, or a client whose prompt_open flag
+		// disagreed with what its tail actually shows would flap the card and ring
+		// the phone in a loop. prompt_open stays stored above, but purely advisory.
+		if looksLikePrompt(tail) {
+			raises = append(raises, promptRaise{id: s.ID, tail: tail})
 		}
 	}
 	remoteMu.Unlock()
+
+	// Raise a card for each agent that newly shows a dialog — the SAME ceremony
+	// applyHookEvent runs (local.go), so a remote card is indistinguishable from a
+	// tmux one downstream. Attest-time detection is the PRIMARY rung for a remote
+	// agent: the user-global Notification hook (cli.go installs it in
+	// ~/.claude/settings.json, so even a vterm-hosted session fires it) judges
+	// transportFor(c).Capture(c) the instant it lands — but for a remote contact
+	// that is the LAST attested tail, up to an attest interval stale, so the hook
+	// usually sees no dialog yet and, firing exactly once, never retries. The
+	// attest that CARRIES the dialog is the reliable raise. This adds NO clear
+	// path: verifyPrompt owns the clear for remote contacts too.
+	for _, pr := range raises {
+		c := registry.Resolve(pr.id)
+		// Transition-only: skip a gone/offline agent, and skip one whose card is
+		// already up. Re-attesting the same open dialog every ~10s must not re-ring,
+		// and the transition guard makes the Notification hook a harmless second
+		// raiser — whichever of the two lands first wins, the other is a no-op.
+		if c == nil || c.Status != "live" || c.PromptOpen {
+			continue
+		}
+		registry.SetPrompt(c.ID, true)
+		Emit("attention", c.ID, c.Name, pr.tail)
+		notifyPush(c.Name+" needs you", firstPromptLine(pr.tail), "attn-"+c.ID, c.ID)
+		markAttnPushed(c.ID)
+		dispatchPluginEvent("permission.prompt", c, map[string]any{"prompt": firstPromptLine(pr.tail)})
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ttl_s": remoteTTLSeconds()})
 }
