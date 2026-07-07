@@ -2235,6 +2235,10 @@ function openActionSheet(meta, at) {
   const reactions = $('action-reactions');
   reactions.innerHTML = '';
   const mine = state.myReactions.get(meta.id);
+  // The quick row: the 6 whitelisted taps (unchanged behaviour), wrapped so the
+  // emoji picker below can swap the whole row out with one class toggle.
+  const quick = document.createElement('div');
+  quick.className = 'reaction-quick';
   for (const emoji of REACTIONS) {
     const already = !!(mine && mine.has(emoji));
     const b = document.createElement('button');
@@ -2245,11 +2249,105 @@ function openActionSheet(meta, at) {
     } else {
       b.onclick = () => { react(state.selected, meta.id, emoji); closeActionSheet(); };
     }
-    reactions.appendChild(b);
+    quick.appendChild(b);
   }
+  reactions.appendChild(quick);
+  // ── BUG 2 (react with ANY emoji) ────────────────────────────────────────────
+  // …plus a "+" that hands off to the phone's NATIVE emoji keyboard, so the user
+  // isn't limited to the 6. The chosen emoji flows through the SAME react() path.
+  addEmojiPicker(reactions, quick, meta);
+  // ── end BUG 2 ────────────────────────────────────────────────────────────────
   $('action-quote').onclick = () => { setQuote(meta); closeActionSheet(); };
   actionOpenedAt = Date.now();
   positionActionMenu(at);
+}
+
+/* ── BUG 2 helper: the "react with any emoji" affordance ─────────────────────
+   Appends a "+" button and a hidden capture input to the reaction row. Tapping
+   "+" hides the 6-tap quick row, reveals the input, and focuses it — on iOS that
+   pops the keyboard; the user switches to emoji (🌐 key) and taps one. The FIRST
+   emoji entered is captured (grapheme-aware — a ZWJ sequence, flag, or skin-tone
+   modifier stays whole) and sent through react() exactly like a quick tap, then
+   the sheet closes. No CDN, no emoji data, no build step: the phone's own
+   keyboard IS the picker (strict CSP-friendly). The whole thing lives inside
+   #action-reactions, which openActionSheet clears on every open, so it never
+   stacks or leaks a stale listener across opens.
+   NOTE for Vint: end-to-end this needs the daemon's reactionEmoji whitelist
+   (httpapi.go) opened up — today anything outside the 6 returns 400 "bad-emoji"
+   and react() rolls the optimistic badge back. The PWA side is ready; the
+   companion daemon change is out of this agent's file scope. */
+function addEmojiPicker(reactions, quick, meta) {
+  const more = document.createElement('button');
+  more.className = 'action-reaction action-reaction-more';
+  more.textContent = '+';
+  more.setAttribute('aria-label', 'React with any emoji');
+  quick.appendChild(more);
+
+  const picker = document.createElement('input');
+  picker.id = 'action-emoji-input';
+  picker.className = 'action-emoji-input hidden';
+  picker.type = 'text';
+  picker.autocomplete = 'off';
+  picker.setAttribute('autocapitalize', 'none');
+  picker.setAttribute('aria-label', 'Type or pick any emoji');
+  picker.placeholder = 'Pick any emoji…';
+  reactions.appendChild(picker);
+
+  more.onclick = () => {
+    quick.classList.add('hidden');        // hand the row over to the picker
+    picker.classList.remove('hidden');
+    // Focus reveals the OS keyboard. The popover may end up behind the keyboard,
+    // but that's immaterial: we capture the first emoji and close immediately, so
+    // the user interacts with the keyboard, never the input itself.
+    picker.focus();
+  };
+
+  let fired = false;   // one reaction per open — guard against a double 'input'
+  picker.addEventListener('input', (e) => {
+    if (e.isComposing || fired) return;   // ignore mid-IME-composition frames
+    const emoji = firstEmoji(picker.value);
+    if (!emoji) return;                    // nothing pickable yet (empty / letters)
+    fired = true;
+    react(state.selected, meta.id, emoji); // SAME path the 6 quick taps use
+    picker.blur();                         // dismiss the keyboard
+    closeActionSheet();
+  });
+}
+
+/* The first WHOLE emoji in a string, grapheme-aware. Intl.Segmenter keeps a ZWJ
+   sequence (👨‍👩‍👧), a flag (🇺🇸), a skin-tone modifier (👍🏽) or a
+   variation-selector emoji (❤️) intact as one user-perceived character. Skips any
+   leading non-emoji (a stray letter the keyboard was still on) and returns '' when
+   there is no emoji yet — so the picker only fires on a real pick, and a
+   multi-emoji paste yields just the first (the "take the first emoji" guard). */
+function firstEmoji(str) {
+  const s = str || '';
+  const isEmoji = (g) => /(\p{Extended_Pictographic}|\p{Regional_Indicator})/u.test(g);
+  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+    for (const { segment } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s)) {
+      if (isEmoji(segment)) return segment;
+    }
+    return '';
+  }
+  // Fallback (no Segmenter): first pictographic/flag code point, greedily
+  // extended over trailing joiners / variation selectors / skin tones / flags.
+  const cps = Array.from(s);
+  for (let i = 0; i < cps.length; i++) {
+    if (!isEmoji(cps[i])) continue;
+    // Extend the base emoji over trailing joiners / variation selectors /
+    // skin-tone modifiers / regional-indicator (flag) halves — numeric
+    // code-point checks, so no invisible literals live in the source.
+    let g = cps[i];
+    const cont = (ch) => {
+      const cp = ch.codePointAt(0);
+      return cp === 0x200D || cp === 0xFE0F ||        // ZWJ, VS16
+             (cp >= 0x1F3FB && cp <= 0x1F3FF) ||       // skin-tone modifiers
+             (cp >= 0x1F1E6 && cp <= 0x1F1FF);         // regional indicators
+    };
+    for (let j = i + 1; j < cps.length && cont(cps[j]); j++) g += cps[j];
+    return g;
+  }
+  return '';
 }
 
 function closeActionSheet() { $('action-sheet').classList.add('hidden'); }
@@ -2312,7 +2410,14 @@ function quoteExcerptText(text) {
 function setQuote(meta) {
   state.quote = { name: meta.name, excerpt: quoteExcerptText(meta.text) };
   renderQuoteChip();
-  input.focus();
+  // ── BUG 1 (quote focus-steal) ───────────────────────────────────────────────
+  // Deliberately do NOT focus the composer here. On mobile, focusing the
+  // textarea the instant "Quote" is tapped pops the on-screen keyboard up over
+  // the screen — jarring and unwanted (iPhone daily-driver field report). The
+  // quote is now fully armed anyway: the chip is up (renderQuoteChip above) and
+  // state.quote rides on the next reply (see sendMessage/deliver). The user taps
+  // the box themselves when ready to type. Was: input.focus();
+  // ── end BUG 1 ────────────────────────────────────────────────────────────────
 }
 
 function renderQuoteChip() {

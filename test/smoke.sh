@@ -366,11 +366,15 @@ else
 fi
 
 # Bodies pre-defined (the JSON-in-$(...) gotcha): event_id is a number, emoji is
-# raw UTF-8. 🦄 is outside the whitelist; 👍 is inside it.
-REACT_BADEMOJI_BODY="{\"agent\":\"$CNAME\",\"event_id\":$EVID,\"emoji\":\"🦄\"}"
+# raw UTF-8. The 6-emoji whitelist is gone — ANY real emoji is accepted
+# (sanitized), only non-emoji (plain text / control) is rejected. So the negative
+# test sends TEXT; 🦄 — once "outside the whitelist" — is now a valid reaction.
+REACT_BADEMOJI_BODY="{\"agent\":\"$CNAME\",\"event_id\":$EVID,\"emoji\":\"not-emoji\"}"
+REACT_ANYEMOJI_BODY="{\"agent\":\"$CNAME\",\"event_id\":$EVID,\"emoji\":\"🦄\"}"
 REACT_NOEVENT_BODY="{\"agent\":\"$CNAME\",\"event_id\":999999999,\"emoji\":\"👍\"}"
 REACT_OK_BODY="{\"agent\":\"$CNAME\",\"event_id\":$EVID,\"emoji\":\"👍\"}"
-check "react bad emoji -> 400"            400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_BADEMOJI_BODY" $BASE/api/react)"
+check "react rejects non-emoji text -> 400"          400 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_BADEMOJI_BODY" $BASE/api/react)"
+check "react any emoji (🦄, once non-whitelisted) -> 200" 200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_ANYEMOJI_BODY" $BASE/api/react)"
 check "react unknown event id -> 404"     404 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_NOEVENT_BODY" $BASE/api/react)"
 check "react on a real event -> 200"      200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_OK_BODY" $BASE/api/react)"
 REACT_DUP=$(curl -s "${DEV_AUTH[@]}" "${J[@]}" -d "$REACT_OK_BODY" $BASE/api/react)
