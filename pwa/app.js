@@ -186,6 +186,7 @@ export const state = {
   quote: null,           // {name, excerpt} — the bubble the composer is replying to
   view: 'list',          // 'list' (conversation list) | 'thread' (one contact)
   selected: null,        // contact id of the open thread, or null on the list
+  focus: localStorage.getItem('focus') === '1', // list filter: only recent chats
   feedWindow: FEED_WINDOW, // newest events the open thread renders (grows on "show earlier")
   myStatus: '',          // the human's away line, delivered to agents on reach-out
   lastEventId: 0,
@@ -799,6 +800,20 @@ $('stop-btn').addEventListener('click', async () => {
 
 // The gear opens a slide-up sheet: a theme picker (applies + persists on tap)
 // and the notification control (state + enable flow, relocated from the gear).
+// Focus toggle: filter the list to recent chats (applyFocus). A persisted UI
+// preference mirrored on state.focus — the same shape as the theme/wallpaper.
+function setFocusButton() {
+  const b = $('focus-btn');
+  if (b) b.classList.toggle('active', state.focus);
+}
+function toggleFocus() {
+  state.focus = !state.focus;
+  localStorage.setItem('focus', state.focus ? '1' : '0');
+  setFocusButton();
+  renderList();
+}
+$('focus-btn').addEventListener('click', toggleFocus);
+setFocusButton();
 $('settings-btn').addEventListener('click', openSettings);
 $('settings-close').addEventListener('click', closeSettings);
 $('settings-backdrop').addEventListener('click', closeSettings);
@@ -985,6 +1000,27 @@ function renderMyStatus() {
   el.classList.toggle('hidden', !t);
 }
 
+// Focus mode: show only rows with activity in the last FOCUS_WINDOW_MS, but
+// never fewer than FOCUS_FLOOR — an away-stretch fills up to the floor with the
+// contacts you last MESSAGED (myLastSentMs), so the screen is never empty and
+// the scenery can breathe. Off (the default) returns every row unchanged.
+const FOCUS_WINDOW_MS = 20 * 60 * 1000;
+const FOCUS_FLOOR = 2;
+function applyFocus(rows) {
+  if (!state.focus) return rows;
+  const cut = Date.now() - FOCUS_WINDOW_MS;
+  const shown = rows.filter((c) => lastActivityMs(c) >= cut);
+  if (shown.length < FOCUS_FLOOR) {
+    const byMine = rows.slice().sort((a, b) => myLastSentMs(b.id) - myLastSentMs(a.id));
+    for (const c of byMine) {
+      if (shown.length >= FOCUS_FLOOR) break;
+      if (!shown.includes(c)) shown.push(c);
+    }
+    shown.sort(listSort);   // restore the natural activity order after filling
+  }
+  return shown;
+}
+
 function renderList() {
   renderMyStatus();
   const list = $('contact-list');
@@ -1003,8 +1039,9 @@ function renderList() {
   const rows = state.contacts.slice();
   for (const r of state.rooms) rows.push({ id: r.id, name: r.name, room: true });
   rows.sort(listSort);
+  const shown = applyFocus(rows);
   list.innerHTML = '';
-  for (const c of rows) list.appendChild(c.room ? makeRoomRow(c) : makeRow(c));
+  for (const c of shown) list.appendChild(c.room ? makeRoomRow(c) : makeRow(c));
   updateUnreadTotals();
 }
 
@@ -1229,6 +1266,21 @@ function lastActivityMs(contact) {
   let ms = 0;
   for (let i = state.events.length - 1; i >= 0; i--) {
     if (state.events[i].agent === id) { ms = Date.parse(state.events[i].ts) || 0; break; }
+  }
+  for (const m of state.pending) {
+    if (m.agent === id) { const t = Date.parse(m.ts) || 0; if (t > ms) ms = t; }
+  }
+  return ms;
+}
+
+// Milliseconds of MY last message to a contact — the newest 'sent' event or a
+// pending outbox echo (both are mine). 0 if I haven't messaged them within the
+// loaded window. Drives the Focus floor ordering.
+function myLastSentMs(id) {
+  let ms = 0;
+  for (let i = state.events.length - 1; i >= 0; i--) {
+    const e = state.events[i];
+    if (e.agent === id && e.type === 'sent') { ms = Date.parse(e.ts) || 0; break; }
   }
   for (const m of state.pending) {
     if (m.agent === id) { const t = Date.parse(m.ts) || 0; if (t > ms) ms = t; }

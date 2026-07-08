@@ -309,6 +309,24 @@ header {
   padding: 4px 2px;
 }
 
+/* Focus toggle: a pill by the wordmark. Muted outline when off; accent-filled
+   when on (only recent chats shown — see applyFocus in app.js). */
+#focus-btn {
+  flex: none;
+  font: 600 12px/1 -apple-system, "SF Pro Text", "Segoe UI", sans-serif;
+  padding: 4px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--header-dim);
+  -webkit-tap-highlight-color: transparent;
+}
+#focus-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--out-ink);
+}
+
 /* ---- conversation list ---- */
 
 /* Your own away line, a subtle italic strip under the header (floats on the
