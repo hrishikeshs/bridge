@@ -92,10 +92,12 @@ function setWallpaper(w) {
 // SF marine layer, by local hour: thick mornings, clear afternoons, the bank
 // rolls back in around dusk, settles overnight. The app has weather.
 function fogDensity(hour) {
-  if (hour >= 5 && hour < 11) return 1.0;
-  if (hour >= 11 && hour < 17) return 0.35;
-  if (hour >= 17 && hour < 22) return 0.85;
-  return 0.6;
+  // Same marine-layer SHAPE as ever, floors lifted so the bank is always a
+  // present thing (Hrishi loves the fog) rather than nearly gone by afternoon.
+  if (hour >= 5 && hour < 11) return 1.0;    // thick morning marine layer
+  if (hour >= 11 && hour < 17) return 0.55;  // clearest — but it never fully lifts
+  if (hour >= 17 && hour < 22) return 0.95;  // rolls back in at dusk
+  return 0.72;                                // settles, heavy, overnight
 }
 
 function updateFog() {
