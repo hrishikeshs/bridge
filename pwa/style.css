@@ -1312,62 +1312,22 @@ footer {
 #scenery .veil { display: none; }
 
 #scenery .fog {
-  position: absolute; border-radius: 50%; filter: blur(20px);
+  position: absolute; border-radius: 50%; filter: blur(16px);
   opacity: var(--fog-density);
-  will-change: transform;
 }
-/* Low, broad marine-layer banks — the dense base rolling along the water. */
-#scenery .f1 { width: 175%; height: 20%; bottom: -3%; left: -35%;
-  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.95), rgba(var(--fog-c), 0)); }
-#scenery .f2 { width: 150%; height: 16%; bottom: 8%; left: 5%;
+#scenery .f1 { width: 150%; height: 14%; bottom: 12%; left: -30%;
   background: radial-gradient(closest-side, rgba(var(--fog-c), 0.85), rgba(var(--fog-c), 0)); }
-#scenery .f3 { width: 185%; height: 23%; bottom: 15%; left: -55%;
-  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.9), rgba(var(--fog-c), 0)); }
-/* Mid banks — fog crossing the deck and starting up the towers. */
-#scenery .f4 { width: 145%; height: 19%; bottom: 27%; left: -20%;
-  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.72), rgba(var(--fog-c), 0)); }
-#scenery .f5 { width: 125%; height: 16%; bottom: 37%; left: 12%;
-  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.58), rgba(var(--fog-c), 0)); }
-/* A high wisp — a thin tendril drifting past the tower tops. */
-#scenery .f6 { width: 165%; height: 13%; bottom: 46%; left: -42%;
-  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.42), rgba(var(--fog-c), 0)); }
+#scenery .f2 { width: 130%; height: 11%; bottom: 22%; left: 10%;
+  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.7), rgba(var(--fog-c), 0)); }
+#scenery .f3 { width: 170%; height: 17%; bottom: 3%; left: -50%;
+  background: radial-gradient(closest-side, rgba(var(--fog-c), 0.8), rgba(var(--fog-c), 0)); }
 @media (prefers-reduced-motion: no-preference) {
-  /* Each bank ROLLS (translate) AND SWELLS (scale) on its own slow cycle — the
-     marine layer breathing, not a flat slide. The three-stop path and varied
-     speeds/directions give the banks parallax depth against one another. */
-  #scenery .f1 { animation: fog-roll-1 44s ease-in-out infinite alternate; }
-  #scenery .f2 { animation: fog-roll-2 58s ease-in-out infinite alternate; }
-  #scenery .f3 { animation: fog-roll-3 71s ease-in-out infinite alternate; }
-  #scenery .f4 { animation: fog-roll-4 53s ease-in-out infinite alternate; }
-  #scenery .f5 { animation: fog-roll-5 65s ease-in-out infinite alternate; }
-  #scenery .f6 { animation: fog-roll-6 83s ease-in-out infinite alternate; }
-  @keyframes fog-roll-1 { 0% { transform: translate(0,0) scale(1); }
-    50% { transform: translate(16%,-4%) scale(1.14); } 100% { transform: translate(30%,1%) scale(1.06); } }
-  @keyframes fog-roll-2 { 0% { transform: translate(0,0) scale(1.06); }
-    50% { transform: translate(-13%,3%) scale(1); } 100% { transform: translate(-24%,-3%) scale(1.16); } }
-  @keyframes fog-roll-3 { 0% { transform: translate(0,0) scale(1.04); }
-    50% { transform: translate(20%,-2%) scale(1.18); } 100% { transform: translate(34%,2%) scale(1.02); } }
-  @keyframes fog-roll-4 { 0% { transform: translate(0,0) scale(1); }
-    50% { transform: translate(-18%,-5%) scale(1.2); } 100% { transform: translate(-30%,2%) scale(1.08); } }
-  @keyframes fog-roll-5 { 0% { transform: translate(0,0) scale(1.08); }
-    50% { transform: translate(22%,-6%) scale(1); } 100% { transform: translate(12%,-11%) scale(1.22); } }
-  @keyframes fog-roll-6 { 0% { transform: translate(0,-2%) scale(1.1); }
-    50% { transform: translate(26%,-8%) scale(1.28); } 100% { transform: translate(44%,-4%) scale(1.05); } }
-}
-
-/* The iOS home-indicator strip can't show the photo, so it falls back to the
-   dark --band. Under the bright, prominent marine layer that reads as a hard
-   cut, so a dense fog floor settles over the fold — the bank thickening at the
-   waterline, engulfing the strip seamlessly (Hrishi's full-page instinct kept,
-   the fog made bolder). Always present (the strip always needs masking); the
-   drifting banks above carry the density-varying prominence. Fades to nothing
-   by its top, so it never touches the rows above. */
-#scenery .fog-floor {
-  position: absolute; left: 0; right: 0; bottom: 0; height: 32%;
-  background: linear-gradient(to top,
-    rgba(var(--fog-c), 0.98) 0%, rgba(var(--fog-c), 0.88) 14%,
-    rgba(var(--fog-c), 0.5) 34%, rgba(var(--fog-c), 0) 100%);
-  pointer-events: none;
+  #scenery .f1 { animation: fog-drift-1 52s ease-in-out infinite alternate; }
+  #scenery .f2 { animation: fog-drift-2 74s ease-in-out infinite alternate; }
+  #scenery .f3 { animation: fog-drift-3 96s ease-in-out infinite alternate; }
+  @keyframes fog-drift-1 { to { transform: translateX(18%); } }
+  @keyframes fog-drift-2 { to { transform: translateX(-14%); } }
+  @keyframes fog-drift-3 { to { transform: translateX(22%); } }
 }
 
 /* The list anchors its own scenery; content floats on the weather as glass
