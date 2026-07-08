@@ -46,13 +46,26 @@ func looksLikePrompt(pane string) bool {
 }
 
 // paneShowsDialog is the conservative DELIVERY gate: does the pane's last
-// screenful show the FRAME of an interactive dialog — the ❯ selector plus a
-// line-anchored numbered option — regardless of the specific proceed
-// vocabulary? looksLikePrompt (which raises the attention card) additionally
-// demands proceed vocabulary to avoid false cards from agent prose; delivery
-// refuses on the frame alone, because a trailing Enter would select whatever
-// option is highlighted — trust / text-input / plan dialogs included, even the
-// shapes looksLikePrompt is deliberately too strict to name.
+// screenful show the FRAME of an interactive dialog — the ❯ SELECTION CURSOR
+// sitting on a numbered option line ("❯ 1. Yes") — regardless of the specific
+// proceed vocabulary? looksLikePrompt (which raises the attention card)
+// additionally demands proceed vocabulary to avoid false cards from agent prose;
+// delivery refuses on the frame alone, because a trailing Enter would select
+// whatever option is highlighted — trust / text-input / plan dialogs included,
+// even the shapes looksLikePrompt is deliberately too strict to name.
+//
+// The ❯ glyph is OVERLOADED: Claude Code's IDLE input caret is a bare ❯, while a
+// dialog's selection cursor is ❯ immediately before a numbered option. The old
+// test (❯ ANYWHERE in the tail AND a numbered line ANYWHERE, checked
+// independently) conflated the two — an idle agent with a numbered list anywhere
+// in its scrollback tripped the gate and had its mail HELD as if a dialog were
+// open, with zero trace (health stayed ok, no card, no audit line). That silently
+// held quick-wolf's 8 messages on 2026-07-08. Requiring the cursor ON the option
+// line disambiguates them and loses no real dialog: capture-pane renders the
+// cursor adjacent to its option (see realPromptPane/trustPane in prompt_test.go),
+// and dialogFrameRe uses \d+ (not [123]) so a selection past option 3 is still
+// caught. The || fallback keeps this delivery gate a strict superset of the card
+// gate: anything that raises an attention card still blocks a blind delivery.
 func paneShowsDialog(pane string) bool {
 	if pane == "" {
 		return false
@@ -62,7 +75,7 @@ func paneShowsDialog(pane string) bool {
 		lines = lines[len(lines)-18:]
 	}
 	tail := strings.Join(lines, "\n")
-	return strings.Contains(tail, "❯") && promptOptionRe.MatchString(tail)
+	return dialogFrameRe.MatchString(tail) || looksLikePrompt(pane)
 }
 
 // paneReadyForDelivery reports whether it is safe to send-keys into c's pane
@@ -82,8 +95,18 @@ func paneReadyForDelivery(c *Contact) bool {
 }
 
 // promptOptionRe matches a dialog option at the start of a line ("❯ 1. Yes",
-// "  2. No…") — prose mentions of "1." mid-sentence do not anchor.
+// "  2. No…") — prose mentions of "1." mid-sentence do not anchor. Used by
+// looksLikePrompt (the card gate), where the ❯ is OPTIONAL because the card gate
+// also scans the unselected option lines and pairs them with a ❯ elsewhere plus
+// proceed vocabulary.
 var promptOptionRe = regexp.MustCompile(`(?m)^\s*(?:❯\s*)?[123]\.\s`)
+
+// dialogFrameRe matches a dialog's SELECTED option — the ❯ cursor on the SAME
+// line as its numbered option ("❯ 1. Yes", " ❯ 2. No"). Unlike promptOptionRe the
+// ❯ is REQUIRED and adjacent, so a bare idle ❯ caret paired with a distant
+// numbered list (agent prose) no longer reads as a dialog. This is the delivery
+// gate's frame test; \d+ (not [123]) so a selection on option 4+ is still caught.
+var dialogFrameRe = regexp.MustCompile(`(?m)^\s*❯\s*\d+\.\s`)
 
 // timeNowUnix returns the current unix time in seconds.
 func timeNowUnix() int64 { return time.Now().Unix() }

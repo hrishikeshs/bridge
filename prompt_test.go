@@ -81,6 +81,54 @@ Choose a plan
 	}
 }
 
+// quickWolfIdlePane reproduces quick-wolf's real buffer on 2026-07-08: an agent
+// idle at the bare ❯ input caret, with a numbered list earlier in its scrollback
+// — her OWN debug prose, not a dialog. The old gate saw "❯ somewhere" AND "a N.
+// line somewhere" and wrongly held 8 messages for hours with health reading ok
+// and no card raised. The ❯ sits on its own line; no ❯ is adjacent to a number,
+// and there is no proceed vocabulary anywhere.
+const quickWolfIdlePane = `  [response]
+  It's the fix for your "generator exited abnormally with code 1" — two files:
+
+  1. magnus--headless-command was calling claude --bare --print (exit 1).
+  2. Even with that fixed, replies come wrapped in [thinking]/[response] markers.
+
+  Both files byte-compile clean, smoke-tested. Say the word and I'll push. 🐺
+  [end-response]
+
+✻ Sautéed for 18s
+─────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`
+
+// TestPaneShowsDialogRejectsIdleCaretWithNumberedProse is the 2026-07-08
+// quick-wolf regression: an idle ❯ caret plus a numbered list in the scrollback
+// is NOT a dialog, and delivery must not be held as if it were one.
+func TestPaneShowsDialogRejectsIdleCaretWithNumberedProse(t *testing.T) {
+	if paneShowsDialog(quickWolfIdlePane) {
+		t.Error("paneShowsDialog = true on an idle ❯ caret + numbered prose; delivery would be held with no dialog present (the quick-wolf false positive)")
+	}
+	// And it must not raise a card either — no proceed vocabulary.
+	if looksLikePrompt(quickWolfIdlePane) {
+		t.Error("looksLikePrompt = true on idle prose lacking proceed vocabulary")
+	}
+}
+
+// TestPaneShowsDialogCatchesSelectionPastThree guards the \d+ (not [123]) choice:
+// a real dialog whose cursor is on option 4+ (unselected options carry no ❯) must
+// still block delivery. A narrower [123] would MISS this and type into the dialog.
+func TestPaneShowsDialogCatchesSelectionPastThree(t *testing.T) {
+	pane := `Pick a target
+   1. staging
+   2. canary
+   3. one box
+ ❯ 4. production`
+	if !paneShowsDialog(pane) {
+		t.Error("paneShowsDialog = false with the cursor on option 4; delivery would type into an open dialog")
+	}
+}
+
 func TestFirstPromptLine(t *testing.T) {
 	if got := firstPromptLine(realPromptPane); got != "Bash(git push origin master)" {
 		t.Errorf("firstPromptLine = %q, want the tool call", got)
