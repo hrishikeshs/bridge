@@ -469,6 +469,10 @@ func pluginTickLoop() {
 			roster = append(roster, map[string]string{
 				"id": c.ID, "name": c.Name, "directory": c.Directory,
 				"status": c.Status, "health": c.Health,
+				// Transport lets a plugin distinguish a magnus-bridge-client-hosted
+				// agent ("remote") from a tmux one ("") — e.g. memory-keeper skips
+				// the Magnus cohort, which already has its own memory-saver system.
+				"transport": c.Transport,
 			})
 		}
 		dispatchPluginEvent("tick", nil, map[string]any{"contacts": roster})
