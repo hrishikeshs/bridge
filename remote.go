@@ -349,7 +349,8 @@ func handleTransportHello(w http.ResponseWriter, r *http.Request) {
 		ids[c.ID] = true
 		names = append(names, c.Name)
 		Emit("connected", c.ID, c.Name, "")
-		flushMailbox(c) // defers pre-attest (Ready false); called for symmetry with connect
+		prependWakeDigest(c) // lead the backlog with a since-you-woke line if this was a real wake
+		flushMailbox(c)      // defers pre-attest (Ready false); the digest waits durably with the backlog
 	}
 	audit("remote-hello", flavor+" "+strings.Join(names, " "), "local")
 

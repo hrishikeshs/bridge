@@ -108,6 +108,7 @@ func handleLocalConnect(w http.ResponseWriter, r *http.Request) {
 	c := registry.Connect(req.Name, req.Directory, req.SessionID, req.TmuxTarget)
 	audit("connect", c.Name+" "+c.Directory, "local")
 	Emit("connected", c.ID, c.Name, "")
+	prependWakeDigest(c) // lead the backlog with a since-you-woke line if this was a real wake
 	flushMailbox(c)
 	writeJSON(w, http.StatusOK, map[string]string{"id": c.ID, "name": c.Name})
 }
