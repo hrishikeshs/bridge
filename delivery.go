@@ -132,6 +132,7 @@ const (
 	quoteMaxNameRunes    = 40
 	quoteMaxExcerptRunes = 80
 	reactExcerptRunes    = 60
+	reactionMaxRunes     = 12 // a reaction emoji — even a family ZWJ sequence — is well under this
 )
 
 // sanitizeExcerpt makes body-derived text safe to ride inline into a terminal
@@ -166,7 +167,34 @@ func decorateQuote(name, excerpt, text string) string {
 // of the agent's own reacted message (agent-authored text going back into a
 // pane, so stripControl + neutralizeFrame via sanitizeExcerpt, H9).
 func reactionDelivery(emoji, targetText string) string {
-	return fmt.Sprintf(`reacted %s to "%s"`, emoji, sanitizeExcerpt(targetText, reactExcerptRunes))
+	// BOTH body-derived fields are sanitized before they ride into the agent's
+	// terminal: the emoji (handleReact already validated it via reactionSafe;
+	// re-sanitize here as defense-in-depth) and the excerpt. Neither can carry a
+	// control byte or forge the daemon's framing alphabet (H9).
+	return fmt.Sprintf(`reacted %s to "%s"`,
+		sanitizeExcerpt(emoji, reactionMaxRunes),
+		sanitizeExcerpt(targetText, reactExcerptRunes))
+}
+
+// reactionSafe sanitizes a phone-supplied reaction emoji and reports whether it
+// is acceptable. The phone may now send ANY emoji (the old fixed 6-emoji
+// whitelist is gone), so THIS is the guard that keeps an arbitrary field out of
+// an agent's terminal (reactionDelivery types it via send-keys): it strips
+// control bytes and defangs the framing alphabet exactly like every other
+// body-derived snippet (sanitizeExcerpt), bounds the length, then requires the
+// result be emoji-ish — non-empty with at least one non-ASCII rune — so plain
+// text or ASCII control-art can't ride in as a "reaction". Never trust the phone.
+func reactionSafe(s string) (string, bool) {
+	s = sanitizeExcerpt(s, reactionMaxRunes)
+	if s == "" {
+		return "", false
+	}
+	for _, r := range s {
+		if r > unicode.MaxASCII {
+			return s, true
+		}
+	}
+	return "", false
 }
 
 // flushMailbox delivers a contact's queued messages in order, combining each

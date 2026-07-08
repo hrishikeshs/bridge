@@ -338,12 +338,6 @@ func handleSend(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// reactionEmoji is the closed set of reactions /api/react accepts — the phone
-// offers exactly these; anything else is a 400.
-var reactionEmoji = map[string]bool{
-	"👍": true, "❤️": true, "😂": true, "🎉": true, "👀": true, "🚀": true,
-}
-
 // reactableType reports whether an event kind can carry a reaction — the inbound
 // agent messages a phone taps back on.
 func reactableType(t string) bool {
@@ -367,10 +361,18 @@ func handleReact(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	_ = json.Unmarshal(data, &req)
 
-	if !reactionEmoji[req.Emoji] {
+	// The phone may send ANY emoji now (the fixed 6-emoji whitelist is gone).
+	// Sanitize + validate it before anything downstream touches it — it gets
+	// typed into the agent's terminal (reactionDelivery), so an arbitrary field
+	// must never carry control bytes, forge the framing alphabet, or be plain
+	// text (never trust the phone; H9). Reassign the cleaned value so the dedup,
+	// the stored badge event, and the delivery all ride the safe emoji.
+	safeEmoji, okEmoji := reactionSafe(req.Emoji)
+	if !okEmoji {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-emoji"})
 		return
 	}
+	req.Emoji = safeEmoji
 	// The target must be a real, reactable event in THIS agent's thread. Resolve
 	// the handle to its contact id and match it against the stored event's Agent
 	// (the thread it lives in), so a phone can't react across threads or onto a

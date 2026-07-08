@@ -1473,6 +1473,26 @@ footer {
 .action-reaction.reacted { background: var(--accent); border-color: var(--accent); }
 .action-reaction:disabled { opacity: 0.9; }
 
+/* ── BUG 2: react with ANY emoji ──────────────────────────────────────────────
+   The 6 quick taps live in .reaction-quick (a flex row); the "+" opens the OS
+   emoji keyboard via a capture input that swaps in for the row. Existing tokens
+   only — no new palette/scenery tokens. */
+.reaction-quick { display: flex; gap: 4px; }
+/* the "+" more-affordance: same 40px round target as an emoji, quieter glyph */
+.action-reaction-more { font-weight: 700; color: var(--dim); }
+/* the native-keyboard capture input, revealed in place of the quick row */
+.action-emoji-input {
+  width: 168px;
+  max-width: 60vw;
+  padding: 8px 14px;
+  font: 20px/1 -apple-system, "SF Pro Text", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--ground);
+  border: 1px solid var(--hairline);
+  border-radius: 20px;
+}
+/* ── end BUG 2 ─────────────────────────────────────────────────────────────── */
+
 /* ---- reaction badges on a target bubble ---- */
 .reactions { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
 .reaction {
