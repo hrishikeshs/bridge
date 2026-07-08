@@ -1009,7 +1009,7 @@ const FOCUS_FLOOR = 2;
 function applyFocus(rows) {
   if (!state.focus) return rows;
   const cut = Date.now() - FOCUS_WINDOW_MS;
-  const shown = rows.filter((c) => lastActivityMs(c) >= cut);
+  const shown = rows.filter((c) => lastMessageMs(c.id) >= cut);
   if (shown.length < FOCUS_FLOOR) {
     const byMine = rows.slice().sort((a, b) => myLastSentMs(b.id) - myLastSentMs(a.id));
     for (const c of byMine) {
@@ -1286,6 +1286,15 @@ function myLastSentMs(id) {
     if (m.agent === id) { const t = Date.parse(m.ts) || 0; if (t > ms) ms = t; }
   }
   return ms;
+}
+
+// The newest MESSAGE (reply/sent/mention/peer, or a pending echo) touching a
+// contact — what "chatted with" means for Focus. Distinct from lastActivityMs,
+// which counts ANY event: a reconnect's 'connected' or a status/health tick
+// would otherwise keep a quiet agent in focus (e.g. right after a daemon restart).
+function lastMessageMs(id) {
+  const m = newestMessage(id);
+  return m ? (Date.parse(m.ts) || 0) : 0;
 }
 
 // Strip thinking/response markers and markdown syntax, collapsing to a single

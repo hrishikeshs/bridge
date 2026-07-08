@@ -272,6 +272,7 @@ header {
   font-family: ui-serif, "New York", Georgia, serif;
   font-weight: 600;
   font-size: 20px;
+  line-height: 1;   /* tight box so the wordmark's glyph centers with the Focus pill */
   letter-spacing: 0.2px;
   color: var(--header-ink);
 }
