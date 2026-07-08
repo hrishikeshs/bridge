@@ -1355,6 +1355,21 @@ footer {
     50% { transform: translate(26%,-8%) scale(1.28); } 100% { transform: translate(44%,-4%) scale(1.05); } }
 }
 
+/* The iOS home-indicator strip can't show the photo, so it falls back to the
+   dark --band. Under the bright, prominent marine layer that reads as a hard
+   cut, so a dense fog floor settles over the fold — the bank thickening at the
+   waterline, engulfing the strip seamlessly (Hrishi's full-page instinct kept,
+   the fog made bolder). Always present (the strip always needs masking); the
+   drifting banks above carry the density-varying prominence. Fades to nothing
+   by its top, so it never touches the rows above. */
+#scenery .fog-floor {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 32%;
+  background: linear-gradient(to top,
+    rgba(var(--fog-c), 0.98) 0%, rgba(var(--fog-c), 0.88) 14%,
+    rgba(var(--fog-c), 0.5) 34%, rgba(var(--fog-c), 0) 100%);
+  pointer-events: none;
+}
+
 /* The list anchors its own scenery; content floats on the weather as glass
    rows. Threads deliberately have NO wallpaper — words beat weather. The navy
    header bars of international-orange stay opaque — brand, not ground. */
