@@ -131,6 +131,14 @@ type bridgeConfig struct {
 	// this before jitter. Unset means the default (20000); floored at 0 in
 	// fanoutStaggerMax().
 	FanoutStaggerMaxMs *int `json:"fanout_stagger_max_ms"`
+	// WakeDigestMinAwayS gates the since-you-woke welcome-back digest (wakedigest.go,
+	// docs/route-health.md — the first limb of the route-health family): a contact
+	// must have been away at least this many seconds for its revival to lead with a
+	// one-line "while you were away…" summary that gives the waking agent a sense of
+	// time. Unset means the default (300 = 5m); 0 disables the feature entirely. A
+	// conservative floor keeps a brief blip or a routine re-hello from ever
+	// producing one. Clamped in wakeDigestMinAwaySeconds().
+	WakeDigestMinAwayS *int `json:"wake_digest_min_away_s"`
 }
 
 // authConfig holds the loaded policy; secure defaults apply until loadConfig runs.

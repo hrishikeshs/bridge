@@ -24,8 +24,12 @@ LOG="$TESTDIR/server.log"
 HDRS="$TESTDIR/pair-headers"
 mkdir -p "$HOME_DIR/.bridge"
 # require_identity:false lets curl hit /api without a Tailscale-User-Login
-# header; per-device pairing tokens are still enforced.
-printf '%s\n' '{"require_identity": false, "remote_ttl_s": 3, "remote_ack_timeout_s": 2}' > "$HOME_DIR/.bridge/config.json"
+# header; per-device pairing tokens are still enforced. wake_digest_min_away_s:6
+# arms the since-you-woke digest at a smoke-fast threshold: a deliberate >6s wait
+# (its own section below) trips it, while the brief offline→re-hello reconnects the
+# other sections do stay well under it — so those sections' assertions are unmoved
+# (a routine reconnect fires no digest: the "brief blip < threshold" negative).
+printf '%s\n' '{"require_identity": false, "remote_ttl_s": 3, "remote_ack_timeout_s": 2, "wake_digest_min_away_s": 6}' > "$HOME_DIR/.bridge/config.json"
 
 # --- plugin runtime fixtures (installed BEFORE the daemon boots) ----------
 # docs/plugins.md: discovery scans ~/.bridge/plugins/ at daemon start and lazily
@@ -1014,6 +1018,112 @@ CO_ATTEST_DIALOG=$(RT_L="$CO_LEASE" RT_C="$CO_ID" RT_T="$RT_DIALOG_TAIL" python3
 print(json.dumps({"lease":os.environ["RT_L"],"states":[{"id":os.environ["RT_C"],"ready":True,"prompt_open":True,"screen_tail":os.environ["RT_T"]}]}))')
 check "attest compact-owl a dialog -> 200"     200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$CO_ATTEST_DIALOG" $BASE/local/transport/attest)"
 check "compact while a prompt is open -> 409"  409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$CO_BODY" $BASE/api/compact)"
+
+# --- since-you-woke welcome-back digest (docs/route-health.md) --------------
+# When a contact WAKES after being genuinely away (>= wake_digest_min_away_s, set
+# to 6s in this daemon's config), the daemon leads its held backlog with ONE
+# daemon-authored line summarizing the gap — a sense of time for the waking agent.
+# It rides the SAME guarded park/drain/ack path as any delivery (no second typing
+# path), is From-less (no forgeable "[From …]" head, no client text), and fires AT
+# MOST ONCE per wake. Live agents are the remote/sim transport, reusing rt_*.
+# Placed before lockdown (which stops the daemon these checks need alive).
+
+# rt_status <name>: a contact's status off /local/contacts (blank if absent).
+rt_status() { curl -s "${LOCAL_AUTH[@]}" $BASE/local/contacts | WNAME="$1" python3 -c 'import json,os,sys
+try: data=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for c in (data.get("contacts") if isinstance(data,dict) else data) or []:
+    if c.get("name")==os.environ["WNAME"]: print(c.get("status",""))'; }
+
+# hello wake-otter fresh + attest ready. A FIRST connect is never a wake (no
+# trusted prior last-seen), so nothing is prepended here.
+WK_HELLO_BODY="{\"transport\":\"sim\",\"agents\":[{\"name\":\"wake-otter\",\"directory\":\"$RT_DIR/wk\",\"session_id\":\"\"}]}"
+WK_HELLO=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$WK_HELLO_BODY" $BASE/local/transport/hello)
+WK_LEASE=$(printf '%s' "$WK_HELLO" | rt_field lease)
+WK_ID=$(printf '%s' "$WK_HELLO" | rt_agent0)
+if [ -n "$WK_LEASE" ] && [ -n "$WK_ID" ]; then
+  pass_msg "wake digest: hello registered wake-otter ($WK_ID)"
+else
+  fail_msg "wake digest: hello returned no lease+id: $WK_HELLO"
+fi
+WK_ATTEST_READY="{\"lease\":\"$WK_LEASE\",\"states\":[{\"id\":\"$WK_ID\",\"ready\":true,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+check "wake digest: attest wake-otter ready -> 200" 200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$WK_ATTEST_READY" $BASE/local/transport/attest)"
+
+# Stop attesting -> the lease goes stale (ttl 3s) and wake-otter strikes OFFLINE.
+WK_DEAD=n
+for _ in $(seq 60); do
+  [ "$(rt_status wake-otter 2>/dev/null)" = offline ] && { WK_DEAD=y; break; }
+  sleep 0.25
+done
+[ "$WK_DEAD" = y ] && pass_msg "wake digest: wake-otter struck offline (lease stale)" \
+                   || fail_msg "wake digest: wake-otter never went offline"
+
+# While offline, queue a backlog: one DIRECT phone message + one #crew message.
+# Both land durably in wake-otter's mailbox — Room "" vs "#crew", the split the
+# digest counts as "N direct" / "N in #crew".
+WK_DIRECT_BODY="{\"agent\":\"$WK_ID\",\"text\":\"direct while away\"}"
+check "wake digest: direct to offline wake-otter queued -> 409" 409 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$WK_DIRECT_BODY" $BASE/api/send)"
+WK_CREW_BODY='{"agent":"room:crew","text":"crew while away"}'
+check "wake digest: #crew fan-out accepted -> 200" 200 "$(code "${DEV_AUTH[@]}" "${J[@]}" -d "$WK_CREW_BODY" $BASE/api/send)"
+
+# Wait past the 6s threshold, THEN re-hello (same name+dir -> SAME id, the offline
+# contact adopted). This transition is a genuine wake: the digest leads the backlog.
+sleep 8
+WK_HELLO2=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$WK_HELLO_BODY" $BASE/local/transport/hello)
+WK_LEASE2=$(printf '%s' "$WK_HELLO2" | rt_field lease)
+check "wake digest: re-hello keeps the same contact id" "$WK_ID" "$(printf '%s' "$WK_HELLO2" | rt_agent0)"
+WK_ATTEST_READY2="{\"lease\":\"$WK_LEASE2\",\"states\":[{\"id\":\"$WK_ID\",\"ready\":true,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+check "wake digest: attest on the revived lease -> 200" 200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$WK_ATTEST_READY2" $BASE/local/transport/attest)"
+
+# The reconcile loop flushes; remote Deliver BLOCKS per group on ack, so the
+# digest lead-in parks first (its own From-less group), then the backlog. Drain in
+# ONE loop, acking each batch IMMEDIATELY (well within the 2s ack window) so the
+# transport never redelivers — then the digest text appears exactly once and the
+# count is exact. Keepalive-attest each turn to hold the 3s lease. WK_DIGEST
+# captures the digest's own batch (it parks alone, so no backlog [From ...] frame
+# rides with it — the no-forgeable-head assertion is scoped to it).
+WK_ALL="$TESTDIR/wk-all"; : > "$WK_ALL"
+WK_DIGEST=""
+for _ in $(seq 40); do
+  curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$WK_ATTEST_READY2" $BASE/local/transport/attest
+  WK_M=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$WK_LEASE2&wait=2")
+  WK_ACK_IDS=$(printf '%s' "$WK_M" | rt_deliv jsonids)
+  if [ -n "$WK_ACK_IDS" ]; then
+    printf '%s\n' "$WK_M" >> "$WK_ALL"
+    case "$WK_M" in *'back after'*) WK_DIGEST="$WK_M";; esac
+    curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "{\"lease\":\"$WK_LEASE2\",\"ids\":[$WK_ACK_IDS]}" $BASE/local/transport/ack
+  fi
+  grep -q 'back after' "$WK_ALL" && grep -q 'direct while away' "$WK_ALL" && grep -q 'crew while away' "$WK_ALL" && break
+done
+# The lead-in: the ⏱ back-after clock with both daemon-computed counts.
+body_has "wake digest: leads with the back-after clock"   'back after'          "$WK_DIGEST"
+body_has "wake digest: reads 'while you were away'"        'while you were away' "$WK_DIGEST"
+body_has "wake digest: counts the 1 #crew message"        '1 in #crew'          "$WK_DIGEST"
+body_has "wake digest: counts the 1 direct message"       '1 direct'            "$WK_DIGEST"
+# Daemon-authored: the digest's own delivery carries NO forgeable provenance head
+# (the backlog frames DO wear "[From …]" — correctly — so this is scoped to WK_DIGEST).
+case "$WK_DIGEST" in
+  *'[From '*) fail_msg "wake digest carried a [From ...] head (must be daemon-authored/From-less)" ;;
+  *)          pass_msg "wake digest is daemon-authored (no [From ...] head, no client text)" ;;
+esac
+# The real backlog delivered BEHIND the lead-in, and exactly ONE digest fired.
+body_has "wake digest: the direct backlog delivered behind the lead-in" 'direct while away' "$(cat "$WK_ALL")"
+body_has "wake digest: the #crew backlog delivered behind the lead-in"  'crew while away'   "$(cat "$WK_ALL")"
+WK_DIGCOUNT=$(grep -o 'back after' "$WK_ALL" | wc -l | tr -d ' ')
+check "wake digest: exactly ONE digest across the whole wake" 1 "$WK_DIGCOUNT"
+
+# NEGATIVE — live-guard/debounce: wake-otter is LIVE now, so a routine re-hello is
+# NOT a wake and must add no second digest (mailbox drained; nothing new should park).
+WK_HELLO3=$(curl -s "${J[@]}" "${LOCAL_AUTH[@]}" -d "$WK_HELLO_BODY" $BASE/local/transport/hello)
+WK_LEASE3=$(printf '%s' "$WK_HELLO3" | rt_field lease)
+check "wake digest: live re-hello keeps the same id" "$WK_ID" "$(printf '%s' "$WK_HELLO3" | rt_agent0)"
+WK_ATTEST_READY3="{\"lease\":\"$WK_LEASE3\",\"states\":[{\"id\":\"$WK_ID\",\"ready\":true,\"prompt_open\":false,\"screen_tail\":\"\"}]}"
+curl -s -o /dev/null "${J[@]}" "${LOCAL_AUTH[@]}" -d "$WK_ATTEST_READY3" $BASE/local/transport/attest
+WK_MAIL_N=$(curl -s "${LOCAL_AUTH[@]}" "$BASE/local/transport/mail?lease=$WK_LEASE3&wait=2")
+case "$WK_MAIL_N" in
+  *'back after'*) fail_msg "a live re-hello produced a SECOND wake digest (live-guard/debounce failed)" ;;
+  *)              pass_msg "a live re-hello of a woken agent produces no second digest" ;;
+esac
 
 # --- lockdown (LAST: it stops the daemon) ---------------------------------
 check "lockdown -> 200"                    200 "$(code "${LOCAL_AUTH[@]}" -X POST $BASE/local/lockdown)"

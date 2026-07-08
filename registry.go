@@ -57,6 +57,26 @@ type Contact struct {
 	// harmlessly across a restart (the next tail line refreshes it).
 	ContextTokens int    `json:"context_tokens,omitempty"`
 	ContextModel  string `json:"context_model,omitempty"`
+
+	// LastSeen is the unix time the daemon last had positive evidence this contact
+	// was alive: stamped when it connects/revives (it is live now) and when it
+	// strikes offline (last seen alive ≈ the strike). Its gap to a later wake is
+	// the "since you woke" away duration (wakedigest.go), and it is the last-seen
+	// substrate route-health's staleness will read (docs/route-health.md). 0 until
+	// first seen; omitempty so a pre-feature roster loads unchanged.
+	LastSeen int64 `json:"last_seen,omitempty"`
+	// LastDigestAt is the unix time the last since-you-woke digest fired for this
+	// contact — the debounce that keeps a flapping reconnect within one wake from
+	// re-firing a second digest (at most one per wake). 0 = never; omitempty.
+	LastDigestAt int64 `json:"last_digest_at,omitempty"`
+
+	// wakeAwaySeconds is a transient, in-memory-only hand-off from Connect/
+	// ConnectRemote to the wake site (wakedigest.go's prependWakeDigest): when > 0
+	// this connect was a genuine wake after that many seconds away, so the caller
+	// should lead the flush with a since-you-woke digest. Unexported, so it never
+	// serializes and never persists — a one-shot hint carried only on the returned
+	// copy, not durable identity.
+	wakeAwaySeconds int64
 }
 
 // maxContactFields bounds plugin annotations per contact so a chatty plugin
@@ -208,6 +228,13 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 			break
 		}
 	}
+	// Snapshot the pre-connect liveness BEFORE any mutation, for the wake detector
+	// (noteSeenAndWakeLocked): a genuine wake is prevStatus != "live" plus a
+	// trusted, long-enough LastSeen gap. A brand-new contact leaves these zero.
+	prevStatus, prevLastSeen := "", int64(0)
+	if c != nil {
+		prevStatus, prevLastSeen = c.Status, c.LastSeen
+	}
 	// Sanitize a NEW registration here, at the choke point every producer flows
 	// through, so no caller of the local connect endpoint (a rollback binary, a
 	// stale client) can bypass runConnect's CLI-side checks and register a
@@ -261,9 +288,12 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 	c.Status = "live"
 	c.Health = "ok"
 	c.PromptOpen = false
+	away := r.noteSeenAndWakeLocked(c, prevStatus, prevLastSeen)
 	r.save()
 	dispatchPluginEvent("agent.connect", c, map[string]any{"reason": reason})
-	return c.copy()
+	cp := c.copy()
+	cp.wakeAwaySeconds = away // one-shot wake hint for prependWakeDigest (transient, not persisted)
+	return cp
 }
 
 // ConnectRemote registers or revives a contact hosted by a remote client
@@ -291,6 +321,13 @@ func (r *Registry) ConnectRemote(name, directory, sessionID, flavor string) *Con
 	// all mints a new contact.
 	if c != nil && c.Status == "live" && c.Transport != "remote" {
 		c = nil
+	}
+	// Snapshot pre-connect liveness for the wake detector, AFTER the hijack-avoid
+	// drop above so a dropped live-tmux collision is treated as a fresh contact
+	// (no wake), never a wake of the pane it declined to hijack.
+	prevStatus, prevLastSeen := "", int64(0)
+	if c != nil {
+		prevStatus, prevLastSeen = c.Status, c.LastSeen
 	}
 	if c == nil {
 		// Sanitize a NEW registration at the choke point, exactly as Connect does:
@@ -327,9 +364,45 @@ func (r *Registry) ConnectRemote(name, directory, sessionID, flavor string) *Con
 	c.Transport = "remote"
 	c.TransportFlavor = flavor
 	c.TmuxTarget = ""
+	away := r.noteSeenAndWakeLocked(c, prevStatus, prevLastSeen)
 	r.save()
 	dispatchPluginEvent("agent.connect", c, map[string]any{"reason": reason})
-	return c.copy()
+	cp := c.copy()
+	cp.wakeAwaySeconds = away // one-shot wake hint for prependWakeDigest (transient, not persisted)
+	return cp
+}
+
+// noteSeenAndWakeLocked stamps a contact's last-seen bookkeeping at the moment it
+// becomes live and decides whether this transition earns a since-you-woke digest.
+// It is the transport-agnostic heart of the wake detector, shared by Connect and
+// ConnectRemote. A digest fires only when ALL hold:
+//
+//   - the feature is on (wakeDigestMinAwaySeconds() > 0; 0 disables it entirely);
+//   - the contact was genuinely AWAY — prevStatus != "live" (a routine re-hello of
+//     a still-live contact is not a wake);
+//   - the away gap is TRUSTWORTHY — prevLastSeen was stamped by THIS daemon
+//     instance (>= daemonStartUnix), so a restart's blank slate can never invent a
+//     giant "back after 40d" gap out of a pre-restart timestamp;
+//   - the gap is at least the threshold; and
+//   - the per-contact debounce has elapsed (now - LastDigestAt >= threshold), so a
+//     flapping reconnect within one wake can't re-fire.
+//
+// It returns the away duration in seconds when a digest should fire, else 0, and
+// always advances LastSeen (and, on a fire, LastDigestAt) so the next cycle is
+// clean. Caller holds r.mu and has already set c.Status live.
+func (r *Registry) noteSeenAndWakeLocked(c *Contact, prevStatus string, prevLastSeen int64) int64 {
+	now := timeNowUnix()
+	away := int64(0)
+	if threshold := wakeDigestMinAwaySeconds(); threshold > 0 &&
+		prevStatus != "live" &&
+		prevLastSeen >= daemonStartUnix &&
+		now-prevLastSeen >= threshold &&
+		now-c.LastDigestAt >= threshold {
+		away = now - prevLastSeen
+		c.LastDigestAt = now
+	}
+	c.LastSeen = now
+	return away
 }
 
 // liveNameTaken reports whether a live contact other than `self` already answers
@@ -498,6 +571,7 @@ func (r *Registry) SetOffline(id string) {
 	c.Health = "offline"
 	c.PromptOpen = false
 	c.PromptSig = "" // no card survives going offline; don't let a revival inherit its caption
+	c.LastSeen = timeNowUnix() // last observed alive ≈ now; the away clock the wake digest measures from
 	r.save()
 }
 
@@ -532,6 +606,43 @@ func (r *Registry) Queue(id string, m MailMessage) {
 			fmt.Sprintf("dropped %s -> %.8s (cap %d): %.80s", dropped.From, id, maxMailbox, dropped.Text),
 			"daemon")
 	}
+}
+
+// QueueFront prepends a message to the HEAD of a contact's mailbox so it is the
+// next group flushMailbox delivers — the seam the since-you-woke digest uses to
+// lead a waking contact's backlog (wakedigest.go). Every already-queued message
+// keeps its relative order; only a new head is inserted, so the real backlog is
+// never reordered. Unlike Queue it does NOT evict at the cap: the lead-in is one
+// short daemon line that delivers (and drops) first, so a one-past-cap blip must
+// never push out a real queued message. Persisted like every mailbox mutation.
+func (r *Registry) QueueFront(id string, m MailMessage) {
+	r.mu.Lock()
+	r.mailbox[id] = append([]MailMessage{m}, r.mailbox[id]...)
+	r.save()
+	r.mu.Unlock()
+}
+
+// MailboxBacklogCounts reports how many queued messages are #crew/room traffic vs
+// direct 1:1 messages — read straight from the durable mailbox, which is the
+// exact backlog a wake flush is about to deliver ("held above"). The split is the
+// daemon-set Room field (never body text; H9): Room != "" is room/crew traffic,
+// empty is direct. A From-less daemon lead-in (a wake digest itself) is never
+// counted. prependWakeDigest uses this to color the since-you-woke line. Caller
+// must NOT hold r.mu.
+func (r *Registry) MailboxBacklogCounts(id string) (crew, direct int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, m := range r.mailbox[id] {
+		switch {
+		case m.From == "": // a daemon lead-in (e.g. a prior digest) — never self-count
+			continue
+		case m.Room != "":
+			crew++
+		default:
+			direct++
+		}
+	}
+	return crew, direct
 }
 
 // BeginFlush claims the (single) flush slot for a mailbox; a false return

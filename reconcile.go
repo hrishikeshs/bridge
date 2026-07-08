@@ -82,6 +82,11 @@ func startSessionManager() {
 					// cleared — and so flushMailbox refuses to type into it
 					// (review 2026-07-06, criticals C2/C4).
 					raiseOrRefreshPrompt(revived, transportFor(revived).Capture(revived))
+					// A genuine wake (away >= threshold) leads the backlog with a
+					// since-you-woke line. Across a daemon restart this is normally a
+					// no-op: the pre-restart LastSeen predates daemonStartUnix, which
+					// the detector refuses to trust (no invented "back after 40d" gap).
+					prependWakeDigest(revived)
 					flushMailbox(revived)
 				case c.Status == "live" && alive:
 					pollReplies(c)
