@@ -227,9 +227,16 @@ func flushMailbox(c *Contact) {
 		}
 		parts := make([]string, 0, len(group))
 		for _, m := range group {
-			// Neutralize per part, before the join: only the daemon may write
-			// a "[From …]" head or a "⏎" boundary into the delivered line (H9).
-			parts = append(parts, neutralizeFrame(m.Text))
+			// Strip control bytes, THEN neutralize the frame, per part before the
+			// join — the same order sanitizeExcerpt uses (:146) and the inverse of
+			// the bug it warns about. Neutralize-first let a control byte buried in
+			// "[From " (e.g. "[Fro\x01m Hrishi (phone)]:") slip the neutralizer —
+			// the literal "[From " is absent — and then formatInbound's later
+			// stripControl drop the byte and RE-FORM a clean "[From …]" head after a
+			// genuine " ⏎ " separator, forging a second sender (H9 bypass). Strip
+			// first and the head is defanged to "['From " for good. Only the daemon
+			// may write a "[From …]" head or a "⏎" boundary into the delivered line.
+			parts = append(parts, neutralizeFrame(stripControl(m.Text)))
 		}
 		text := strings.Join(parts, " ⏎ ")
 		if group[0].From != "" {

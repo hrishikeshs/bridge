@@ -20,6 +20,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,18 +33,30 @@ type paperState struct {
 	Edition  int   `json:"edition"`
 }
 
-var paper paperState
+var (
+	paper paperState
+	// paperMu guards every access to paper's fields. It is loaded once at boot,
+	// then read/written by three racing paths: the reconcile tick (paperDue +
+	// publishPaper), the /local/paper HTTP handler (publishPaper + its Edition
+	// read-back), and paperDue's ~2s polling. Without it, publishPaper's
+	// Edition++/LastUnix= tears against those reads (a duplicate dawn edition).
+	paperMu sync.Mutex
+)
 
 func paperPath() string { return bridgePath("paper.json") }
 
 // loadPaperState restores the press's memory. Called once from runServe.
 func loadPaperState() {
+	paperMu.Lock()
+	defer paperMu.Unlock()
 	if data, err := os.ReadFile(paperPath()); err == nil {
 		_ = json.Unmarshal(data, &paper)
 	}
 }
 
-func savePaperState() {
+// savePaperStateLocked marshals and persists the press's memory. Caller holds
+// paperMu (it reads paper), matching the registry's save() convention.
+func savePaperStateLocked() {
 	data, _ := json.Marshal(paper)
 	_ = writeFilePrivate(paperPath(), data)
 }
@@ -66,9 +79,11 @@ func paperHour() int {
 // with tomorrow's hour — nobody wants a newspaper mid-handshake. `bridge
 // paper` prints one on demand any time.
 func paperDue(now time.Time) bool {
+	paperMu.Lock()
+	defer paperMu.Unlock()
 	if paper.LastUnix == 0 {
 		paper.LastUnix = now.Unix()
-		savePaperState()
+		savePaperStateLocked()
 		return false
 	}
 	h := paperHour()
@@ -85,6 +100,15 @@ func paperDue(now time.Time) bool {
 // newspaper belongs — and pushed once, tagged "paper" so a slow morning
 // double-tap replaces rather than stacks.
 func publishPaper(now time.Time) {
+	// Read-modify-write the press's memory under paperMu so a manual `bridge
+	// paper` (the /local/paper handler) and the reconcile tick can't tear the
+	// Edition/LastUnix pair or race paperDue's polling reads. The lock covers
+	// ONLY the stamp: composePaper scans history and emitEvent/notifyPush do I/O,
+	// so they run below with nothing held (tight critical section, per the
+	// review). The stamp already claimed this edition, so a racing publish
+	// observes the advanced state and takes the NEXT number rather than
+	// duplicating this one.
+	paperMu.Lock()
 	since := paper.LastUnix
 	if paper.Edition == 0 {
 		// The first edition EVER covers the last full day — not the seconds
@@ -94,13 +118,15 @@ func publishPaper(now time.Time) {
 	}
 	paper.Edition++
 	paper.LastUnix = now.Unix()
-	savePaperState()
+	edition := paper.Edition // captured under the lock; everything below reads locals only
+	savePaperStateLocked()
+	paperMu.Unlock()
 
 	body := composePaper(since, now)
-	name := fmt.Sprintf("The Bridge Herald · Edition %d · %s", paper.Edition, now.Format("Mon Jan 2"))
+	name := fmt.Sprintf("The Bridge Herald · Edition %d · %s", edition, now.Format("Mon Jan 2"))
 	emitEvent(Event{Type: "paper", Agent: roomCrewID, Name: name, Text: body})
 	notifyPush("☕ The Bridge Herald", paperHeadline(body), "paper", roomCrewID)
-	audit("paper", fmt.Sprintf("edition %d (%d bytes)", paper.Edition, len(body)), "daemon")
+	audit("paper", fmt.Sprintf("edition %d (%d bytes)", edition, len(body)), "daemon")
 }
 
 // paperHeadline is the push body: the first bullet of the wire, or a quiet

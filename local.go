@@ -56,7 +56,10 @@ func handleLocal(w http.ResponseWriter, r *http.Request) {
 		// `bridge paper` — print an edition on demand. It counts as today's:
 		// the scheduled one stands down rather than repeating the news.
 		publishPaper(time.Now())
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "edition": paper.Edition})
+		paperMu.Lock()
+		edition := paper.Edition
+		paperMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "edition": edition})
 	case r.Method == http.MethodGet && r.URL.Path == "/local/contacts":
 		cs := registry.Roster()
 		if cs == nil {

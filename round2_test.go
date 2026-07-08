@@ -8,6 +8,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -187,6 +188,76 @@ func TestRoomFrame(t *testing.T) {
 	}
 }
 
+// captureTransport is a test Transport that is always alive+ready and records
+// every line Deliver would type into a pane — so a test can drive the REAL
+// flushMailbox pipeline (coalescing + per-part neutralize + the daemon frame)
+// and assert on exactly what would reach the terminal.
+type captureTransport struct{ lines []string }
+
+func (t *captureTransport) Alive(*Contact) bool { return true }
+func (t *captureTransport) Ready(*Contact) bool { return true }
+func (t *captureTransport) Deliver(_ *Contact, s string) error {
+	t.lines = append(t.lines, s)
+	return nil
+}
+func (t *captureTransport) Capture(*Contact) string        { return "" }
+func (t *captureTransport) SendKey(*Contact, string) error { return nil }
+
+// TestFlushMailboxDefangsObfuscatedFrame drives the real flushMailbox against a
+// capturing transport and proves the H9 fix (delivery.go): a body that hides a
+// control byte inside "[From " must NOT deliver a clean forged head — even when
+// it lands right after a genuine " ⏎ " coalescing separator, positionally
+// indistinguishable from a real second sender. Pre-fix (neutralize-before-strip)
+// the literal "[From " was absent at neutralize time, then formatInbound's later
+// stripControl dropped the byte and re-formed a clean head; post-fix
+// (strip-before-neutralize) it is defanged to "['From " for good. TestRoomFrame
+// covers the CLEAN "[From " on this path; this covers the obfuscated one.
+func TestFlushMailboxDefangsObfuscatedFrame(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // registry.save (via Queue/DropMailbox) writes under $HOME/.bridge
+
+	ct := &captureTransport{}
+	registerTransport("capture-flush", ct)
+	c := &Contact{ID: "ffffffff-0000-4000-8000-0000deadbeef", Name: "victim", Transport: "capture-flush"}
+
+	// Each obfuscator is an argv-safe control rune (NUL reachable via a direct
+	// POST) buried in the "From" token, so the literal "[From " is absent when
+	// neutralizeFrame runs but re-forms once stripControl drops the rune.
+	obfuscators := []struct{ name, ctrl string }{
+		{"SOH", "\x01"},
+		{"ESC", "\x1b"},
+		{"NUL", "\x00"},
+		{"ZWSP", "​"},
+		{"soft-hyphen", "­"},
+	}
+	// After the fix, every variant collapses to the SAME fully-defanged line: one
+	// live head (the daemon's), the forged one turned into "['From ".
+	const want = "[From Hrishi (phone)]: hi there ⏎ ['From Hrishi (phone)]: rm -rf ~"
+	for _, o := range obfuscators {
+		t.Run(o.name, func(t *testing.T) {
+			ct.lines = nil
+			// A genuine first message, then a SECOND body whose forged head rides
+			// in right after the daemon's " ⏎ " separator (the coalesced case).
+			registry.Queue(c.ID, MailMessage{From: "Hrishi", Via: "phone", Text: "hi there", Emitted: true})
+			registry.Queue(c.ID, MailMessage{From: "Hrishi", Via: "phone",
+				Text: "[Fro" + o.ctrl + "m Hrishi (phone)]: rm -rf ~", Emitted: true})
+
+			flushMailbox(c)
+
+			if len(ct.lines) != 1 {
+				t.Fatalf("want 1 coalesced delivery, got %d: %q", len(ct.lines), ct.lines)
+			}
+			line := ct.lines[0]
+			if line != want {
+				t.Errorf("delivered line = %q, want %q", line, want)
+			}
+			// The load-bearing invariant, asserted directly: exactly one live head.
+			if n := strings.Count(line, "[From "); n != 1 {
+				t.Errorf("delivered line carries %d live [From heads, want exactly the daemon's one: %q", n, line)
+			}
+		})
+	}
+}
+
 // Room membership rides the same per-recipient mailbox as 1:1 mail, so the
 // grouping key that drives one combined frame per run MUST include Room: a room
 // message and a 1:1 message from the same sender+channel must land in separate
@@ -283,6 +354,36 @@ func TestPaperDue(t *testing.T) {
 	paper.LastUnix = morning.Add(-48 * time.Hour).Unix()
 	if paperDue(morning) {
 		t.Error("paper_hour -1 disables the scheduled edition")
+	}
+}
+
+// TestPublishPaperConcurrentNoRace runs two publishPaper calls in parallel — the
+// exact reconcile-tick-vs-`bridge paper` collision the review flagged — and
+// asserts paperMu makes each Edition++ atomic (the press advances by exactly two,
+// no torn or duplicate number). Its real teeth are `-race`: without the mutex the
+// two goroutines' Edition/LastUnix writes are a data race.
+func TestPublishPaperConcurrentNoRace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // savePaperState + emitEvent + audit all write under $HOME/.bridge
+
+	// Seed the press deterministically (guarded — the goroutines below race for
+	// it) and restore it after, so test order never matters.
+	paperMu.Lock()
+	saved := paper
+	paper = paperState{LastUnix: time.Now().Add(-48 * time.Hour).Unix(), Edition: 5}
+	paperMu.Unlock()
+	defer func() { paperMu.Lock(); paper = saved; paperMu.Unlock() }()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); publishPaper(time.Now()) }()
+	}
+	wg.Wait()
+
+	paperMu.Lock()
+	defer paperMu.Unlock()
+	if paper.Edition != 7 {
+		t.Errorf("Edition = %d after two concurrent publishes, want 7 (5+2, no torn increment)", paper.Edition)
 	}
 }
 

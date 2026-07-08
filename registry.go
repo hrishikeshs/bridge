@@ -220,7 +220,6 @@ func (r *Registry) save() {
 // new mints a fresh uuid. Returns a copy of the live contact.
 func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Contact {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	var c *Contact
 	for _, existing := range r.contacts {
 		if existing.Name == name && existing.Directory == directory {
@@ -290,8 +289,16 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 	c.PromptOpen = false
 	away := r.noteSeenAndWakeLocked(c, prevStatus, prevLastSeen)
 	r.save()
-	dispatchPluginEvent("agent.connect", c, map[string]any{"reason": reason})
 	cp := c.copy()
+	r.mu.Unlock()
+	// Dispatch the plugin event OUTSIDE registry.mu: dispatchPluginEvent →
+	// maybeRescanPlugins os.Stats the plugins dir and, on any mtime bump, execs
+	// each plugin's manifest (10s timeout, sequential) — holding registry.mu
+	// across that would freeze every registry op (send, status, flushMailbox) and
+	// stall the phone. The post-mutation copy is captured under the lock, so the
+	// dispatch sees exactly this connect's state with nothing held. Same hoist the
+	// remote transport does (remote.go) and Queue/QueueFront do for post-lock I/O.
+	dispatchPluginEvent("agent.connect", cp, map[string]any{"reason": reason})
 	cp.wakeAwaySeconds = away // one-shot wake hint for prependWakeDigest (transient, not persisted)
 	return cp
 }
@@ -305,7 +312,6 @@ func (r *Registry) Connect(name, directory, sessionID, tmuxTarget string) *Conta
 // suffixed identity (marvin-2) rather than hijacking the pane. Returns a copy.
 func (r *Registry) ConnectRemote(name, directory, sessionID, flavor string) *Contact {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	var c *Contact
 	for _, existing := range r.contacts {
 		if existing.Name == name && existing.Directory == directory {
@@ -366,8 +372,12 @@ func (r *Registry) ConnectRemote(name, directory, sessionID, flavor string) *Con
 	c.TmuxTarget = ""
 	away := r.noteSeenAndWakeLocked(c, prevStatus, prevLastSeen)
 	r.save()
-	dispatchPluginEvent("agent.connect", c, map[string]any{"reason": reason})
 	cp := c.copy()
+	r.mu.Unlock()
+	// Dispatch OUTSIDE registry.mu — the plugin manifest exec (10s) must never run
+	// under the lock (see Connect and remote.go's load-bearing rule). The
+	// post-mutation copy captured above is what the dispatch reads.
+	dispatchPluginEvent("agent.connect", cp, map[string]any{"reason": reason})
 	cp.wakeAwaySeconds = away // one-shot wake hint for prependWakeDigest (transient, not persisted)
 	return cp
 }
@@ -737,17 +747,25 @@ func (r *Registry) DropMailbox(id string, delivered []MailMessage) {
 // SetHealth updates a live contact's health indicator (e.g. "working" while
 // its session file is growing). No-op for offline contacts.
 func (r *Registry) SetHealth(id, health string) {
+	var idle *Contact
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if c, ok := r.contacts[id]; ok && c.Status == "live" {
 		wasWorking := c.Health == "working"
 		c.Health = health
 		r.save()
 		if wasWorking && health == "ok" {
-			// The tail went quiet after activity: the agent settled. This is
-			// the agent.idle plugins hear about (docs/plugins.md).
-			dispatchPluginEvent("agent.idle", c, nil)
+			// The tail went quiet after activity: the agent settled — the
+			// agent.idle plugins hear about (docs/plugins.md). Capture the
+			// post-mutation copy now; DISPATCH below, once the lock is released.
+			idle = c.copy()
 		}
+	}
+	r.mu.Unlock()
+	if idle != nil {
+		// Outside registry.mu: dispatchPluginEvent may exec a plugin's manifest
+		// (10s timeout); holding the lock across it would freeze every registry
+		// op — the availability rule remote.go and Queue/QueueFront already follow.
+		dispatchPluginEvent("agent.idle", idle, nil)
 	}
 }
 
