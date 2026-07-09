@@ -16,20 +16,43 @@
 import { armScreensaver, wakeScreensaver, isMomentEvent, initScreensaver } from './screensaver.js';
 import { renderContextGauge } from './context-gauge.js';
 // Appearance (theme / scenery / light drift): the module applies the saved
-// look at import time (same startup point as before). We import the symbols the
-// settings sheet and the visibilitychange handler below still call.
-import {
-  THEMES, THEME_INFO, currentTheme, setTheme,
-  WALLPAPERS, WALLPAPER_NAMES, currentWallpaper, setWallpaper,
-  paletteFollowsSun, applyPhase, setPaletteSun,
-} from './appearance.js';
+// look at import time (same startup point as before). The settings sheet's
+// theme/wallpaper/palette setters moved with it into ./settings.js, so the spine
+// now calls only applyPhase (the visibilitychange handler re-reads the light on
+// wake); currentWallpaper is re-exported below for screensaver.js.
+import { applyPhase } from './appearance.js';
 // Pure text/time formatters (bubble markdown/linkify/thinking, bubble splitter,
 // preview flattener, timestamp/date labels). Leaf module; we import the ones
 // this core still calls directly.
 import {
   richText, splitPleasing, plainPreview, firstLine, who,
-  typingBubble, photoBox, appendStamp, localTime, listTime, dayLabel,
+  typingBubble, photoBox, appendStamp, localTime, dayLabel,
 } from './textformat.js';
+// Message & unread math (newest-message / activity / unread derivations off the
+// event log + outbox). The list module imports the rest; the spine only calls
+// markSeen (init / openThread / renderFeed). unreadCount rides into the list
+// module (updateUnreadTotals lives there now).
+import { markSeen } from './messagemath.js';
+// Notifications (browser Notification / ServiceWorker / PushManager + /api/push).
+// The module wires its own enable-push listener at import time; the spine calls
+// these four entry points back.
+import {
+  updatePushButton, requestNotifyPermission, maybeNotify, clearDeliveredNotifications,
+} from './notifications.js';
+// The settings sheet + Focus toggle. Self-contained (it wires its own listeners
+// at import time and reaches nothing back out of the spine); a bare import pulls
+// it into the graph so those side-effects run at the same startup point as before.
+// settings.js imports renderList from this core (its toggleFocus re-renders the
+// list) — the re-export below keeps that a core import, avoiding a settings↔list
+// cycle. renderMyStatus lives in settings.js and the list module calls it.
+import './settings.js';
+// The conversation list (roster view). The spine calls renderList (every
+// roster/status change) and updateUnreadTotals (the feed clears unread).
+import { renderList, updateUnreadTotals } from './list.js';
+// settings.js imports renderList from this core (its toggleFocus re-renders the
+// list); re-export the binding so that import resolves here — keeping renderList
+// a core import and avoiding a settings↔list cycle.
+export { renderList };
 
 export const $ = (id) => document.getElementById(id);   // exported: shared by the feature modules
 
@@ -538,24 +561,12 @@ function updateBanner() {
   }
 }
 
-function markSeen(contactId) {
-  state.lastSeen[contactId] = state.lastEventId;
-  localStorage.setItem('lastSeen', JSON.stringify(state.lastSeen));
-}
-
-// Unread = agent replies/mentions newer than the stored cursor. Outbound and
-// self events never count. This reads the SAME lastSeen cursor the old boolean
-// used (a per-contact event id), so existing devices need no migration — the
-// old hasUnread was just this count > 0.
-function unreadCount(contactId) {
-  const seen = state.lastSeen[contactId] || 0;
-  let n = 0;
-  for (const e of state.events) {
-    if (e.agent === contactId && e.id > seen &&
-        (e.type === 'reply' || e.type === 'mention' || e.type === 'peer')) n++;
-  }
-  return n;
-}
+/* ---------- message & unread math ----------
+   Peeled into ./messagemath.js (imported at the top of this file): newestMessage,
+   lastActivityMs, myLastSentMs, lastMessageMs, unreadCount, markSeen. The spine
+   still calls markSeen (init / openThread / renderFeed) and unreadCount
+   (updateUnreadTotals), imported back at the top; the list module imports the
+   rest. */
 
 /* ---------- navigation: list ↔ thread ----------
 
@@ -604,29 +615,8 @@ function openThread(id) {
   wakeScreensaver();    // #19(b): a thread has no scenery — cancel the idle timer
 }
 
-/* iMessage behavior: opening the app clears its pile from Notification
-   Center — everything a delivered banner said is richer in-app anyway. iOS
-   never withdraws delivered notifications itself, so stale "needs your
-   attention" banners otherwise outlive their prompts (field report,
-   2026-07-06). Best-effort: notification support may be absent entirely. */
-async function clearDeliveredNotifications() {
-  try {
-    if (!('serviceWorker' in navigator)) return;
-    const reg = await navigator.serviceWorker.ready;
-    (await reg.getNotifications()).forEach((n) => {
-      // Opening the app clears DELIVERED notifications — but a "needs you"
-      // whose prompt is still open is a live demand, not a delivered one.
-      // Closing it here silenced other agents' active prompts every time the
-      // app was foregrounded (review round 3 hygiene).
-      const m = (n.tag || '').match(/^attn-(.+)$/);
-      if (m && state.attentions.has(m[1])) return;
-      n.close();
-    });
-  } catch (e) { /* unsupported or not yet registered — nothing to clear */ }
-}
-
 // Enter a thread and push it onto history, so back pops to the list.
-function navigateToThread(id) {
+export function navigateToThread(id) {   // exported: list.js rows navigate through it
   if (state.view === 'thread' && state.selected === id) { openThread(id); return; }
   history.pushState({ view: 'thread', id }, '', '#/c/' + encodeURIComponent(id));
   openThread(id);
@@ -680,459 +670,22 @@ $('stop-btn').addEventListener('click', async () => {
    calls armScreensaver / wakeScreensaver / isMomentEvent / initScreensaver; the
    module reads state.view + currentWallpaper() to decide eligibility. */
 
-/* ---------- settings sheet ---------- */
+/* ---------- settings sheet ----------
+   Peeled into ./settings.js (imported at the top of this file): the gear's
+   slide-up sheet (theme / wallpaper / palette-sun / notifications / my-status)
+   and the list-header Focus toggle, plus all their event listeners. That module
+   imports the appearance setters, the notification entry points, and $/state/
+   renderList from here; renderMyStatus lives there and the list module calls it.
+   The spine imports nothing back — the sheet is self-contained. */
 
-// The gear opens a slide-up sheet: a theme picker (applies + persists on tap)
-// and the notification control (state + enable flow, relocated from the gear).
-// Focus toggle: filter the list to recent chats (applyFocus). A persisted UI
-// preference mirrored on state.focus — the same shape as the theme/wallpaper.
-function setFocusButton() {
-  const b = $('focus-btn');
-  if (b) b.classList.toggle('active', state.focus);
-}
-function toggleFocus() {
-  state.focus = !state.focus;
-  localStorage.setItem('focus', state.focus ? '1' : '0');
-  setFocusButton();
-  renderList();
-}
-$('focus-btn').addEventListener('click', toggleFocus);
-setFocusButton();
-$('settings-btn').addEventListener('click', openSettings);
-$('settings-close').addEventListener('click', closeSettings);
-$('settings-backdrop').addEventListener('click', closeSettings);
-$('notif-row').addEventListener('click', async () => {
-  await requestNotifyPermission();
-  updatePushButton();
-  renderNotifState();
-});
-
-// My status: the human's away line. 'change' fires on blur/Enter for a text
-// input, so an edit saves when you leave the field; Enter blurs to commit it.
-// The ✕ clears. Both POST /api/mystatus {text}; the daemon echoes a live
-// 'mystatus' event so every open phone (and the next agent to reach out) syncs.
-$('mystatus-input').addEventListener('change', (e) => saveMyStatus(e.target.value));
-$('mystatus-input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
-});
-// preventDefault on mousedown keeps the input focused when ✕ is tapped, so its
-// blur doesn't fire a spurious 'change' (old value) that races the clear's POST.
-$('mystatus-clear').addEventListener('mousedown', (e) => e.preventDefault());
-$('mystatus-clear').addEventListener('click', () => { $('mystatus-input').value = ''; saveMyStatus(''); });
-
-async function saveMyStatus(text) {
-  // Mirror the daemon's clampAway: one line, capped — so the input and the
-  // stored value never disagree (the daemon clamps again authoritatively).
-  text = (text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120);
-  state.myStatus = text;
-  $('mystatus-input').value = text;
-  renderMyStatus();
-  try {
-    await fetch('/api/mystatus', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
-  } catch (e) { /* offline — the daemon keeps its last value; a later edit retries */ }
-}
-
-function openSettings() {
-  renderThemeOptions();
-  renderWallpaperOptions();
-  renderPaletteSun();
-  renderNotifState();
-  $('mystatus-input').value = state.myStatus || '';
-  $('settings-sheet').classList.remove('hidden');
-}
-
-function renderWallpaperOptions() {
-  const box = $('wallpaper-options');
-  const active = currentWallpaper();
-  box.innerHTML = '';
-  for (const key of WALLPAPERS) {
-    const row = document.createElement('button');
-    row.className = 'theme-row';
-    const name = document.createElement('span');
-    name.className = 'theme-name';
-    name.textContent = WALLPAPER_NAMES[key];
-    const check = document.createElement('span');
-    check.className = 'check';
-    check.textContent = key === active ? '✓' : '';
-    row.appendChild(name);
-    row.appendChild(check);
-    row.onclick = () => { setWallpaper(key); renderWallpaperOptions(); };
-    box.appendChild(row);
-  }
-}
-
-// "Palette follows the sun" — a single on/off switch. The drift only touches
-// the Golden Hour palette, so the control is shown ONLY under that theme (the
-// whole section hides otherwise; the CSS scoping would make it inert there
-// anyway). role="switch" + aria-checked so it reads as a toggle to VoiceOver.
-function renderPaletteSun() {
-  const section = $('palette-sun-section');
-  const box = $('palette-sun-options');
-  const golden = currentTheme() === 'golden-hour';
-  section.classList.toggle('hidden', !golden);
-  box.textContent = '';
-  if (!golden) return;
-
-  const on = paletteFollowsSun();
-  const row = document.createElement('button');
-  row.className = 'sheet-row toggle-row';
-  row.setAttribute('role', 'switch');
-  row.setAttribute('aria-checked', on ? 'true' : 'false');
-
-  const label = document.createElement('span');
-  label.className = 'toggle-label';
-  label.textContent = 'Palette follows the sun';
-
-  const sw = document.createElement('span');
-  sw.className = on ? 'toggle on' : 'toggle';
-  const knob = document.createElement('span');
-  knob.className = 'toggle-knob';
-  sw.appendChild(knob);
-
-  row.appendChild(label);
-  row.appendChild(sw);
-  row.onclick = () => { setPaletteSun(!paletteFollowsSun()); renderPaletteSun(); };
-  box.appendChild(row);
-}
-
-function closeSettings() {
-  $('settings-sheet').classList.add('hidden');
-}
-
-function renderThemeOptions() {
-  const box = $('theme-options');
-  const active = currentTheme();
-  box.innerHTML = '';
-  for (const key of THEMES) {
-    const info = THEME_INFO[key];
-    const row = document.createElement('button');
-    row.className = 'theme-row';
-
-    const name = document.createElement('span');
-    name.className = 'theme-name';
-    name.textContent = info.name;
-
-    const strip = document.createElement('span');
-    strip.className = 'swatches';
-    for (const c of info.swatches) {
-      const sw = document.createElement('span');
-      sw.className = 'swatch';
-      sw.style.background = c;   // CSSOM write — allowed by the style-src CSP
-      strip.appendChild(sw);
-    }
-
-    const check = document.createElement('span');
-    check.className = 'check';
-    check.textContent = key === active ? '✓' : '';
-
-    row.appendChild(name);
-    row.appendChild(strip);
-    row.appendChild(check);
-    // Re-render the palette-sun control too: it appears only under Golden Hour.
-    row.onclick = () => { setTheme(key); renderThemeOptions(); renderPaletteSun(); };
-    box.appendChild(row);
-  }
-}
-
-function renderNotifState() {
-  const el = $('notif-state');
-  const row = $('notif-row');
-  const supported = 'Notification' in window &&
-    'serviceWorker' in navigator && 'PushManager' in window;
-  if (!supported) {
-    el.textContent = 'Notifications · not supported here';
-    row.disabled = true;
-  } else if (Notification.permission === 'granted') {
-    el.textContent = 'Notifications · On';
-    row.disabled = true;
-  } else if (Notification.permission === 'denied') {
-    el.textContent = 'Notifications · blocked in iOS Settings';
-    row.disabled = true;
-  } else {
-    el.textContent = 'Notifications · tap to enable';
-    row.disabled = false;
-  }
-}
-
-/* ---------- conversation list ---------- */
-
-// Order: last activity (newest first); then live before offline; then name.
-// Attention deliberately does NOT reorder (honest ordering) — the row gets an
-// accent instead.
-function listSort(a, b) {
-  const am = lastActivityMs(a), bm = lastActivityMs(b);
-  if (am !== bm) return bm - am;
-  const ao = a.status === 'offline', bo = b.status === 'offline';
-  if (ao !== bo) return ao ? 1 : -1;
-  return (a.name || '').localeCompare(b.name || '');
-}
-
-// The subtle "You: <status>" line under the list header — your own away line,
-// shown only when set. It mirrors exactly what an agent hears the moment it
-// messages you (the daemon's AIM auto-responder). Rendered from renderList (the
-// single hook every roster/status change already flows through) so it stays in
-// sync without scattering calls.
-function renderMyStatus() {
-  const el = $('my-status');
-  if (!el) return;
-  const t = state.myStatus || '';
-  el.textContent = t ? 'You: ' + t : '';
-  el.classList.toggle('hidden', !t);
-}
-
-// Focus mode: show only rows with activity in the last FOCUS_WINDOW_MS, but
-// never fewer than FOCUS_FLOOR — an away-stretch fills up to the floor with the
-// contacts you last MESSAGED (myLastSentMs), so the screen is never empty and
-// the scenery can breathe. Off (the default) returns every row unchanged.
-const FOCUS_WINDOW_MS = 20 * 60 * 1000;
-const FOCUS_FLOOR = 2;
-function applyFocus(rows) {
-  if (!state.focus) return rows;
-  const cut = Date.now() - FOCUS_WINDOW_MS;
-  const shown = rows.filter((c) => lastMessageMs(c.id) >= cut);
-  if (shown.length < FOCUS_FLOOR) {
-    const byMine = rows.slice().sort((a, b) => myLastSentMs(b.id) - myLastSentMs(a.id));
-    for (const c of byMine) {
-      if (shown.length >= FOCUS_FLOOR) break;
-      if (!shown.includes(c)) shown.push(c);
-    }
-    shown.sort(listSort);   // restore the natural activity order after filling
-  }
-  return shown;
-}
-
-function renderList() {
-  renderMyStatus();
-  const list = $('contact-list');
-  const empty = $('list-empty');
-  // Onboarding holds until the first agent connects: a lone #crew row (a party
-  // line with nobody in it) would only bury the "use bridge" hint. Once there's
-  // at least one contact, the room joins the roster and sorts by activity like
-  // any other row.
-  if (!state.contacts.length) {
-    list.innerHTML = '';
-    empty.classList.remove('hidden');
-    updateUnreadTotals();
-    return;
-  }
-  empty.classList.add('hidden');
-  const rows = state.contacts.slice();
-  for (const r of state.rooms) rows.push({ id: r.id, name: r.name, room: true });
-  rows.sort(listSort);
-  const shown = applyFocus(rows);
-  list.innerHTML = '';
-  for (const c of shown) list.appendChild(c.room ? makeRoomRow(c) : makeRow(c));
-  updateUnreadTotals();
-}
-
-// The #crew row: a 📢 monogram (no presence dot — a room has no health), a
-// persistent "everyone — party line" subtitle in place of an away line, the
-// newest-message preview, and an unread badge — all from the same helpers a
-// contact row uses, keyed on the room's string id.
-function makeRoomRow(room) {
-  const id = room.id;
-  const row = document.createElement('button');
-  row.className = 'row room';
-  row.onclick = () => navigateToThread(id);
-
-  const av = document.createElement('span');
-  av.className = 'avatar room-avatar';
-  av.textContent = '📢';
-  row.appendChild(av);
-
-  const main = document.createElement('span');
-  main.className = 'row-main';
-
-  const top = document.createElement('span');
-  top.className = 'row-top';
-  const name = document.createElement('span');
-  name.className = 'row-name';
-  name.textContent = room.name || '#crew';
-  const time = document.createElement('span');
-  time.className = 'row-time';
-  const ms = lastActivityMs(room);
-  time.textContent = ms ? listTime(ms) : '';
-  top.appendChild(name);
-  top.appendChild(time);
-  main.appendChild(top);
-
-  const st = document.createElement('span');
-  st.className = 'row-status';
-  st.textContent = 'everyone — party line';
-  main.appendChild(st);
-
-  const bottom = document.createElement('span');
-  bottom.className = 'row-bottom';
-  const preview = document.createElement('span');
-  preview.className = 'row-preview';
-  const p = roomPreview(id);
-  if (p.cls) preview.classList.add(p.cls);
-  preview.textContent = p.text;
-  bottom.appendChild(preview);
-  const n = unreadCount(id);
-  if (n > 0) {
-    const badge = document.createElement('span');
-    badge.className = 'row-badge';
-    badge.textContent = n > 99 ? '99+' : String(n);
-    bottom.appendChild(badge);
-  }
-  main.appendChild(bottom);
-  row.appendChild(main);
-  return row;
-}
-
-// The room's own preview derivation — the newest room message, reusing the same
-// helpers previewFor leans on. In a room an inbound bubble wears its author, so
-// the preview prefixes the author's name (yours says "You:"). Empty when the
-// room has no messages yet (the subtitle already says what it is).
-function roomPreview(id) {
-  const item = newestMessage(id);
-  if (!item) return { text: '', cls: 'muted' };
-  const out = item.type === 'sent' || item.mstate !== undefined;   // event vs outbox echo
-  const body = item.image ? '📷 photo' : (plainPreview(item.text) || '📷 photo');
-  const prefix = out ? 'You: ' : ((item.name || 'agent') + ': ');
-  return { text: prefix + body };
-}
-
-function makeRow(contact) {
-  const id = contact.id;
-  const offline = contact.status === 'offline';
-  const row = document.createElement('button');
-  row.className = 'row' + (offline ? ' offline' : '') +
-    (state.attentions.has(id) ? ' attn' : '');
-  row.onclick = () => navigateToThread(id);
-
-  const av = document.createElement('span');
-  av.className = 'avatar';
-  av.style.background = avatarColor(contact.name);
-  av.textContent = monogram(contact.name);
-  const sdot = document.createElement('span');
-  // Route Health L1: a stuck route overrides the health dot — 'stale' (grey,
-  // the remote client stopped attesting) or 'held' (amber, mail queued + blocked).
-  // Absent hold_reason (healthy, or an older daemon) falls through to the health dot.
-  const routeCls = contact.hold_reason === 'stale' ? 'stale'
-    : contact.hold_reason ? 'held'
-    : (contact.health || 'ok');
-  sdot.className = 'status-dot ' + (offline ? 'offline' : routeCls);
-  av.appendChild(sdot);
-  row.appendChild(av);
-
-  const main = document.createElement('span');
-  main.className = 'row-main';
-
-  const top = document.createElement('span');
-  top.className = 'row-top';
-  // ── feature #18: transport badge ──────────────────────────────────────────
-  // Name + an optional transport-flavor tag share one flex line, so the badge
-  // hugs the name while the timestamp still floats to the right edge. tmux
-  // contacts report no flavor and get no badge (see transportBadge).
-  const nameLine = document.createElement('span');
-  nameLine.className = 'name-line';
-  const name = document.createElement('span');
-  name.className = 'row-name';
-  name.textContent = contact.name || 'contact';
-  nameLine.appendChild(name);
-  const badge = transportBadge(contact);
-  if (badge) nameLine.appendChild(badge);
-  // ── end #18 ───────────────────────────────────────────────────────────────
-  const time = document.createElement('span');
-  time.className = 'row-time';
-  const ms = lastActivityMs(contact);
-  time.textContent = ms ? listTime(ms) : '';
-  top.appendChild(nameLine);
-  top.appendChild(time);
-
-  main.appendChild(top);
-  // Away/status one-liner from the plugin fields map; omitted when absent so
-  // it never leaves an empty gap.
-  const status = contact.fields && contact.fields.status;
-  if (status) {
-    const st = document.createElement('span');
-    st.className = 'row-status';
-    st.textContent = status;
-    main.appendChild(st);
-  }
-
-  const bottom = document.createElement('span');
-  bottom.className = 'row-bottom';
-  const preview = document.createElement('span');
-  preview.className = 'row-preview';
-  const p = previewFor(contact);
-  if (p.cls) preview.classList.add(p.cls);
-  preview.textContent = p.text;
-  bottom.appendChild(preview);
-  const n = unreadCount(id);
-  if (n > 0) {
-    const badge = document.createElement('span');
-    badge.className = 'row-badge';
-    badge.textContent = n > 99 ? '99+' : String(n);
-    bottom.appendChild(badge);
-  }
-
-  main.appendChild(bottom);
-  row.appendChild(main);
-  return row;
-}
-
-/* ── feature #18: transport badge ──────────────────────────────────────────
-   A small, secondary tag after a contact's name naming its client-hosted
-   transport ("emacs" / "magnus" / …). The daemon sends contact.transport
-   ("remote") and contact.transport_flavor on /api/status (httpapi.go); a tmux
-   contact reports no flavor, so it gets nothing. Rooms build their own row
-   (makeRoomRow) and never call this. Palette-native and quieter than the name
-   or the presence dot, by design. */
-function transportBadge(contact) {
-  const flavor = contact && contact.transport_flavor;
-  if (!flavor) return null;
-  const badge = document.createElement('span');
-  badge.className = 'transport-badge';
-  badge.textContent = flavor;
-  return badge;
-}
-
-// Monogram + a deterministic colour derived from the name — stable across
-// loads (adjective-animal names like "swift-wolf" → "SW").
-function monogram(name) {
-  const parts = (name || '?').trim().split(/[\s_-]+/).filter(Boolean);
-  if (!parts.length) return '?';
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
-}
-
-// Deterministic per-name hue → a 135° gradient (base hue to a darker stop),
-// richer than a flat disc. Assigned via the CSSOM (el.style.background), which
-// the strict style-src CSP allows — unlike a string style attribute.
-function avatarColor(name) {
-  let h = 0;
-  const s = name || '';
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  const hue = h % 360;
-  return 'linear-gradient(135deg, hsl(' + hue + ' 52% 50%), hsl(' + hue + ' 56% 34%))';
-}
-
-// The one-line row preview. Precedence per the charter: live typing → open
-// prompt → away status (only when nothing is unread) → newest message → the
-// contact's directory / a placeholder. The away line stands in for an already-
-// read history, but a fresh reply must never hide behind a stale status — so
-// unread previews win (spec).
-function previewFor(contact) {
-  const id = contact.id;
-  if ((state.typing.get(id) || 0) > Date.now()) return { text: 'typing…', cls: 'typing' };
-  if (contact.health === 'prompt') return { text: '🔔 needs your approval', cls: 'alert' };
-  const hold = routeHold(contact);
-  if (hold) return { text: '⚠ ' + hold, cls: 'alert' };   // route-health: mail queued + blocked
-  if (contact.away && unreadCount(id) === 0) return { text: '💬 ' + contact.away, cls: 'away' };
-  const item = newestMessage(id);
-  if (!item) return { text: contact.directory || 'no messages yet', cls: 'muted' };
-  const out = item.type === 'sent' || item.mstate !== undefined;   // event vs outbox echo
-  const body = item.image ? '📷 photo' : (plainPreview(item.text) || '📷 photo');
-  const prefix = out ? 'You: ' : (item.type === 'peer' ? (item.name || 'agent') + ': ' : '');
-  return { text: prefix + body };
-}
+/* ---------- conversation list ----------
+   Peeled into ./list.js (imported at the top of this file): listSort, applyFocus
+   (Focus filter), renderList, the contact/#crew rows + their previews, the
+   avatar monogram/colour, the #18 transport badge, and updateUnreadTotals. That
+   module imports the message/unread math, the preview flattener + list time,
+   renderMyStatus, and $/state/isRoomId/navigateToThread/routeHold from here; the
+   spine calls renderList and updateUnreadTotals back. routeHold + humanizeAgo
+   stay here (threadStatusText also uses routeHold). */
 
 // Route Health L1 (daemon-derived, docs/route-health.md): a human phrase for a
 // route whose mail is queued+blocked, or "" when healthy (hold_reason absent —
@@ -1140,7 +693,7 @@ function previewFor(contact) {
 // the remote client stopped attesting and carries the last-seen age; the others
 // mean mail is genuinely held. Composed per context: previewFor prefixes "⚠ ",
 // threadStatusText joins it with " · ".
-function routeHold(contact) {
+export function routeHold(contact) {   // exported: list.js previewFor uses it (humanizeAgo stays here too)
   const r = contact.hold_reason;
   if (!r) return '';
   if (r === 'stale') return 'stale — last seen ' + humanizeAgo(contact.last_seen_s);
@@ -1156,61 +709,6 @@ function humanizeAgo(s) {
   if (s < 3600) return Math.floor(s / 60) + 'm';
   if (s < 86400) return Math.floor(s / 3600) + 'h';
   return Math.floor(s / 86400) + 'd';
-}
-
-// Newest message-like item touching the contact — a stored reply/mention/sent
-// event or a not-yet-confirmed outbox echo — whichever is more recent.
-function newestMessage(id) {
-  let ev = null;
-  for (let i = state.events.length - 1; i >= 0; i--) {
-    const e = state.events[i];
-    if (e.agent === id && (e.type === 'reply' || e.type === 'mention' ||
-        e.type === 'sent' || e.type === 'peer')) {
-      ev = e; break;
-    }
-  }
-  let pend = null;
-  for (const m of state.pending) if (m.agent === id) pend = m;   // last wins (chronological)
-  if (ev && pend) return (Date.parse(pend.ts) || 0) >= (Date.parse(ev.ts) || 0) ? pend : ev;
-  return ev || pend;
-}
-
-// Milliseconds of the last activity of ANY kind touching the contact (drives
-// ordering). 0 for a contact the phone has never seen an event for.
-function lastActivityMs(contact) {
-  const id = contact.id;
-  let ms = 0;
-  for (let i = state.events.length - 1; i >= 0; i--) {
-    if (state.events[i].agent === id) { ms = Date.parse(state.events[i].ts) || 0; break; }
-  }
-  for (const m of state.pending) {
-    if (m.agent === id) { const t = Date.parse(m.ts) || 0; if (t > ms) ms = t; }
-  }
-  return ms;
-}
-
-// Milliseconds of MY last message to a contact — the newest 'sent' event or a
-// pending outbox echo (both are mine). 0 if I haven't messaged them within the
-// loaded window. Drives the Focus floor ordering.
-function myLastSentMs(id) {
-  let ms = 0;
-  for (let i = state.events.length - 1; i >= 0; i--) {
-    const e = state.events[i];
-    if (e.agent === id && e.type === 'sent') { ms = Date.parse(e.ts) || 0; break; }
-  }
-  for (const m of state.pending) {
-    if (m.agent === id) { const t = Date.parse(m.ts) || 0; if (t > ms) ms = t; }
-  }
-  return ms;
-}
-
-// The newest MESSAGE (reply/sent/mention/peer, or a pending echo) touching a
-// contact — what "chatted with" means for Focus. Distinct from lastActivityMs,
-// which counts ANY event: a reconnect's 'connected' or a status/health tick
-// would otherwise keep a quiet agent in focus (e.g. right after a daemon restart).
-function lastMessageMs(id) {
-  const m = newestMessage(id);
-  return m ? (Date.parse(m.ts) || 0) : 0;
 }
 
 export function updateThreadHeader() {   // exported: context-gauge.js doCompact() re-renders through it
@@ -1256,19 +754,6 @@ function threadStatusText(contact) {
    $, state, isRoomId, threadName, api and updateThreadHeader back from here to
    render the bar and run the compact confirm/POST flow. */
 /* ── end context gauge ─────────────────────────────────────────────────────*/
-
-// Total unread across contacts → app-icon badge (where supported) + a
-// document.title prefix; both cleared when everything is read.
-function updateUnreadTotals() {
-  let total = 0;
-  for (const c of state.contacts) total += unreadCount(c.id);
-  for (const r of state.rooms) total += unreadCount(r.id);   // #crew unreads count too
-  document.title = total > 0 ? '(' + total + ') bridge' : 'bridge';
-  if ('setAppBadge' in navigator) {
-    if (total > 0) navigator.setAppBadge(total).catch(() => {});
-    else if ('clearAppBadge' in navigator) navigator.clearAppBadge().catch(() => {});
-  }
-}
 
 /* ---------- feed ---------- */
 
@@ -2236,103 +1721,12 @@ async function approve(agent, key) {
   await api('/api/approve', { agent, key });
 }
 
-/* ---------- notifications (best-effort; no-op where unsupported) ---------- */
-
-// Trace push setup/errors without breaking the flow. Was called but never
-// defined, so every push error path (incl. the catch) threw a ReferenceError.
-const pushDebug = (m) => console.debug('[push]', m);
-
-// Show the enable-notifications button whenever push is supported but not yet
-// granted+subscribed. iOS requires the permission prompt to come from a tap.
-function updatePushButton() {
-  const btn = $('enable-push');
-  if (!btn) return;
-  const supported = 'Notification' in window && 'serviceWorker' in navigator && 'PushManager' in window;
-  const granted = supported && Notification.permission === 'granted';
-  btn.classList.toggle('hidden', !supported || granted);
-  if (granted) enablePush();   // already allowed on a prior visit: (re)subscribe
-}
-
-$('enable-push').addEventListener('click', async () => {
-  await requestNotifyPermission();
-  updatePushButton();
-});
-
-async function requestNotifyPermission() {
-  if (!('Notification' in window)) return;
-  if (Notification.permission === 'default') {
-    await Notification.requestPermission().catch(() => {});
-  }
-  if (Notification.permission === 'granted') enablePush();
-}
-
-/* Subscribe this device to Web Push so the daemon can ring it with the app
-   closed. Idempotent — safe to call on every load once permission is granted. */
-async function enablePush() {
-  try {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) { return;
-    }
-    if (Notification.permission !== 'granted') { pushDebug('not granted'); return; }
-    const reg = await navigator.serviceWorker.ready;
-    let sub = await reg.pushManager.getSubscription();
-    if (!sub) {
-      const res = await fetch('/api/push/key');
-      if (!res.ok) { pushDebug('key fetch failed ' + res.status); return; }
-      const { key } = await res.json();
-      sub = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlB64ToUint8Array(key),
-      });
-    }
-    const subRes = await fetch('/api/push/subscribe', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sub),
-    });
-    if (!subRes.ok) { pushDebug('subscribe failed ' + subRes.status); return; }
-    pushDebug('subscribed');
-  } catch (e) { pushDebug('ERROR ' + (e && e.message ? e.message : e)); }
-}
-
-function urlB64ToUint8Array(base64) {
-  const pad = '='.repeat((4 - (base64.length % 4)) % 4);
-  const b64 = (base64 + pad).replace(/-/g, '+').replace(/_/g, '/');
-  const raw = atob(b64);
-  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
-}
-
-/* Page-side notification for events arriving while the tab is hidden. Routed
-   through the service worker with the daemon's own tag scheme, so it REPLACES
-   the matching Web Push instead of stacking a second, untagged banner beside
-   it — and it becomes visible to clearDeliveredNotifications and tappable
-   into the right thread, neither of which a bare page-scoped Notification
-   was (review round 3 hygiene). Bare Notification remains as the fallback. */
-function maybeNotify(event) {
-  if (!('Notification' in window)) return;
-  if (Notification.permission !== 'granted' || !document.hidden) return;
-  let title, body, tag;
-  if (event.type === 'attention') {
-    title = (event.name || 'agent') + ' needs your attention';
-    body = (event.text || '').slice(-120);
-    tag = 'attn-' + event.agent;
-  } else if (event.type === 'mention' || event.type === 'reply' || event.type === 'peer') {
-    // A room peer already flows here; its agent id is the room, so the tag is
-    // "msg-room:crew" (matching the daemon's push) and the title names the
-    // author "in #crew" so a lock-screen banner says who and where.
-    title = isRoomId(event.agent) ? (event.name || 'agent') + ' in #crew' : (event.name || 'bridge');
-    body = (event.text || '').slice(0, 160);
-    tag = 'msg-' + event.agent;
-  } else {
-    return;
-  }
-  navigator.serviceWorker.ready
-    .then((reg) => reg.showNotification(title, {
-      body, tag,
-      icon: '/icons/icon-192.png',
-      badge: '/icons/icon-192.png',
-      data: { contact: event.agent },
-    }))
-    .catch(() => { try { new Notification(title, { body }); } catch (e) { /* blocked */ } });
-}
+/* ---------- notifications (best-effort; no-op where unsupported) ----------
+   Peeled into ./notifications.js (imported at the top of this file): the
+   enable-push button + tap flow, permission request, Web Push subscribe, the
+   VAPID-key decode, the hidden-tab page notification, and
+   clearDeliveredNotifications. The spine calls updatePushButton /
+   requestNotifyPermission / maybeNotify / clearDeliveredNotifications, imported
+   back at the top. */
 
 init();

@@ -299,6 +299,13 @@ async function loadApp(opts = {}) {
   const dom = new JSDOM(html, { url, runScripts: 'dangerously', pretendToBeVisual: true });
   const win = dom.window;
 
+  // Optional localStorage seed, applied BEFORE the app runs — so a second load
+  // can carry a first load's persisted state (e.g. the lastSeen unread cursor)
+  // and prove it survives a "reopen". Additive: absent → a fresh, empty store.
+  if (opts.localStorage) {
+    for (const [k, v] of Object.entries(opts.localStorage)) win.localStorage.setItem(k, v);
+  }
+
   const harness = {
     dom, win, document: win.document,
     status, history,

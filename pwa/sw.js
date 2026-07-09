@@ -4,12 +4,13 @@
 
 'use strict';
 
-const CACHE = 'bridge-v40';
+const CACHE = 'bridge-v41';
 // app.js is a native ES module that imports these peeled modules; every one must
 // be precached (a missed entry = a broken PWA offline on the phone). Bump CACHE
 // whenever this list or any shell file changes.
 const SHELL = ['/', '/style.css', '/app.js',
                '/screensaver.js', '/context-gauge.js', '/textformat.js', '/appearance.js',
+               '/messagemath.js', '/notifications.js', '/settings.js', '/list.js',
                '/manifest.webmanifest',
                '/wallpaper.jpg',
                '/icons/icon-192.png', '/icons/icon-512.png'];
