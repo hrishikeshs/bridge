@@ -1127,7 +1127,13 @@ function makeRow(contact) {
   av.style.background = avatarColor(contact.name);
   av.textContent = monogram(contact.name);
   const sdot = document.createElement('span');
-  sdot.className = 'status-dot ' + (offline ? 'offline' : (contact.health || 'ok'));
+  // Route Health L1: a stuck route overrides the health dot — 'stale' (grey,
+  // the remote client stopped attesting) or 'held' (amber, mail queued + blocked).
+  // Absent hold_reason (healthy, or an older daemon) falls through to the health dot.
+  const routeCls = contact.hold_reason === 'stale' ? 'stale'
+    : contact.hold_reason ? 'held'
+    : (contact.health || 'ok');
+  sdot.className = 'status-dot ' + (offline ? 'offline' : routeCls);
   av.appendChild(sdot);
   row.appendChild(av);
 
@@ -1233,6 +1239,8 @@ function previewFor(contact) {
   const id = contact.id;
   if ((state.typing.get(id) || 0) > Date.now()) return { text: 'typing…', cls: 'typing' };
   if (contact.health === 'prompt') return { text: '🔔 needs your approval', cls: 'alert' };
+  const hold = routeHold(contact);
+  if (hold) return { text: '⚠ ' + hold, cls: 'alert' };   // route-health: mail queued + blocked
   if (contact.away && unreadCount(id) === 0) return { text: '💬 ' + contact.away, cls: 'away' };
   const item = newestMessage(id);
   if (!item) return { text: contact.directory || 'no messages yet', cls: 'muted' };
@@ -1240,6 +1248,30 @@ function previewFor(contact) {
   const body = item.image ? '📷 photo' : (plainPreview(item.text) || '📷 photo');
   const prefix = out ? 'You: ' : (item.type === 'peer' ? (item.name || 'agent') + ': ' : '');
   return { text: prefix + body };
+}
+
+// Route Health L1 (daemon-derived, docs/route-health.md): a human phrase for a
+// route whose mail is queued+blocked, or "" when healthy (hold_reason absent —
+// also the case on an older daemon, so the UI degrades cleanly). 'stale' means
+// the remote client stopped attesting and carries the last-seen age; the others
+// mean mail is genuinely held. Composed per context: previewFor prefixes "⚠ ",
+// threadStatusText joins it with " · ".
+function routeHold(contact) {
+  const r = contact.hold_reason;
+  if (!r) return '';
+  if (r === 'stale') return 'stale — last seen ' + humanizeAgo(contact.last_seen_s);
+  const lbl = { 'at-prompt': 'at a prompt', busy: 'busy',
+                unconfirmed: 'unconfirmed', stalled: 'stuck' }[r] || r;
+  return 'held — ' + lbl;
+}
+
+// Compact age string ("45s" / "12m" / "3h" / "2d") from a seconds count.
+function humanizeAgo(s) {
+  s = Math.max(0, s | 0);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  if (s < 86400) return Math.floor(s / 3600) + 'h';
+  return Math.floor(s / 86400) + 'd';
 }
 
 // Newest message-like item touching the contact — a stored reply/mention/sent
@@ -1341,6 +1373,9 @@ function threadStatusText(contact) {
     const h = HEALTH_LABELS[contact.health];
     if (h) s += ' · ' + h;
   }
+  // Route Health L1: the honest delivery state, after presence/health.
+  const hold = routeHold(contact);
+  if (hold) s += ' · ' + hold;
   // The away line rides under the name, after presence/health.
   if (contact.away) s += ' · 💬 ' + contact.away;
   return s;

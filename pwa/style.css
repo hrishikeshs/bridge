@@ -393,6 +393,8 @@ header {
 .status-dot.working { background: var(--accent); }
 .status-dot.prompt { background: var(--attn); }
 .status-dot.offline { background: var(--dim); }
+.status-dot.held { background: var(--attn); }    /* route-health: mail queued + blocked */
+.status-dot.stale { background: var(--dim); }    /* route-health: remote lease not attesting */
 
 /* The #crew room avatar: a neutral themed disc with the 📢 monogram. A room has
    no name-hashed colour (makeRoomRow sets none inline) and no presence dot. */
