@@ -9,8 +9,8 @@ package main
 import "testing"
 
 // A real Claude Code permission dialog, as capture-pane renders it: the
-// option list is line-anchored (no box border ahead of the ❯/number), which
-// is exactly what promptOptionRe requires.
+// option list is line-anchored (no box border ahead of the ❯/number) and the ❯
+// selection cursor sits on the option line — exactly what dialogFrameRe requires.
 const realPromptPane = `
 ⏺ Bash(git push origin master)
   ⎿  Running…
@@ -126,6 +126,32 @@ func TestPaneShowsDialogCatchesSelectionPastThree(t *testing.T) {
  ❯ 4. production`
 	if !paneShowsDialog(pane) {
 		t.Error("paneShowsDialog = false with the cursor on option 4; delivery would type into an open dialog")
+	}
+}
+
+// TestGatesRejectIdlePlanWithProceedVocab closes the vocab-BEARING half of the
+// quick-wolf class (2026-07-08 review, lens 3). An idle agent whose screenful is a
+// numbered PLAN ending in "Would you like me to proceed?" — with the bare ❯ input
+// caret always on screen — is NOT a dialog: the ❯ is not on a numbered option. The
+// first fix caught only the vocab-LESS variant (quick-wolf's); this asserts BOTH
+// gates now reject the vocab-bearing one too, so the agent's mail is delivered
+// (not held) and no false attention card is raised.
+func TestGatesRejectIdlePlanWithProceedVocab(t *testing.T) {
+	pane := `Here's my plan:
+  1. Refactor the parser
+  2. Add tests
+  3. Update docs
+
+Would you like me to proceed?
+──────────────────────────────
+❯
+──────────────────────────────
+  ⏵⏵ accept edits on (shift+tab to cycle)`
+	if paneShowsDialog(pane) {
+		t.Error("paneShowsDialog = true on an idle numbered plan + 'proceed?' prose; the agent's mail would be wrongly held")
+	}
+	if looksLikePrompt(pane) {
+		t.Error("looksLikePrompt = true on an idle plan; a false attention card would be raised")
 	}
 }
 
