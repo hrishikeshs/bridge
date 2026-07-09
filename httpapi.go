@@ -75,10 +75,20 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		// unknown — no usage parsed yet, or a sessionless agent — so the phone hides
 		// the bar rather than drawing a misleading 0%.
 		ContextPct int `json:"context_pct,omitempty"`
+		// HoldReason and LastSeenS are Route Health Layer 1 (routehealth.go): a
+		// DERIVED, honest delivery state so a stuck route stops reading a sticky
+		// health:"ok". HoldReason is "" (omitempty → hidden) unless mail is genuinely
+		// held — "stale"/"unconfirmed"/"at-prompt"/"busy"/"stalled"; LastSeenS is the
+		// seconds since a remote route last attested (0/hidden for tmux). Purely
+		// additive: Health above is untouched, so every existing consumer stays
+		// byte-identical; the PWA composes the dot color from these in a later change.
+		HoldReason string `json:"hold_reason,omitempty"`
+		LastSeenS  int    `json:"last_seen_s,omitempty"`
 	}
 	items := []item{}
 	for _, c := range registry.Roster() {
-		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Away, c.Fields, c.Transport, c.TransportFlavor, contextPct(c.ContextTokens, c.ContextModel)})
+		hr, ls := deriveRouteHealth(c)
+		items = append(items, item{c.ID, c.Name, c.Directory, c.Status, c.Health, c.PromptOpen, c.Away, c.Fields, c.Transport, c.TransportFlavor, contextPct(c.ContextTokens, c.ContextModel), hr, ls})
 	}
 	// Clocks for phone-side presence truth (round 4): the phone compares `now`
 	// to its own clock and its last-contact timestamp to distinguish "my

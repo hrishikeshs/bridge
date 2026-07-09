@@ -300,6 +300,56 @@ func remoteParkAndWait(c *Contact, text, key string) error {
 }
 
 // ---------------------------------------------------------------------------
+// Route-health read accessor (route-health Layer 1, routehealth.go)
+// ---------------------------------------------------------------------------
+
+// remoteRoute is a read-only snapshot of a contact's RAW lease state, for the
+// route-health surfacing in /api/status (deriveRouteHealth). It exists because
+// remoteFreshLeaseLocked — the funnel every Transport answer uses — COLLAPSES a
+// stale lease to "no lease" so those answers fail safe; that same collapse is
+// exactly what made the July 7 silence invisible (a stale lease read as plain
+// offline, no "last seen 21m"). This snapshot reports staleness honestly instead.
+type remoteRoute struct {
+	hasLease    bool // a lease exists AND still hosts this contact
+	stale       bool // the lease has aged past the TTL (client stopped attesting)
+	suspect     bool // a Deliver timed out against this lease; the next attest clears it
+	ready       bool // the last attest's raw ready boolean (before the dialog belt)
+	dialog      bool // the attested tail shows an interactive dialog (paneShowsDialog)
+	lastSeenAgo int  // whole seconds since the lease's last hello/attest
+	outbox      int  // parked, un-acked deliveries still awaiting drain
+}
+
+// remoteRouteInfo returns a read-only snapshot of a contact's raw lease state. It
+// deliberately does NOT route through remoteFreshLeaseLocked (which hides
+// staleness): it looks the lease up raw — remoteLeaseByContact[id] -> the lease,
+// checking it still hosts the contact — so a stale-but-present lease reports
+// hasLease:true, stale:true rather than vanishing. Takes remoteMu for a short
+// read exactly like Alive/Ready/Capture. paneShowsDialog is the same pure
+// in-memory parse Ready() already runs under this lock. MUTATES NOTHING.
+func remoteRouteInfo(contactID string) remoteRoute {
+	remoteMu.Lock()
+	defer remoteMu.Unlock()
+	token := remoteLeaseByContact[contactID]
+	if token == "" {
+		return remoteRoute{}
+	}
+	l := remoteLeases[token]
+	if l == nil || !l.agents[contactID] {
+		return remoteRoute{}
+	}
+	st := l.states[contactID] // missing key -> zero remoteState (Ready false, tail "")
+	return remoteRoute{
+		hasLease:    true,
+		stale:       l.stale(),
+		suspect:     l.suspect,
+		ready:       st.Ready,
+		dialog:      paneShowsDialog(st.ScreenTail),
+		lastSeenAgo: int(time.Since(l.lastSeen) / time.Second),
+		outbox:      len(l.outbox),
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The /local/transport/* endpoints (lockfile-token auth enforced in handleLocal)
 // ---------------------------------------------------------------------------
 
