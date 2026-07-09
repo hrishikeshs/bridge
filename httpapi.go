@@ -5,17 +5,12 @@ package main
 // Every handler here sits behind route's identity + device-token gates.
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
 // handlePair redeems a pairing code and, on success, sets the device token as
@@ -108,77 +103,6 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp["wake_from"], resp["wake_to"] = from, to
 	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-// myStatusText holds the human's away line — the AIM auto-responder delivered to
-// an agent the moment it messages the phone (handleLocalSend). It is persisted
-// under ~/.bridge/mystatus.json so it survives a daemon restart, guarded by
-// myStatusMu since both the HTTP handler and the send path touch it.
-var (
-	myStatusMu   sync.Mutex
-	myStatusText string
-)
-
-// myStatusFile is the on-disk shape: an object, not a bare string, so the file
-// can gain fields later without a format break (matching tokens.json's shape).
-type myStatusFile struct {
-	Text string `json:"text"`
-}
-
-// loadMyStatus restores the human's away line at startup (called from runServe).
-// A missing or unparseable file leaves it empty — the secure, quiet default.
-func loadMyStatus() {
-	myStatusMu.Lock()
-	defer myStatusMu.Unlock()
-	data, err := os.ReadFile(bridgePath("mystatus.json"))
-	if err != nil {
-		return
-	}
-	var f myStatusFile
-	if json.Unmarshal(data, &f) == nil {
-		myStatusText = f.Text
-	}
-}
-
-// setMyStatus records the human's away line and persists it 0600. Empty clears.
-func setMyStatus(text string) {
-	myStatusMu.Lock()
-	defer myStatusMu.Unlock()
-	myStatusText = text
-	data, _ := json.Marshal(myStatusFile{Text: text})
-	_ = writeFilePrivate(bridgePath("mystatus.json"), data)
-}
-
-// myStatus returns the current human away line ("" when none).
-func myStatus() string {
-	myStatusMu.Lock()
-	defer myStatusMu.Unlock()
-	return myStatusText
-}
-
-// handleMyStatus sets (or clears, on empty text) the human's away line. It is
-// device-token authed like every /api mutation; the value is flattened/capped
-// exactly like an agent status (clampAway), surfaced on /api/status as
-// my_status, and pushed live as a "mystatus" event so every open phone syncs.
-func handleMyStatus(w http.ResponseWriter, r *http.Request, id string) {
-	data, ok := readBody(w, r)
-	if !ok {
-		return
-	}
-	var req struct {
-		Text string `json:"text"`
-	}
-	_ = json.Unmarshal(data, &req)
-
-	text := clampAway(req.Text)
-	setMyStatus(text)
-	if text == "" {
-		audit("mystatus-clear", "", id)
-	} else {
-		audit("mystatus", text, id)
-	}
-	Emit("mystatus", "", authConfig.UserMention, text)
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // handleHistory returns stored events newer than ?since=N.
@@ -556,85 +480,4 @@ func handleCompact(w http.ResponseWriter, r *http.Request, id string) {
 	audit("compact", c.Name, id)
 	Emit("compacted", c.ID, c.Name, "") // so the PWA/feed can reflect it
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// handleUpload saves a photo locally under a server-chosen name (0600) and
-// hands the agent the path to Read. Client filenames are never trusted.
-func handleUpload(w http.ResponseWriter, r *http.Request, id string) {
-	data, ok := readBody(w, r)
-	if !ok {
-		return
-	}
-	var req struct {
-		Agent    string `json:"agent"`
-		Text     string `json:"text"`
-		Image    string `json:"image"`
-		ClientID string `json:"client_id"`
-	}
-	_ = json.Unmarshal(data, &req)
-
-	img, err := base64.StdEncoding.DecodeString(req.Image)
-	if err != nil || len(img) < 100 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad-image"})
-		return
-	}
-	// Reserve the client_id (same TOCTOU-closing claim as handleSend, #3): a
-	// completed or still-in-flight upload is acked as a duplicate; the claim is
-	// released below — committed on delivery, dropped on any failure so the retry
-	// re-runs (H1).
-	if !claimClientID(req.ClientID) {
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "duplicate": true})
-		return
-	}
-	c := registry.Resolve(req.Agent)
-	if c == nil || c.Status != "live" {
-		releaseClientID(req.ClientID, false) // never delivered: allow the retry
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "offline"})
-		return
-	}
-	pathOnDisk, err := saveAttachment(img)
-	if err != nil {
-		releaseClientID(req.ClientID, false) // nothing durable: allow the retry
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "save-failed"})
-		return
-	}
-	msg := fmt.Sprintf("%s [photo saved at %s — use the Read tool to view it]", strings.TrimSpace(req.Text), pathOnDisk)
-	// Same hold-and-batch as handleSend, so a photo can never overtake the
-	// held texts that were sent before it (ordering lives in one queue).
-	holdInbound(c, MailMessage{From: authConfig.UserMention, Via: "phone", Text: msg, TS: nowUTC(), Emitted: true})
-	releaseClientID(req.ClientID, true) // durably queued: a retry is now a safe duplicate ack
-	audit("upload", fmt.Sprintf("%s <- %s (%d bytes)", c.Name, pathOnDisk, len(img)), id)
-	Emit("sent", c.ID, c.Name, strings.TrimSpace(req.Text)+" 📷 photo", req.ClientID)
-	dispatchPluginEvent("message.in", c, map[string]any{"text": msg, "via": "phone", "queued": false})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// saveAttachment writes image bytes under ~/.bridge/attachments with a
-// server-chosen, timestamped name (0600).
-func saveAttachment(img []byte) (string, error) {
-	dir := bridgePath("attachments")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	name := "photo-" + time.Now().UTC().Format("20060102-150405.000000000") + imageExt(img)
-	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, img, 0o600); err != nil {
-		return "", err
-	}
-	_ = os.Chmod(p, 0o600)
-	return p, nil
-}
-
-// imageExt sniffs the file type so the saved photo carries a sensible extension.
-func imageExt(img []byte) string {
-	switch http.DetectContentType(img) {
-	case "image/png":
-		return ".png"
-	case "image/gif":
-		return ".gif"
-	case "image/webp":
-		return ".webp"
-	default:
-		return ".jpg"
-	}
 }
