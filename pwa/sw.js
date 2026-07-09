@@ -1,10 +1,11 @@
 /* bridge service worker — minimal shell cache.
-   API calls always go to the network; the shell falls back to cache
-   so the app opens instantly (and shows the reconnect state) offline. */
+   API calls always go to the network; the shell falls back to cache so the app
+   opens instantly offline — and, since v42, on a STALLED network too (the
+   lie-fi race below), not just on a hard network error. */
 
 'use strict';
 
-const CACHE = 'bridge-v41';
+const CACHE = 'bridge-v42';
 // app.js is a native ES module that imports these peeled modules; every one must
 // be precached (a missed entry = a broken PWA offline on the phone). Bump CACHE
 // whenever this list or any shell file changes.
@@ -13,7 +14,16 @@ const SHELL = ['/', '/style.css', '/app.js',
                '/messagemath.js', '/notifications.js', '/settings.js', '/list.js',
                '/manifest.webmanifest',
                '/wallpaper.jpg',
-               '/icons/icon-192.png', '/icons/icon-512.png'];
+               '/icons/icon-180.png', '/icons/icon-192.png', '/icons/icon-512.png'];
+
+// How long a shell fetch may hang before the cache answers instead. The
+// 2026-07-08 refactor review (C2, the hospital-corridor case): network-first is
+// right when the link works, but a stalled-yet-connected link (1-bar cellular, a
+// black-holed tailnet peer) neither resolves nor rejects for tens of seconds —
+// while a complete precached shell sits on the device. 2.5s keeps any usable
+// network first (shell fetches resolve well under it) and bounds a lie-fi open
+// to a couple of module waves instead of a 30–60s white screen.
+const STALL_MS = 2500;
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)));
@@ -31,19 +41,31 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (url.pathname.startsWith('/api/')) return; // never intercept the API
-  e.respondWith(
-    fetch(e.request)
-      .then((res) => {
-        // Only cache successful GETs — a transient 5xx (or a non-GET) must not
-        // poison the offline shell (e.g. a bad /app.js served forever).
-        if (e.request.method === 'GET' && res.ok) {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(e.request, copy));
-        }
-        return res;
-      })
-      .catch(() => caches.match(e.request, { ignoreSearch: true }))
-  );
+  const network = fetch(e.request).then((res) => {
+    // Only cache successful GETs — a transient 5xx (or a non-GET) must not
+    // poison the offline shell (e.g. a bad /app.js served forever).
+    if (e.request.method === 'GET' && res.ok) {
+      const copy = res.clone();
+      caches.open(CACHE).then((c) => c.put(e.request, copy));
+    }
+    return res;
+  });
+  e.respondWith((async () => {
+    // Race the network against the stall timer. A working network wins and
+    // behaves exactly as before (network-first, cache refreshed); hard-offline
+    // rejects instantly into the cache fallback as before; a STALLED fetch now
+    // loses to the timer and the precached shell opens, while the request keeps
+    // running in the background (waitUntil below) so its eventual response
+    // still lands in the cache for next time.
+    const timer = new Promise((resolve) => { setTimeout(resolve, STALL_MS, undefined); });
+    const winner = await Promise.race([network.catch(() => undefined), timer]);
+    if (winner) return winner;
+    const cached = await caches.match(e.request, { ignoreSearch: true });
+    if (cached) return cached;
+    return network; // nothing cached (first run): let the request run its course
+  })());
+  // Keep the worker alive so a stall-loser response still completes its cache.put.
+  e.waitUntil(network.then(() => undefined, () => undefined));
 });
 
 // Web Push: the daemon fires these so the phone rings with the app closed.

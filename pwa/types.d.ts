@@ -20,19 +20,29 @@ interface Contact {
   /** Client-only marker: renderList tags the synthetic room row so it renders via
       makeRoomRow. Never sent by the daemon. */
   room?: boolean;
-  health?: 'ok' | 'working' | 'prompt';
-  prompt_open?: boolean;
+  /** 'offline' rides along on both disconnect paths; status is the canonical
+      presence signal, health mirrors it there (registry.go:23). */
+  health?: 'ok' | 'working' | 'prompt' | 'offline';
   away?: string;
-  /** Live "needs approval RIGHT NOW" flag — the daemon's authority pruneAttentions trusts over history. */
+  /** The daemon's PromptOpen — a permission dialog is open on the agent's
+      screen — packed by handleStatus into json:"attention" (httpapi.go). ONE
+      field, one truth: there is no separate prompt_open key on this wire (that
+      json tag exists only on /local/contacts, which the PWA never calls). This
+      is the live authority pruneAttentions trusts over event history. */
   attention?: boolean;
   fields?: { status?: string; [k: string]: string | undefined };
   transport?: string;
   transport_flavor?: string;
   /** input+cache tokens ÷ model window, 0/omitted when unknown (context gauge). */
   context_pct?: number;
-  /** Route-health L1: present ONLY when a route is genuinely stuck. */
-  hold_reason?: 'stale' | 'unconfirmed' | 'at-prompt' | 'busy' | 'stalled';
-  /** Seconds since a remote route last attested (route-health, remote only). */
+  /** Route-health L1: present ONLY when a route is genuinely stuck ('offline'
+      = mail queued for a contact that is gone — the July-7 soft-wedge row). */
+  hold_reason?: 'stale' | 'unconfirmed' | 'at-prompt' | 'busy' | 'stalled' | 'offline';
+  /** Seconds since the route was last seen (route-health). Live remote rows:
+      the lease's attest age. OFFLINE rows, best evidence first: the lingering
+      stale lease's attest age (while it survives the lazy 10×TTL reap), else
+      the Contact.LastSeen strike/connect stamp — so tmux offline rows carry an
+      honest age too. Absent/0 = no evidence; the UI stays silent. */
   last_seen_s?: number;
 }
 
@@ -41,20 +51,23 @@ interface Room {
   name: string;
 }
 
-/** A stored/streamed event (SSE /api/events + /api/history). */
+/** A stored/streamed event (SSE /api/events + /api/history). Mirrors the Go
+    Event struct (events.go) — it carries NO image/mstate fields (a phone photo
+    is a 'sent' event whose text ends in "📷 photo"; those two live on the
+    client-only PendingMsg/MessageLike shapes). */
 interface BridgeEvent {
-  id: number;
+  /** Every STORED event carries id+ts; only the transient 'typing' frame
+      (EmitTyping marshals just {type,agent,name}) arrives without them. */
+  id?: number;
   type:
     | 'reply' | 'mention' | 'sent' | 'peer' | 'connected'
     | 'attention' | 'attention-clear' | 'approved' | 'compacted'
     | 'mystatus' | 'reaction' | 'status' | 'typing' | 'paper'
-    | 'interrupted';
+    | 'interrupted' | 'plugin';
   agent: string;
   name?: string;
   text?: string;
-  ts: string;
-  image?: string;
-  mstate?: string;
+  ts?: string;
   /** reaction events: the target event id the emoji decorates. */
   target?: number;
   /** 'sent' events: the client-supplied id used to reconcile the outbox echo. */

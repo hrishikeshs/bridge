@@ -539,7 +539,7 @@ func (r *Registry) SetOffline(id string) {
 	c.Status = "offline"
 	c.Health = "offline"
 	c.PromptOpen = false
-	c.PromptSig = "" // no card survives going offline; don't let a revival inherit its caption
+	c.PromptSig = ""           // no card survives going offline; don't let a revival inherit its caption
 	c.LastSeen = timeNowUnix() // last observed alive ≈ now; the away clock the wake digest measures from
 	r.save()
 }
@@ -681,6 +681,16 @@ func (r *Registry) MailboxOldestAgeSeconds(id string) int {
 		age = 0
 	}
 	return age
+}
+
+// IsFlushing reports whether a guarded mailbox flush is currently delivering
+// this contact's queue (BeginFlush held). Route-health reads it so an actively
+// draining backlog is never called "stalled" (2026-07-08 refactor review, C8).
+// Pure read, zero writes.
+func (r *Registry) IsFlushing(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.flushing[id]
 }
 
 // PeekMailboxGroup returns (a copy of) the longest queue prefix that shares

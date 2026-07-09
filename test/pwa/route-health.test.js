@@ -22,6 +22,7 @@ const status = {
     { id: 'b', name: 'busy-agent', status: 'live', health: 'working', hold_reason: 'busy' },
     { id: 'c', name: 'stale-agent', status: 'live', health: 'ok', hold_reason: 'stale', last_seen_s: 720 },
     { id: 'd', name: 'healthy-agent', status: 'live', health: 'ok' },
+    { id: 'e', name: 'prompt-agent', status: 'live', health: 'prompt' },
   ],
   rooms: [{ id: 'room:crew', name: '#crew' }],
   my_status: '',
@@ -60,4 +61,20 @@ test('healthy route (no hold_reason) → normal health dot, no held/stale', asyn
   const cls = rowByName(h, 'healthy-agent').querySelector('.status-dot').className;
   assert.match(cls, /\bok\b/, 'falls through to the health dot');
   assert.doesNotMatch(cls, /\b(held|stale)\b/, 'no route-health class when the field is absent');
+});
+
+// 2026-07-08 refactor review, C9: Focus filters on message recency, but an
+// ALERTING row (held/stale route, open permission prompt) must never be hidden
+// — a held route stops producing messages by definition. With no messages in
+// history at all, every row is "quiet": pre-fix, Focus showed only the 2-row
+// floor; post-fix, every alerting row survives and the quiet healthy row is
+// still filtered (proving the filter itself still works).
+test('Focus never hides an alerting row (held/stale/prompt exempt from the quiet filter)', async (t) => {
+  const h = await loadApp({ status, localStorage: { focus: '1' } });
+  t.after(() => h.teardown());
+  for (const name of ['held-agent', 'busy-agent', 'stale-agent', 'prompt-agent']) {
+    assert.ok(rowByName(h, name), name + ' visible under Focus despite no recent messages');
+  }
+  assert.equal(rowByName(h, 'healthy-agent'), undefined,
+    'quiet healthy row is still focus-filtered (the exemption is alert-only)');
 });

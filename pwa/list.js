@@ -44,7 +44,12 @@ const FOCUS_FLOOR = 2;
 function applyFocus(rows) {
   if (!state.focus) return rows;
   const cut = Date.now() - FOCUS_WINDOW_MS;
-  const shown = rows.filter((c) => lastMessageMs(c.id) >= cut);
+  // An ALERTING row is exempt from the quiet-list filter (2026-07-08 review,
+  // C9): a held/stale route or an open permission prompt must never be hidden
+  // by Focus — a held route stops producing messages by definition, so recency
+  // is exactly the wrong test for it.
+  const shown = rows.filter((c) =>
+    c.hold_reason || c.health === 'prompt' || lastMessageMs(c.id) >= cut);
   if (shown.length < FOCUS_FLOOR) {
     const byMine = rows.slice().sort((a, b) => myLastSentMs(b.id) - myLastSentMs(a.id));
     for (const c of byMine) {

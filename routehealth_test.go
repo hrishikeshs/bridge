@@ -191,13 +191,77 @@ func TestDeriveRouteHealth(t *testing.T) {
 			wantHold: "",
 		},
 		{
-			// (f6) no false positive: an offline contact (even with old mail) is
-			// already shown offline — route-health returns empty immediately.
-			name: "no-fp offline: returns empty regardless of mail",
+			// (g1) offline honesty (2026-07-08 review, C7): mail queued for a gone
+			// contact reads "offline" — the July-7 soft-wedge lands on the offline
+			// row, and its waiting mail must not be silent there.
+			name: "offline honesty: held mail on an offline row reads offline",
 			setup: func() (*Contact, func()) {
 				cid := "rh-offline"
 				registry.mailbox[cid] = []MailMessage{mail(routeStallSeconds + 100)}
 				return &Contact{ID: cid, Name: "ghost", Status: "offline", Transport: "remote"}, noCleanup
+			},
+			wantHold: "offline",
+		},
+		{
+			// (g2) offline honesty: the lingering stale lease supplies the TRUE
+			// last-attested age for the offline row (Contact.LastSeen is hello-time
+			// and deliberately unused). The lease is 2h stale — well past the TTL,
+			// short of the 10×TTL reap.
+			name: "offline honesty: lingering stale lease supplies last seen",
+			setup: func() (*Contact, func()) {
+				cid := "rh-offline-lease"
+				clean := addLease(cid, time.Now().Add(-2*time.Hour), false, remoteState{Ready: true})
+				registry.mailbox[cid] = []MailMessage{mail(30)}
+				return &Contact{ID: cid, Name: "wedge", Status: "offline", Transport: "remote"}, clean
+			},
+			wantHold: "offline",
+			verify: func(t *testing.T, ls int) {
+				if ls < 7000 {
+					t.Errorf("offline lastSeenS = %d, want the lease's ~2h attest age", ls)
+				}
+			},
+		},
+		{
+			// (g3) no false positive: an offline contact with NO mail and NO
+			// evidence (zero LastSeen, no lease) stays fully quiet.
+			name: "no-fp offline: no mail, no evidence stays quiet",
+			setup: func() (*Contact, func()) {
+				return &Contact{ID: "rh-offline-quiet", Name: "gone", Status: "offline", Transport: ""}, noCleanup
+			},
+			wantHold: "",
+			verify: func(t *testing.T, ls int) {
+				if ls != 0 {
+					t.Errorf("offline tmux lastSeenS = %d, want 0 (no evidence, no guessing)", ls)
+				}
+			},
+		},
+		{
+			// (g5) offline fallback clock: with no lease, the SetOffline strike
+			// stamp (Contact.LastSeen) supplies the age — tmux rows included.
+			name: "offline honesty: strike-stamp fallback supplies last seen on tmux",
+			setup: func() (*Contact, func()) {
+				return &Contact{ID: "rh-offline-struck", Name: "struck", Status: "offline",
+					Transport: "", LastSeen: timeNowUnix() - 3600}, noCleanup
+			},
+			wantHold: "",
+			verify: func(t *testing.T, ls int) {
+				if ls < 3595 || ls > 3660 {
+					t.Errorf("offline strike-stamp lastSeenS = %d, want ~3600", ls)
+				}
+			},
+		},
+		{
+			// (g4) mid-drain is not stalled (2026-07-08 review, C8): the same
+			// old-backlog tmux case as (e), but a guarded flush is actively
+			// delivering (flushing[id] held) — the backlog is draining, not stuck.
+			name: "no-fp tmux: draining backlog (flushing) is not stalled",
+			setup: func() (*Contact, func()) {
+				cid := "rh-draining"
+				registry.mailbox[cid] = []MailMessage{mail(routeStallSeconds + 30)}
+				registry.flushing[cid] = true
+				return &Contact{ID: cid, Name: "drain", Status: "live", Transport: ""}, func() {
+					delete(registry.flushing, cid)
+				}
 			},
 			wantHold: "",
 		},

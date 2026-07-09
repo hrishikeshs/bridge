@@ -715,7 +715,8 @@ export function routeHold(contact) {   // exported: list.js previewFor uses it (
   if (!r) return '';
   if (r === 'stale') return 'stale — last seen ' + humanizeAgo(contact.last_seen_s);
   const lbl = { 'at-prompt': 'at a prompt', busy: 'busy',
-                unconfirmed: 'unconfirmed', stalled: 'stuck' }[r] || r;
+                unconfirmed: 'unconfirmed', stalled: 'stuck',
+                offline: 'mail waiting' }[r] || r;   // offline = queued for someone who's gone (review C7)
   return 'held — ' + lbl;
 }
 
@@ -762,6 +763,12 @@ function threadStatusText(contact) {
   // Route Health L1: the honest delivery state, after presence/health.
   const hold = routeHold(contact);
   if (hold) s += ' · ' + hold;
+  // An offline row's honest clock (review C7): the daemon sends last_seen_s
+  // from the lingering lease's true attest age when it has one — real evidence,
+  // so show it; absent, stay silent rather than guessing off hello-time.
+  if (contact.status === 'offline' && contact.last_seen_s) {
+    s += ' · last seen ' + humanizeAgo(contact.last_seen_s);
+  }
   // The away line rides under the name, after presence/health.
   if (contact.away) s += ' · 💬 ' + contact.away;
   return s;
