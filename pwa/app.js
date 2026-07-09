@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — phone client.
    Talks to the daemon over REST + Server-Sent Events.
 
@@ -123,18 +125,22 @@ loadPending();
    "room:" id namespace, so every helper keyed on a string id (unreadCount,
    newestMessage, lastActivityMs, the lastSeen cursor) just works, while the
    contact-shaped lookups (health, presence, panes) are guarded to skip it. */
+/** @param {string | null} id @returns {boolean} */
 export function isRoomId(id) { return typeof id === 'string' && id.startsWith('room:'); }   // exported: context-gauge.js
+/** @param {string | null} id @returns {Room | null} */
 function roomById(id) { return state.rooms.find((r) => r.id === id) || null; }
 
 // A thread target is legitimate if it's a known contact OR a known room. A
 // notification tap deep-links with contact="room:crew", so navigation must
 // validate against both (never trust an id from outside to pick a target).
+/** @param {string | null} id @returns {boolean} */
 function isValidTarget(id) {
   return state.contacts.some((c) => c.id === id) || state.rooms.some((r) => r.id === id);
 }
 
 // Display name for a thread id — a contact's name or a room's ("#crew"). Used
 // wherever contactName() alone would return undefined for a room.
+/** @param {string | null} id @returns {string | undefined} */
 export function threadName(id) {   // exported: context-gauge.js
   if (isRoomId(id)) { const r = roomById(id); return (r && r.name) || '#crew'; }
   return contactName(id);
@@ -303,7 +309,7 @@ function showApp() {
 /* ---------- pairing ---------- */
 
 $('pair-btn').addEventListener('click', async () => {
-  const code = $('pair-code').value.trim();
+  const code = /** @type {HTMLInputElement} */ ($('pair-code')).value.trim();
   const res = await fetch('/api/pair', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -438,6 +444,7 @@ function scheduleReconnect() {
   reconnectDelay = Math.min(reconnectDelay * 2, 15000);
 }
 
+/** @param {BridgeEvent} event @returns {boolean} — true when the event was pushed to the feed */
 function ingest(event) {
   if (event.id <= state.lastEventId) return false;
   state.lastEventId = event.id;
@@ -476,6 +483,7 @@ function ingest(event) {
   return true;
 }
 
+/** @param {boolean} on */
 function setConnected(on) {
   state.connected = !!on;
   // Both view headers carry a connection dot; keep them in lockstep.
@@ -508,6 +516,7 @@ function updateAttentionBanner() {
 /* Record the daemon's clocks from a /api/status payload (round 4 presence
    truth). Marks the reach time, notices a restart (started changed), and
    surfaces a fresh sleep window once as a transient banner. */
+/** @param {any} data — the /api/status JSON (res.json() is untyped) */
 function noteServerClocks(data) {
   if (!data) return;
   state.lastContact = Date.now();
@@ -532,9 +541,12 @@ function noteServerClocks(data) {
 }
 
 // "HH:MM" in the phone's locale from a unix-seconds timestamp.
+/** @param {number} [sec] @returns {string} */
 function clockUnix(sec) {
   const d = new Date((sec || 0) * 1000);
-  return isNaN(d) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // isNaN(Date) coerces via Number(d) at runtime; the cast is inert (a comment)
+  // and keeps that behaviour byte-identical — no d.getTime() logic change.
+  return isNaN(/** @type {?} */ (d)) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function updateBanner() {
@@ -588,6 +600,7 @@ function showList() {
   armScreensaver();          // #19(b): the list is the only view with scenery
 }
 
+/** @param {string} id */
 function openThread(id) {
   state.view = 'thread';
   state.selected = id;
@@ -617,6 +630,7 @@ function openThread(id) {
 }
 
 // Enter a thread and push it onto history, so back pops to the list.
+/** @param {string} id */
 export function navigateToThread(id) {   // exported: list.js rows navigate through it
   if (state.view === 'thread' && state.selected === id) { openThread(id); return; }
   history.pushState({ view: 'thread', id }, '', '#/c/' + encodeURIComponent(id));
@@ -649,6 +663,7 @@ window.addEventListener('popstate', routeFromLocation);
 
 // Notification deep-link (SW postMessage, app already open). Validate the id
 // against the roster so an unknown/crafted value can't select a real target.
+/** @param {string} id */
 function selectContactIfValid(id) {
   if (id && isValidTarget(id)) navigateToThread(id);
 }
@@ -660,7 +675,7 @@ $('back-btn').addEventListener('click', () => history.back());
    "stop — do this instead" arrives in the right order. */
 $('stop-btn').addEventListener('click', async () => {
   if (!state.selected) return;
-  const btn = $('stop-btn');
+  const btn = /** @type {HTMLButtonElement} */ ($('stop-btn'));
   btn.disabled = true;
   await api('/api/interrupt', { agent: state.selected });
   btn.disabled = false;
@@ -694,6 +709,7 @@ $('stop-btn').addEventListener('click', async () => {
 // the remote client stopped attesting and carries the last-seen age; the others
 // mean mail is genuinely held. Composed per context: previewFor prefixes "⚠ ",
 // threadStatusText joins it with " · ".
+/** @param {Contact} contact @returns {string} */
 export function routeHold(contact) {   // exported: list.js previewFor uses it (humanizeAgo stays here too)
   const r = contact.hold_reason;
   if (!r) return '';
@@ -704,6 +720,7 @@ export function routeHold(contact) {   // exported: list.js previewFor uses it (
 }
 
 // Compact age string ("45s" / "12m" / "3h" / "2d") from a seconds count.
+/** @param {number} [s] @returns {string} */
 function humanizeAgo(s) {
   s = Math.max(0, s | 0);
   if (s < 60) return s + 's';
@@ -732,6 +749,7 @@ export function updateThreadHeader() {   // exported: context-gauge.js doCompact
   renderContextGauge(c);   // ── context gauge ── ≥70% only; enabled iff idle
 }
 
+/** @param {Contact | undefined} contact @returns {string} */
 function threadStatusText(contact) {
   if (!contact) return '';
   let s = 'live';
@@ -813,13 +831,13 @@ function renderFeed() {
   // New events arriving while the thread is open and visible clear its unread.
   if (!document.hidden) { markSeen(state.selected); updateUnreadTotals(); }
   const g = state.guidance;
-  $('msg-input').placeholder = (g && g.agent === state.selected && g.until > Date.now())
+  /** @type {HTMLInputElement} */ ($('msg-input')).placeholder = (g && g.agent === state.selected && g.until > Date.now())
     ? 'Tell ' + (threadName(state.selected) || 'the agent') + ' what to do differently…'
     : 'Message ' + (threadName(state.selected) || 'contact') + '…';
-  $('send-btn').disabled = false;
+  /** @type {HTMLButtonElement} */ ($('send-btn')).disabled = false;
   // Photos are a 1:1 feature in v1 — the room upload path has no fan-out, so a
   // photo to #crew would stick queued. Disable the attach button in a room.
-  $('attach-btn').disabled = isRoomId(state.selected);
+  /** @type {HTMLButtonElement} */ ($('attach-btn')).disabled = isRoomId(state.selected);
 }
 
 /* The "↑ show earlier" row at the top of a windowed feed. Widening the window
@@ -828,6 +846,7 @@ function renderFeed() {
    down by exactly how much taller it got. The reader sits at the top when this
    fires (the button IS the top), so renderFeed's near-bottom stick can't trip,
    and pinFeedBottom never runs from here — the view holds where the eye is. */
+/** @param {number} n @returns {HTMLElement} */
 function showEarlierButton(n) {
   const btn = document.createElement('button');
   btn.className = 'show-earlier';
@@ -854,6 +873,7 @@ function showEarlierButton(n) {
    without yanking one who scrolled up. Every DEFERRED re-pin honours that
    near-bottom guard regardless — 60px, renderFeed's own stick threshold — so a
    settle that lands mid-scroll never steals the view (field report, 2026-07-06). */
+/** @param {boolean} [land] */
 function pinFeedBottom(land) {
   const feed = $('feed');
   const nearBottom = () =>
@@ -870,11 +890,13 @@ function pinFeedBottom(land) {
   setTimeout(settle, 300);
 }
 
+/** @param {string | null} id @returns {string | undefined} */
 function contactName(id) {
   const contact = state.contacts.find((c) => c.id === id);
   return contact && contact.name;
 }
 
+/** @param {BridgeEvent} event @param {{kind:string, ts:string|null, key?:string}} [resolution] @returns {Node} */
 function renderEvent(event, resolution) {
   if (event.type === 'attention') return attentionCard(event, resolution);
   const el = document.createElement('div');
@@ -937,6 +959,7 @@ function renderEvent(event, resolution) {
    Render-time only: one event on the wire stays one event, so history,
    pushes and dedup are untouched (and old walls of text improve
    retroactively). */
+/** @param {BridgeEvent} event @param {string} cls @param {Node} whoEl @returns {Node} */
 function replyBubbles(event, cls, whoEl) {
   const parts = splitPleasing(event.text || '');
   // Long-press metadata for the action sheet: the whole event is the reaction
@@ -971,6 +994,7 @@ function replyBubbles(event, cls, whoEl) {
    failed / queued) shows as a glyph in the who-line; failed messages get a
    retry button that re-sends with the same client_id (safe — the server
    dedups). Replaced by the server's own "sent" event when it arrives. */
+/** @param {PendingMsg} msg @returns {HTMLElement} */
 function renderPending(msg) {
   const el = document.createElement('div');
   el.className = 'msg sent pending ' + msg.mstate;
@@ -1007,7 +1031,9 @@ function renderPending(msg) {
    daemon's own attention-clear still reads as "Approved from phone". An
    attention with no later resolver stays live (absent from the map).
    Returns Map(attentionEventId -> { kind: 'approved'|'cleared', ts }). */
+/** @param {BridgeEvent[]} events @returns {Map<number, {kind:string, ts:string|null, key?:string}>} */
 function resolveAttentions(events) {
+  /** @type {Map<number, {kind:string, ts:string|null, key?:string}>} */
   const res = new Map();
   let open = null;   // the currently-unresolved attention, if any
   for (const e of events) {
@@ -1028,6 +1054,7 @@ function resolveAttentions(events) {
 
 /* An attention event. Live → the full tappable approval card. Resolved →
    collapsed: one dimmed prompt line + a resolution line, no buttons. */
+/** @param {BridgeEvent} event @param {{kind:string, ts:string|null, key?:string}} [resolution] @returns {HTMLElement} */
 function attentionCard(event, resolution) {
   const el = document.createElement('div');
   el.className = 'attention';
@@ -1062,6 +1089,7 @@ function attentionCard(event, resolution) {
    no re-approving. A resolved card carries no interactive children, so a single
    click handler on the whole card is unambiguous; the collapse/resolve
    machinery in attentionCard/resolveAttentions is left exactly as it was. */
+/** @param {HTMLElement} card @param {BridgeEvent} event @param {{kind:string, ts:string|null, key?:string}} resolution */
 function makeResolvedExpandable(card, event, resolution) {
   const detail = document.createElement('div');
   detail.className = 'attn-detail hidden';
@@ -1101,6 +1129,7 @@ function makeResolvedExpandable(card, event, resolution) {
 // approved digit is mapped back to its option's full label when the snapshot
 // still parses (so "3" reads "3. No, and tell Claude…"); 'esc' reads as a
 // dismissal; a desk-answered / timed-out resolution carries no key.
+/** @param {BridgeEvent} event @param {{kind:string, ts:string|null, key?:string}} resolution @returns {string} */
 function resolutionAnswer(event, resolution) {
   if (resolution.kind === 'approved') {
     const key = resolution.key;
@@ -1115,6 +1144,7 @@ function resolutionAnswer(event, resolution) {
 }
 /* ── end #17 ────────────────────────────────────────────────────────────────*/
 
+/** @param {string} [text] @returns {HTMLElement} */
 function promptExcerpt(text) {
   const pre = document.createElement('pre');
   const lines = (text || '').split('\n');
@@ -1149,7 +1179,9 @@ function promptExcerpt(text) {
      deny  — a "No…" choice: styled distinctly and wired to the guidance flow
    Fallback when nothing parses: the canonical 1=Yes / 3=No pair, matching the
    daemon's 1/3/esc contract (approveKeys always adds the esc button). */
+/** @param {string} [text] @returns {{key:string, label:string, deny:boolean}[]} */
 function promptOptions(text) {
+  /** @type {{key:string, label:string, deny:boolean}[]} */
   const options = [];
   for (const line of (text || '').split('\n')) {
     const m = line.match(/^\s*(?:❯\s*)?([123])\.\s*(.+?)\s*$/);
@@ -1168,6 +1200,7 @@ function promptOptions(text) {
 // primary; the deny option and the Esc/dismiss button carry secondary/danger
 // styling so they never read as the default tap. The key each sends is
 // unchanged — only the label and the layout do.
+/** @param {BridgeEvent} event @returns {HTMLElement} */
 function approveKeys(event) {
   const keys = document.createElement('div');
   keys.className = 'keys';
@@ -1195,6 +1228,7 @@ function approveKeys(event) {
 
 // After a No: the agent is waiting to hear what to do differently. Point the
 // composer at that conversation and say so; the hint expires quietly.
+/** @param {string} agentID @param {string} [name] */
 function offerGuidance(agentID, name) {
   state.guidance = { agent: agentID, until: Date.now() + 2 * 60 * 1000 };
   input.placeholder = 'Tell ' + (name || 'the agent') + ' what to do differently…';
@@ -1203,13 +1237,14 @@ function offerGuidance(agentID, name) {
 
 /* ---------- composer ---------- */
 
-const input = $('msg-input');
+const input = /** @type {HTMLTextAreaElement} */ ($('msg-input'));
 
 function autogrow() {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 120) + 'px';
 }
 
+/** @returns {string} */
 function draftKey() { return 'draft-' + state.selected; }
 
 function restoreDraft() {
@@ -1227,11 +1262,15 @@ input.addEventListener('input', () => {
    focused, take every other control out of the tab order (taps still
    work) so Safari sees a single input and drops the bar — the
    iMessage-clean keyboard. Restored on blur for desktop keyboard users. */
+/** @param {boolean} on */
 function setComposerFocusMode(on) {
-  document.querySelectorAll('button, [href], input, [tabindex]').forEach((el) => {
+  document.querySelectorAll('button, [href], input, [tabindex]').forEach((node) => {
+    const el = /** @type {HTMLElement} */ (node);
     if (el === input) return;
     if (on) {
-      if (!el.dataset.tabSaved) el.dataset.tabSaved = el.tabIndex;
+      // DOMStringMap coerces the RHS to a string at runtime; the cast is inert
+      // (a comment), so the assignment stays byte-identical (no String() wrap).
+      if (!el.dataset.tabSaved) el.dataset.tabSaved = /** @type {?} */ (el.tabIndex);
       el.tabIndex = -1;
     } else if (el.dataset.tabSaved !== undefined) {
       el.tabIndex = Number(el.dataset.tabSaved);
@@ -1259,8 +1298,9 @@ let pendingImage = null; // base64 payload (no data: prefix)
 $('attach-btn').addEventListener('click', () => $('attach-input').click());
 
 $('attach-input').addEventListener('change', async (e) => {
-  const file = e.target.files && e.target.files[0];
-  e.target.value = '';
+  const target = /** @type {HTMLInputElement} */ (e.target);
+  const file = target.files && target.files[0];
+  target.value = '';
   if (!file) return;
   const dataUrl = await downscale(file).catch(() => null);
   if (!dataUrl) {
@@ -1270,7 +1310,7 @@ $('attach-input').addEventListener('change', async (e) => {
     return;
   }
   pendingImage = dataUrl.split(',')[1];
-  $('attach-thumb').src = dataUrl;
+  /** @type {HTMLImageElement} */ ($('attach-thumb')).src = dataUrl;
   $('attach-preview').classList.remove('hidden');
 });
 
@@ -1278,12 +1318,13 @@ $('attach-remove').addEventListener('click', clearAttachment);
 
 function clearAttachment() {
   pendingImage = null;
-  $('attach-thumb').src = '';
+  /** @type {HTMLImageElement} */ ($('attach-thumb')).src = '';
   $('attach-preview').classList.add('hidden');
 }
 
 /* Re-encode client-side: caps dimensions at 2048px and always produces
    JPEG — smaller uploads and HEIC handled for free by the canvas. */
+/** @param {File} file @returns {Promise<string>} */
 function downscale(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
@@ -1314,6 +1355,7 @@ function sendMessage() {
   // A quote rides on a text send only — the upload path carries none, so a
   // photo drops any pending quote rather than show an inset the agent won't get.
   const quote = image ? null : state.quote;
+  /** @type {PendingMsg} */
   const msg = {
     clientId: crypto.randomUUID(),
     agent: state.selected,               // a contact id, or a room id ("room:crew")
@@ -1351,6 +1393,7 @@ $('send-btn').addEventListener('click', sendMessage);
 
 // The quoted bubble as it rides on an outbound message (a 'sent' event's
 // quote_* fields, or a pending echo's msg.quote): author line + excerpt inset.
+/** @param {string} [name] @param {string} [excerpt] @returns {HTMLElement} */
 function quoteInset(name, excerpt) {
   const box = document.createElement('div');
   box.className = 'quote-inset';
@@ -1367,6 +1410,7 @@ function quoteInset(name, excerpt) {
 
 // The reaction badge row for a target bubble, drawn from the folded map. No-op
 // when nothing has reacted to this event id.
+/** @param {HTMLElement} bubble @param {number} id */
 function appendReactions(bubble, id) {
   const arr = state.reactions.get(id);
   if (!arr || !arr.length) return;
@@ -1389,6 +1433,8 @@ let lpTimer = null;
 let lpStart = null;
 let actionOpenedAt = 0;
 
+/** @typedef {{id:number, name:string, type?:string, text:string}} BubbleMeta */
+/** @param {HTMLElement} el @param {BubbleMeta} meta */
 function attachBubbleActions(el, meta) {
   el.addEventListener('touchstart', (e) => {
     const t = e.touches && e.touches[0];
@@ -1416,6 +1462,7 @@ function attachBubbleActions(el, meta) {
   });
 }
 
+/** @param {BubbleMeta} meta @param {{x:number, y:number}} at */
 function openActionSheet(meta, at) {
   const reactions = $('action-reactions');
   reactions.innerHTML = '';
@@ -1461,6 +1508,7 @@ function openActionSheet(meta, at) {
    (httpapi.go) opened up — today anything outside the 6 returns 400 "bad-emoji"
    and react() rolls the optimistic badge back. The PWA side is ready; the
    companion daemon change is out of this agent's file scope. */
+/** @param {HTMLElement} reactions @param {HTMLElement} quick @param {BubbleMeta} meta */
 function addEmojiPicker(reactions, quick, meta) {
   const more = document.createElement('button');
   more.className = 'action-reaction action-reaction-more';
@@ -1489,7 +1537,7 @@ function addEmojiPicker(reactions, quick, meta) {
 
   let fired = false;   // one reaction per open — guard against a double 'input'
   picker.addEventListener('input', (e) => {
-    if (e.isComposing || fired) return;   // ignore mid-IME-composition frames
+    if (/** @type {InputEvent} */ (e).isComposing || fired) return;   // ignore mid-IME-composition frames
     const emoji = firstEmoji(picker.value);
     if (!emoji) return;                    // nothing pickable yet (empty / letters)
     fired = true;
@@ -1505,11 +1553,15 @@ function addEmojiPicker(reactions, quick, meta) {
    leading non-emoji (a stray letter the keyboard was still on) and returns '' when
    there is no emoji yet — so the picker only fires on a real pick, and a
    multi-emoji paste yields just the first (the "take the first emoji" guard). */
+/** @param {string} str @returns {string} */
 function firstEmoji(str) {
   const s = str || '';
+  /** @param {string} g */
   const isEmoji = (g) => /(\p{Extended_Pictographic}|\p{Regional_Indicator})/u.test(g);
-  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
-    for (const { segment } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s)) {
+  // Intl.Segmenter is es2022; the lib is es2020, so reach it via an inert cast
+  // (a comment) rather than bumping the shared tsconfig lib.
+  if (typeof Intl !== 'undefined' && /** @type {any} */ (Intl).Segmenter) {
+    for (const { segment } of new (/** @type {any} */ (Intl).Segmenter)(undefined, { granularity: 'grapheme' }).segment(s)) {
       if (isEmoji(segment)) return segment;
     }
     return '';
@@ -1543,6 +1595,7 @@ function closeActionSheet() { $('action-sheet').classList.add('hidden'); }
 // box, so a tall bubble threw the menu to the top of the screen). Reveal to
 // measure, clamp 8px inside every edge, and flip ABOVE the finger when placing
 // below it would spill past the bottom. CSSOM writes, allowed by the CSP.
+/** @param {{x:number, y:number}} at */
 function positionActionMenu(at) {
   const menu = $('action-menu');
   menu.style.visibility = 'hidden';        // reveal to measure, place, then show
@@ -1570,6 +1623,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeActio
 /* Send an emoji reaction. The badge itself arrives via the daemon's echoed
    'reaction' event over SSE; myReactions only tracks this session's taps for the
    pressed/disabled state, so it rolls back if the POST doesn't land. */
+/** @param {string | null} agent @param {number} eventId @param {string} emoji */
 async function react(agent, eventId, emoji) {
   if (!agent) return;
   const set = state.myReactions.get(eventId) || new Set();
@@ -1587,11 +1641,13 @@ async function react(agent, eventId, emoji) {
 
 // First 80 chars of a bubble, flattened to one line (plainPreview strips
 // thinking/markdown noise); the daemon re-clamps to 80 runes authoritatively.
+/** @param {string} [text] @returns {string} */
 function quoteExcerptText(text) {
   const clean = plainPreview(text) || (text || '').replace(/\s+/g, ' ').trim();
   return clean.slice(0, 80);
 }
 
+/** @param {BubbleMeta} meta */
 function setQuote(meta) {
   state.quote = { name: meta.name, excerpt: quoteExcerptText(meta.text) };
   renderQuoteChip();
@@ -1620,6 +1676,7 @@ $('quote-chip-remove').addEventListener('click', () => { state.quote = null; ren
 /* Every POST is bounded by a 10s timeout: a hung request aborts and returns
    null (a failed send, retryable). Returns the Response otherwise so callers
    can read res.ok / res.status. */
+/** @param {string} path @param {any} payload @returns {Promise<Response | null>} */
 export async function api(path, payload) {   // exported: context-gauge.js POSTs /api/compact through it
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
@@ -1639,6 +1696,7 @@ export async function api(path, payload) {   // exported: context-gauge.js POSTs
 
 /* Send (or re-send) one pending message. Idempotent by client_id, so a
    retry that the server already saw comes back 200 duplicate — still ok. */
+/** @param {PendingMsg} msg */
 async function deliver(msg) {
   if (msg.inflight) return;
   if (!navigator.onLine) {
@@ -1648,6 +1706,7 @@ async function deliver(msg) {
   msg.mstate = 'sending';
   savePending();
   renderFeed();
+  /** @type {{agent:string, text:string, client_id:string, image?:string, quote?:Quote}} */
   const payload = { agent: msg.agent, text: msg.text, client_id: msg.clientId };
   if (msg.image) payload.image = msg.image;
   // Quote rides on /api/send only (the upload path ignores it). Sent from
@@ -1684,6 +1743,7 @@ function flushOutbox() {
    the wrong queued message when two share the same text ("yes"/"go"). Fall
    back to text only when no client_id is present (older server / no match).
    Uploads arrive with a " 📷 photo" suffix the echo doesn't have. */
+/** @param {string} agent @param {string} [text] @param {string} [clientId] */
 function dropPendingEcho(agent, text, clientId) {
   let i = -1;
   if (clientId) {
@@ -1718,6 +1778,7 @@ function loadPending() {
   }));
 }
 
+/** @param {string} agent @param {string} key */
 async function approve(agent, key) {
   await api('/api/approve', { agent, key });
 }
