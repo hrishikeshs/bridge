@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — the conversation list (roster view).
    Peeled out of app.js (round 2 of the ES-module split); behaviour unchanged.
 
@@ -160,6 +162,7 @@ function roomPreview(id) {
   return { text: prefix + body };
 }
 
+/** @param {Contact} contact */
 function makeRow(contact) {
   const id = contact.id;
   const offline = contact.status === 'offline';
@@ -281,6 +284,7 @@ function avatarColor(name) {
 // contact's directory / a placeholder. The away line stands in for an already-
 // read history, but a fresh reply must never hide behind a stale status — so
 // unread previews win (spec).
+/** @param {Contact} contact */
 function previewFor(contact) {
   const id = contact.id;
   if ((state.typing.get(id) || 0) > Date.now()) return { text: 'typing…', cls: 'typing' };
