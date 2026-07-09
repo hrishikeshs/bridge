@@ -10,155 +10,39 @@
 
 'use strict';
 
-// Peeled feature modules (round 1 of the ES-module split). Behaviour unchanged;
-// they import shared helpers/state from this core, and this core calls back into
-// them (a benign ESM cycle — every call is deferred to runtime, never eval-time).
+// Peeled feature modules (the ES-module split). Behaviour unchanged; they import
+// shared helpers/state from this core, and this core calls back into them (a
+// benign ESM cycle — every call is deferred to runtime, never eval-time).
 import { armScreensaver, wakeScreensaver, isMomentEvent, initScreensaver } from './screensaver.js';
 import { renderContextGauge } from './context-gauge.js';
+// Appearance (theme / scenery / light drift): the module applies the saved
+// look at import time (same startup point as before). We import the symbols the
+// settings sheet and the visibilitychange handler below still call.
+import {
+  THEMES, THEME_INFO, currentTheme, setTheme,
+  WALLPAPERS, WALLPAPER_NAMES, currentWallpaper, setWallpaper,
+  paletteFollowsSun, applyPhase, setPaletteSun,
+} from './appearance.js';
+// Pure text/time formatters (bubble markdown/linkify/thinking, bubble splitter,
+// preview flattener, timestamp/date labels). Leaf module; we import the ones
+// this core still calls directly.
+import {
+  richText, splitPleasing, plainPreview, firstLine, who,
+  typingBubble, photoBox, appendStamp, localTime, listTime, dayLabel,
+} from './textformat.js';
 
 export const $ = (id) => document.getElementById(id);   // exported: shared by the feature modules
 
-/* ---------- theme ----------
-   Every colour is a CSS custom property; three [data-theme] palettes live in
-   style.css. Golden Hour is the default (the base :root values + the manifest
-   colours), so an unset attribute renders it with no flash. We apply the saved
-   theme as the very first thing app.js does — the CSP forbids an inline <script>
-   in <head>, so this is the earliest hook; a non-default theme may show one
-   Golden-Hour frame before this runs, which is acceptable. */
+// screensaver.js imports currentWallpaper from this core; re-export it from
+// ./appearance.js (its new home) so that import stays byte-identical.
+export { currentWallpaper } from './appearance.js';
 
-const THEMES = ['golden-hour', 'dusk', 'international-orange'];
-// <meta name="theme-color"> per theme (browser/PWA chrome tint). The manifest
-// is static, so its theme_color/background_color track the default only.
-const THEME_META = {
-  'golden-hour': '#FAF5EC',
-  'dusk': '#141B26',
-  'international-orange': '#1C3A5E',
-};
-// Picker copy + a 5-swatch preview (ground, outbound, inbound, accent, resolved).
-const THEME_INFO = {
-  'golden-hour': { name: 'Golden Hour',
-    swatches: ['#FAF5EC', '#D3653B', '#EAF0F6', '#4E739F', '#59805D'] },
-  'dusk': { name: 'Dusk',
-    swatches: ['#141B26', '#DF7B4E', '#26344A', '#8AAAC9', '#7FB287'] },
-  'international-orange': { name: 'International Orange',
-    swatches: ['#1C3A5E', '#C8432B', '#EEF2F6', '#4C7FB5', '#55875B'] },
-};
-
-function currentTheme() {
-  const t = localStorage.getItem('theme');
-  return THEMES.includes(t) ? t : 'golden-hour';
-}
-
-function applyTheme(theme) {
-  if (!THEMES.includes(theme)) theme = 'golden-hour';
-  document.documentElement.setAttribute('data-theme', theme);
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute('content', THEME_META[theme]);
-}
-
-function setTheme(theme) {
-  if (!THEMES.includes(theme)) return;
-  localStorage.setItem('theme', theme);
-  applyTheme(theme);
-}
-
-applyTheme(currentTheme());
-
-/* ---------- background (the scenery layer) ----------
-   Off / airy / whisper — the veil strength over the Golden Gate photo.
-   Fog density follows the real San Francisco marine-layer schedule: dense
-   mornings, burned off by afternoon, rolling back at dusk. */
-
-const WALLPAPERS = ['airy', 'whisper', 'off'];
-const WALLPAPER_NAMES = { airy: 'Bridge · airy veil', whisper: 'Bridge · whisper veil', off: 'Off' };
-
-export function currentWallpaper() {   // exported: screensaver.js reads it for eligibility
-  const w = localStorage.getItem('wallpaper');
-  return WALLPAPERS.includes(w) ? w : 'airy';
-}
-
-function applyWallpaper(w) {
-  if (!WALLPAPERS.includes(w)) w = 'airy';
-  document.documentElement.setAttribute('data-wallpaper', w);
-  updateFog();
-}
-
-function setWallpaper(w) {
-  if (!WALLPAPERS.includes(w)) return;
-  localStorage.setItem('wallpaper', w);
-  applyWallpaper(w);
-}
-
-// SF marine layer, by local hour: thick mornings, clear afternoons, the bank
-// rolls back in around dusk, settles overnight. The app has weather.
-function fogDensity(hour) {
-  if (hour >= 5 && hour < 11) return 1.0;
-  if (hour >= 11 && hour < 17) return 0.35;
-  if (hour >= 17 && hour < 22) return 0.85;
-  return 0.6;
-}
-
-function updateFog() {
-  document.documentElement.style.setProperty(
-    '--fog-density', String(fogDensity(new Date().getHours())));
-}
-
-/* ---------- light (the Golden-Hour palette drift) ----------
-   The default theme is named for a moment of light, so it follows one. Same
-   spirit as the fog above — a month-keyed table and a little arithmetic, no
-   astronomy — but here the palette drifts through five phases across the day.
-   Each phase is a data-phase attribute on <html>; style.css maps it to a small
-   set of hue-token overrides, scoped to the golden-hour theme so the other
-   palettes never drift. 'day' is the anchor: it sets no overrides, so mid-day
-   is exactly the Golden Hour of before. */
-
-// Approximate SF sunrise/sunset by month, as the clock reads them (DST folded
-// in). Off by twenty minutes is fine — this is weather, not an almanac.
-//               Jan   Feb   Mar   Apr   May   Jun   Jul   Aug   Sep   Oct   Nov   Dec
-const SUNRISE = [7.4,  7.0,  7.1,  6.4,  6.0,  5.8,  6.0,  6.4,  6.9,  7.3,  6.9,  7.2];
-const SUNSET  = [17.2, 17.8, 19.0, 19.7, 20.2, 20.5, 20.4, 20.0, 19.3, 18.5, 17.0, 16.9];
-
-// The phase for a moment, keyed off that month's sun. The narrow bands
-// (dawn / golden / dusk) hug sunrise and sunset; day fills the long middle;
-// night is everything left over — the evening and the small hours.
-function solarPhase(date) {
-  const rise = SUNRISE[date.getMonth()];
-  const set  = SUNSET[date.getMonth()];
-  const h = date.getHours() + date.getMinutes() / 60;   // decimal local hour
-  if (h >= rise - 0.75 && h < rise + 1)   return 'dawn';    // 45m before → 1h after sunrise
-  if (h >= set - 1.5   && h < set)        return 'golden';  // last 90m of daylight
-  if (h >= set         && h < set + 0.75) return 'dusk';    // sunset → 45m after
-  if (h >= rise + 1    && h < set - 1.5)  return 'day';     // mid-morning → afternoon (anchor)
-  return 'night';
-}
-
-// Default ON; the settings toggle stores 'off' to opt out. Only an explicit
-// 'off' disables it, so the drift is on for everyone who never opens settings.
-function paletteFollowsSun() {
-  return localStorage.getItem('paletteSun') !== 'off';
-}
-
-// Off → the static day anchor (today's exact look). The attribute is inert
-// under the other themes; the CSS scoping guarantees it.
-function applyPhase() {
-  const phase = paletteFollowsSun() ? solarPhase(new Date()) : 'day';
-  document.documentElement.setAttribute('data-phase', phase);
-}
-
-function setPaletteSun(on) {
-  localStorage.setItem('paletteSun', on ? 'on' : 'off');
-  applyPhase();
-}
-
-// The weather (fog) and the light (palette) both key off the local hour, so
-// they re-check together on one timer, twice an hour.
-setInterval(() => { updateFog(); applyPhase(); }, 30 * 60 * 1000);
-applyWallpaper(currentWallpaper());
-applyPhase();
-// Arm the drift transition only after the first paint, so a phase correction
-// on a slow cold-load lands as a quiet snap (like the theme does) rather than
-// a 2.4s smear; every flip from here on dissolves gently.
-requestAnimationFrame(() => document.documentElement.classList.add('phase-animate'));
+/* ---------- appearance (theme / scenery / light drift) ----------
+   Peeled into ./appearance.js (imported at the top of this file). That module
+   applies the saved theme, wallpaper+fog, and palette phase at import time —
+   the same startup point this block occupied — and exports the symbols the
+   settings sheet + visibilitychange handler here still call (setTheme,
+   setWallpaper, setPaletteSun, applyPhase, currentTheme/Wallpaper, THEMES, …). */
 
 const HEALTH_LABELS = { working: 'working', prompt: 'waiting on you', offline: 'offline' };
 const STATE_GLYPH = { sending: '🕐', sent: '✓', failed: '⚠️', queued: '📮' };
@@ -1329,21 +1213,6 @@ function lastMessageMs(id) {
   return m ? (Date.parse(m.ts) || 0) : 0;
 }
 
-// Strip thinking/response markers and markdown syntax, collapsing to a single
-// preview line — a row preview renders as plain text, so literal **stars** and
-// `backticks` are just noise there (spotted in the field, 2026-07-06).
-function plainPreview(text) {
-  return (text || '')
-    .replace(/\[thinking\][\s\S]*?(?:\[end-thinking\]|\[\/thinking\]|(?=\[response\])|$)/g, '')
-    .replace(/\[response\]/g, '')
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/\*([^*\n]+)\*/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/^#+\s+/gm, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 export function updateThreadHeader() {   // exported: context-gauge.js doCompact() re-renders through it
   // A room has no presence, health, or pane: fixed header "#crew · everyone",
   // and no interrupt button (there is nothing to Escape).
@@ -1612,56 +1481,6 @@ function replyBubbles(event, cls, whoEl) {
   return frag;
 }
 
-const BUBBLE_TARGET = 550;  // chars a bubble aims for
-const BUBBLE_MAX = 900;     // a text (or lone paragraph) beyond this gets split
-
-function splitPleasing(text) {
-  if (!text || text.length <= BUBBLE_MAX) return [text];
-  // Atomic units never split: [thinking] blocks and fenced code.
-  const units = [];
-  const atomicRe = /(\[thinking\][\s\S]*?(?:\[end[- ]?thinking\]|\[\/thinking\]|$)|```[\s\S]*?(?:```|$))/g;
-  let last = 0, m;
-  while ((m = atomicRe.exec(text)) !== null) {
-    if (m.index > last) units.push(...text.slice(last, m.index).split(/\n{2,}/));
-    units.push(m[1]);
-    last = m.index + m[0].length;
-  }
-  if (last < text.length) units.push(...text.slice(last).split(/\n{2,}/));
-  const clean = units.map((u) => u.trim()).filter(Boolean);
-
-  // Pack paragraphs toward the target. A list stays glued to the short
-  // intro that ends with ":"; a giant lone paragraph splits at sentences.
-  const bubbles = [];
-  let cur = '';
-  for (const u of clean) {
-    const atomic = /^(```|\[thinking\])/.test(u);
-    if (u.length > BUBBLE_MAX && !atomic) {
-      if (cur) { bubbles.push(cur); cur = ''; }
-      bubbles.push(...sentencePack(u));
-      continue;
-    }
-    const isList = /^([-*•]|\d+[.)])\s/.test(u);
-    const fits = cur && cur.length + u.length + 2 <= BUBBLE_TARGET;
-    const glued = cur && isList && /:\s*$/.test(cur);
-    if (fits || glued) cur += '\n\n' + u;
-    else { if (cur) bubbles.push(cur); cur = u; }
-  }
-  if (cur) bubbles.push(cur);
-  return bubbles.length ? bubbles : [text];
-}
-
-function sentencePack(par) {
-  const parts = par.split(/(?<=[.!?…])\s+/);
-  const out = [];
-  let cur = '';
-  for (const s of parts) {
-    if (cur && cur.length + s.length + 1 > BUBBLE_TARGET) { out.push(cur); cur = s; }
-    else cur = cur ? cur + ' ' + s : s;
-  }
-  if (cur) out.push(cur);
-  return out;
-}
-
 /* Local echo for an outgoing message. Its delivery state (sending / sent /
    failed / queued) shows as a glyph in the who-line; failed messages get a
    retry button that re-sends with the same client_id (safe — the server
@@ -1689,209 +1508,6 @@ function renderPending(msg) {
   }
   appendStamp(el, msg.ts);
   return el;
-}
-
-/* A photo in a fixed-size box (.photo-box owns the dimensions in CSS). The box
-   reserves its full space before the image decodes, so a loading photo can't
-   shift the feed — zero layout shift by construction. loading="lazy" keeps
-   offscreen history photos off the wire until scrolled near; decoding="async"
-   keeps the decode off the main thread. Tap toggles .full to lift the
-   cover-crop and show the whole photo (no lightbox, no new chrome). */
-function photoBox(src) {
-  const box = document.createElement('div');
-  box.className = 'photo-box';
-  const img = document.createElement('img');
-  img.src = src;
-  img.alt = '';
-  img.loading = 'lazy';
-  img.decoding = 'async';
-  box.appendChild(img);
-  box.onclick = () => box.classList.toggle('full');
-  return box;
-}
-
-function typingBubble(name) {
-  const el = document.createElement('div');
-  el.className = 'msg typing';
-  const label = document.createElement('span');
-  label.className = 'who';
-  label.textContent = name + ' is working';
-  el.appendChild(label);
-  const dots = document.createElement('span');
-  dots.className = 'dots';
-  for (let i = 0; i < 3; i++) dots.appendChild(document.createElement('i'));
-  el.appendChild(dots);
-  return el;
-}
-
-function who(label) {
-  const el = document.createElement('span');
-  el.className = 'who';
-  el.textContent = label;
-  return el;
-}
-
-// Timestamp inside the bubble, bottom-right (styled by .msg .stamp). No-op
-// when the event carries no parseable time.
-function appendStamp(bubble, ts) {
-  const t = localTime(ts);
-  if (!t) return;
-  const el = document.createElement('span');
-  el.className = 'stamp';
-  el.textContent = t;
-  bubble.appendChild(el);
-}
-
-function localTime(ts) {
-  const d = new Date(ts);
-  return isNaN(d) ? '' :
-    d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-// iMessage-convention compact stamp for a conversation row:
-// today → time; yesterday → "Yesterday"; this week → weekday; older → date.
-function listTime(ts) {
-  const d = new Date(ts);
-  if (isNaN(d)) return '';
-  const days = daysAgo(d);
-  if (days <= 0) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  if (days === 1) return 'Yesterday';
-  if (days < 7) return d.toLocaleDateString([], { weekday: 'short' });
-  return d.toLocaleDateString([], { month: 'numeric', day: 'numeric', year: '2-digit' });
-}
-
-// Day-separator label inside a thread feed.
-function dayLabel(ts) {
-  const d = new Date(ts);
-  if (isNaN(d)) return '';
-  const days = daysAgo(d);
-  if (days <= 0) return 'Today';
-  if (days === 1) return 'Yesterday';
-  if (days < 7) return d.toLocaleDateString([], { weekday: 'long' });
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
-}
-
-// Whole calendar days between D and now (0 = today, 1 = yesterday, …).
-function daysAgo(d) {
-  const startOfDay = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
-  return Math.round((startOfDay(new Date()) - startOfDay(d)) / 86400000);
-}
-
-/* Render text with [thinking] blocks collapsed into tappable pills and
-   very long remainders clamped behind "show more". */
-function richText(text) {
-  const container = document.createElement('div');
-  container.className = 'rich';
-  const re = /\[thinking\]([\s\S]*?)(?:\[end-thinking\]|\[\/thinking\]|(?=\[response\])|$)/g;
-  let cursor = 0;
-  let match;
-  while ((match = re.exec(text)) !== null) {
-    appendPlain(container, text.slice(cursor, match.index));
-    appendThinking(container, match[1].trim());
-    cursor = re.lastIndex;
-  }
-  appendPlain(container, text.slice(cursor).replace(/\[response\]/g, '').trim());
-  return container;
-}
-
-function appendPlain(container, chunk) {
-  chunk = chunk.trim();
-  if (!chunk) return;
-  const el = document.createElement('span');
-  el.className = 'plain';
-  if (chunk.length > 1200) {
-    const short = chunk.slice(0, 1000) + '…';
-    appendRich(el, short);
-    const more = document.createElement('button');
-    more.className = 'show-more';
-    more.textContent = 'show more';
-    more.onclick = () => {   // a toggle, not a one-way door
-      const expanded = more.textContent === 'collapse';
-      el.textContent = '';
-      appendRich(el, expanded ? short : chunk);
-      more.textContent = expanded ? 'show more' : 'collapse';
-    };
-    container.appendChild(el);
-    container.appendChild(more);
-  } else {
-    appendRich(el, chunk);
-    container.appendChild(el);
-  }
-}
-
-/* Minimal inline markdown for bubbles — **bold**, *italic*, `code` — built
-   from DOM nodes exactly like the linkifier (never innerHTML), so message
-   content still cannot inject markup. Single-level on purpose: code spans
-   don't linkify, bold/italic contents still do. Anything unmatched renders
-   as the literal text it always was. */
-function appendRich(parent, text) {
-  const re = /(`[^`\n]+`)|(\*\*(?=\S)[^*]+?(?<=\S)\*\*)|(\*(?=\S)[^*\n]+?(?<=\S)\*)/g;
-  let cursor = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > cursor) appendLinkified(parent, text.slice(cursor, m.index));
-    if (m[1]) {
-      const code = document.createElement('code');
-      code.className = 'md-code';
-      code.textContent = m[1].slice(1, -1);
-      parent.appendChild(code);
-    } else if (m[2]) {
-      const b = document.createElement('strong');
-      appendLinkified(b, m[2].slice(2, -2));
-      parent.appendChild(b);
-    } else {
-      const i = document.createElement('em');
-      appendLinkified(i, m[3].slice(1, -1));
-      parent.appendChild(i);
-    }
-    cursor = m.index + m[0].length;
-  }
-  if (cursor < text.length) appendLinkified(parent, text.slice(cursor));
-}
-
-/* Append TEXT to PARENT, turning http(s) URLs into tappable links. Builds
-   text and anchor nodes directly — never innerHTML — so message content
-   cannot inject markup. Trailing sentence punctuation stays out of the href. */
-function appendLinkified(parent, text) {
-  const re = /https?:\/\/[^\s]+/g;
-  let cursor = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    let url = m[0];
-    const trail = url.match(/[.,!?;:'")\]}>]+$/);
-    if (trail) url = url.slice(0, -trail[0].length);
-    if (!url) continue;
-    if (m.index > cursor) {
-      parent.appendChild(document.createTextNode(text.slice(cursor, m.index)));
-    }
-    const a = document.createElement('a');
-    a.href = url;                 // regex guarantees an http(s) scheme
-    a.textContent = url;
-    a.target = '_blank';
-    a.rel = 'noopener noreferrer';
-    parent.appendChild(a);
-    cursor = m.index + url.length;
-  }
-  if (cursor < text.length) {
-    parent.appendChild(document.createTextNode(text.slice(cursor)));
-  }
-}
-
-function appendThinking(container, thought) {
-  if (!thought) return;
-  const words = thought.split(/\s+/).length;
-  const pill = document.createElement('button');
-  pill.className = 'think-pill';
-  pill.textContent = '💭 thinking · ' + words + ' words';
-  const body = document.createElement('div');
-  body.className = 'think-body hidden';
-  body.textContent = thought;
-  pill.onclick = () => {
-    const open = body.classList.toggle('hidden');
-    pill.textContent = open ? '💭 thinking · ' + words + ' words' : '💭 hide thinking';
-  };
-  container.appendChild(pill);
-  container.appendChild(body);
 }
 
 /* ---------- attention cards ---------- */
@@ -1922,19 +1538,6 @@ function resolveAttentions(events) {
     }
   }
   return res;   // `open` (if set) is the one live card — deliberately not added
-}
-
-// First meaningful line of a captured prompt for the collapsed card: strip
-// TUI box-drawing / bullet noise and return the first line with real content.
-function firstLine(text) {
-  const lines = (text || '').split('\n');
-  let fallback = '';
-  for (const raw of lines) {
-    const cleaned = raw.replace(/[│╭╮╰╯─┌┐└┘|>❯•*\s]+/g, ' ').trim();
-    if (/[A-Za-z0-9]/.test(cleaned)) return cleaned;
-    if (!fallback && raw.trim()) fallback = raw.trim();
-  }
-  return fallback || '(prompt)';
 }
 
 /* An attention event. Live → the full tappable approval card. Resolved →
