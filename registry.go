@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Contact is a managed agent: a stable, daemon-minted identity that outlives
@@ -691,6 +692,37 @@ func (r *Registry) HasMail(id string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.mailbox[id]) > 0
+}
+
+// MailboxOldestAgeSeconds returns how long, in whole seconds, the OLDEST message
+// still queued for a contact has waited — 0 when the mailbox is empty. It parses
+// the RFC3339 MailMessage.TS that every queue path stamps (nowUTC) and compares
+// against the same clock (time.Now), so route-health (routehealth.go) can tell a
+// fresh burst still inside the coalescing/fan-out window from a genuinely STALLED
+// backlog. A message whose TS is empty or unparseable is skipped — it can't prove
+// its age, and must never be counted as infinitely old. Pure read, zero writes.
+func (r *Registry) MailboxOldestAgeSeconds(id string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var oldest time.Time
+	found := false
+	for _, m := range r.mailbox[id] {
+		ts, err := time.Parse(time.RFC3339, m.TS)
+		if err != nil {
+			continue
+		}
+		if !found || ts.Before(oldest) {
+			oldest, found = ts, true
+		}
+	}
+	if !found {
+		return 0
+	}
+	age := int(time.Since(oldest) / time.Second)
+	if age < 0 { // a clock skew / future TS must never report negative age
+		age = 0
+	}
+	return age
 }
 
 // PeekMailboxGroup returns (a copy of) the longest queue prefix that shares
