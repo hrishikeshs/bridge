@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — notifications (best-effort; no-op where unsupported).
    Peeled out of app.js (round 2 of the ES-module split); behaviour unchanged.
 
@@ -85,7 +87,9 @@ async function enablePush() {
       const { key } = await res.json();
       sub = await reg.pushManager.subscribe({
         userVisibleOnly: true,
-        applicationServerKey: urlB64ToUint8Array(key),
+        // TS 5.9's Uint8Array<ArrayBufferLike> vs BufferSource(ArrayBufferView<ArrayBuffer>)
+        // generic mismatch — a lib-type nicety, not a runtime concern.
+        applicationServerKey: /** @type {BufferSource} */ (urlB64ToUint8Array(key)),
       });
     }
     const subRes = await fetch('/api/push/subscribe', {
@@ -98,6 +102,7 @@ async function enablePush() {
   } catch (e) { pushDebug('ERROR ' + (e && e.message ? e.message : e)); }
 }
 
+/** @param {string} base64 @returns {Uint8Array} */
 function urlB64ToUint8Array(base64) {
   const pad = '='.repeat((4 - (base64.length % 4)) % 4);
   const b64 = (base64 + pad).replace(/-/g, '+').replace(/_/g, '/');
@@ -111,6 +116,7 @@ function urlB64ToUint8Array(base64) {
    it — and it becomes visible to clearDeliveredNotifications and tappable
    into the right thread, neither of which a bare page-scoped Notification
    was (review round 3 hygiene). Bare Notification remains as the fallback. */
+/** @param {BridgeEvent} event */
 export function maybeNotify(event) {
   if (!('Notification' in window)) return;
   if (Notification.permission !== 'granted' || !document.hidden) return;

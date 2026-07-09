@@ -83,6 +83,7 @@ const FEED_WINDOW = 60;
 
 // Exported: the peeled feature modules read live app state through this object
 // (screensaver: state.view; context-gauge: state.contacts/selected/view).
+/** @type {State} */
 export const state = {
   contacts: [],          // roster from /api/status
   rooms: [],             // shared threads from /api/status (v1: just #crew)

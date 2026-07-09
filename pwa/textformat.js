@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — text & time formatters.
    Peeled out of app.js (the ES-module split); behaviour unchanged.
 
@@ -16,6 +18,7 @@
 const BUBBLE_TARGET = 550;  // chars a bubble aims for
 const BUBBLE_MAX = 900;     // a text (or lone paragraph) beyond this gets split
 
+/** @param {string} text @returns {string[]} */
 export function splitPleasing(text) {
   if (!text || text.length <= BUBBLE_MAX) return [text];
   // Atomic units never split: [thinking] blocks and fenced code.
@@ -51,6 +54,7 @@ export function splitPleasing(text) {
   return bubbles.length ? bubbles : [text];
 }
 
+/** @param {string} par @returns {string[]} */
 export function sentencePack(par) {
   const parts = par.split(/(?<=[.!?…])\s+/);
   const out = [];
@@ -69,6 +73,7 @@ export function sentencePack(par) {
    offscreen history photos off the wire until scrolled near; decoding="async"
    keeps the decode off the main thread. Tap toggles .full to lift the
    cover-crop and show the whole photo (no lightbox, no new chrome). */
+/** @param {string} src @returns {HTMLElement} */
 export function photoBox(src) {
   const box = document.createElement('div');
   box.className = 'photo-box';
@@ -82,6 +87,7 @@ export function photoBox(src) {
   return box;
 }
 
+/** @param {string} name @returns {HTMLElement} */
 export function typingBubble(name) {
   const el = document.createElement('div');
   el.className = 'msg typing';
@@ -96,6 +102,7 @@ export function typingBubble(name) {
   return el;
 }
 
+/** @param {string} label @returns {HTMLElement} */
 export function who(label) {
   const el = document.createElement('span');
   el.className = 'who';
@@ -105,6 +112,7 @@ export function who(label) {
 
 // Timestamp inside the bubble, bottom-right (styled by .msg .stamp). No-op
 // when the event carries no parseable time.
+/** @param {HTMLElement} bubble @param {string | number} [ts] */
 export function appendStamp(bubble, ts) {
   const t = localTime(ts);
   if (!t) return;
@@ -114,17 +122,19 @@ export function appendStamp(bubble, ts) {
   bubble.appendChild(el);
 }
 
+/** @param {string | number} [ts] @returns {string} */
 export function localTime(ts) {
   const d = new Date(ts);
-  return isNaN(d) ? '' :
+  return isNaN(d.getTime()) ? '' :
     d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 // iMessage-convention compact stamp for a conversation row:
 // today → time; yesterday → "Yesterday"; this week → weekday; older → date.
+/** @param {string | number} [ts] @returns {string} */
 export function listTime(ts) {
   const d = new Date(ts);
-  if (isNaN(d)) return '';
+  if (isNaN(d.getTime())) return '';
   const days = daysAgo(d);
   if (days <= 0) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   if (days === 1) return 'Yesterday';
@@ -133,9 +143,10 @@ export function listTime(ts) {
 }
 
 // Day-separator label inside a thread feed.
+/** @param {string | number} [ts] @returns {string} */
 export function dayLabel(ts) {
   const d = new Date(ts);
-  if (isNaN(d)) return '';
+  if (isNaN(d.getTime())) return '';
   const days = daysAgo(d);
   if (days <= 0) return 'Today';
   if (days === 1) return 'Yesterday';
@@ -144,6 +155,7 @@ export function dayLabel(ts) {
 }
 
 // Whole calendar days between D and now (0 = today, 1 = yesterday, …).
+/** @param {Date} d @returns {number} */
 export function daysAgo(d) {
   const startOfDay = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
   return Math.round((startOfDay(new Date()) - startOfDay(d)) / 86400000);
@@ -151,6 +163,7 @@ export function daysAgo(d) {
 
 /* Render text with [thinking] blocks collapsed into tappable pills and
    very long remainders clamped behind "show more". */
+/** @param {string} [text] @returns {HTMLElement} */
 export function richText(text) {
   const container = document.createElement('div');
   container.className = 'rich';
@@ -166,6 +179,7 @@ export function richText(text) {
   return container;
 }
 
+/** @param {HTMLElement} container @param {string} chunk */
 export function appendPlain(container, chunk) {
   chunk = chunk.trim();
   if (!chunk) return;
@@ -196,6 +210,7 @@ export function appendPlain(container, chunk) {
    content still cannot inject markup. Single-level on purpose: code spans
    don't linkify, bold/italic contents still do. Anything unmatched renders
    as the literal text it always was. */
+/** @param {HTMLElement} parent @param {string} text */
 export function appendRich(parent, text) {
   const re = /(`[^`\n]+`)|(\*\*(?=\S)[^*]+?(?<=\S)\*\*)|(\*(?=\S)[^*\n]+?(?<=\S)\*)/g;
   let cursor = 0;
@@ -224,6 +239,7 @@ export function appendRich(parent, text) {
 /* Append TEXT to PARENT, turning http(s) URLs into tappable links. Builds
    text and anchor nodes directly — never innerHTML — so message content
    cannot inject markup. Trailing sentence punctuation stays out of the href. */
+/** @param {HTMLElement} parent @param {string} text */
 export function appendLinkified(parent, text) {
   const re = /https?:\/\/[^\s]+/g;
   let cursor = 0;
@@ -249,6 +265,7 @@ export function appendLinkified(parent, text) {
   }
 }
 
+/** @param {HTMLElement} container @param {string} thought */
 export function appendThinking(container, thought) {
   if (!thought) return;
   const words = thought.split(/\s+/).length;
@@ -268,6 +285,7 @@ export function appendThinking(container, thought) {
 
 // First meaningful line of a captured prompt for the collapsed card: strip
 // TUI box-drawing / bullet noise and return the first line with real content.
+/** @param {string} [text] @returns {string} */
 export function firstLine(text) {
   const lines = (text || '').split('\n');
   let fallback = '';
@@ -282,6 +300,7 @@ export function firstLine(text) {
 // Strip thinking/response markers and markdown syntax, collapsing to a single
 // preview line — a row preview renders as plain text, so literal **stars** and
 // `backticks` are just noise there (spotted in the field, 2026-07-06).
+/** @param {string} [text] @returns {string} */
 export function plainPreview(text) {
   return (text || '')
     .replace(/\[thinking\][\s\S]*?(?:\[end-thinking\]|\[\/thinking\]|(?=\[response\])|$)/g, '')

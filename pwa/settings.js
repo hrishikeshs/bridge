@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — the settings sheet (+ the Focus toggle).
    Peeled out of app.js (round 2 of the ES-module split); behaviour unchanged.
 
@@ -64,21 +66,22 @@ document.getElementById('notif-row').addEventListener('click', async () => {
 // input, so an edit saves when you leave the field; Enter blurs to commit it.
 // The ✕ clears. Both POST /api/mystatus {text}; the daemon echoes a live
 // 'mystatus' event so every open phone (and the next agent to reach out) syncs.
-document.getElementById('mystatus-input').addEventListener('change', (e) => saveMyStatus(e.target.value));
+document.getElementById('mystatus-input').addEventListener('change', (e) => saveMyStatus(/** @type {HTMLInputElement} */ (e.target).value));
 document.getElementById('mystatus-input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+  if (/** @type {KeyboardEvent} */ (e).key === 'Enter') { e.preventDefault(); /** @type {HTMLInputElement} */ (e.target).blur(); }
 });
 // preventDefault on mousedown keeps the input focused when ✕ is tapped, so its
 // blur doesn't fire a spurious 'change' (old value) that races the clear's POST.
 document.getElementById('mystatus-clear').addEventListener('mousedown', (e) => e.preventDefault());
-document.getElementById('mystatus-clear').addEventListener('click', () => { $('mystatus-input').value = ''; saveMyStatus(''); });
+document.getElementById('mystatus-clear').addEventListener('click', () => { /** @type {HTMLInputElement} */ ($('mystatus-input')).value = ''; saveMyStatus(''); });
 
+/** @param {string} text */
 async function saveMyStatus(text) {
   // Mirror the daemon's clampAway: one line, capped — so the input and the
   // stored value never disagree (the daemon clamps again authoritatively).
   text = (text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120);
   state.myStatus = text;
-  $('mystatus-input').value = text;
+  /** @type {HTMLInputElement} */ ($('mystatus-input')).value = text;
   renderMyStatus();
   try {
     await fetch('/api/mystatus', {
@@ -94,7 +97,7 @@ export function openSettings() {
   renderWallpaperOptions();
   renderPaletteSun();
   renderNotifState();
-  $('mystatus-input').value = state.myStatus || '';
+  /** @type {HTMLInputElement} */ ($('mystatus-input')).value = state.myStatus || '';
   $('settings-sheet').classList.remove('hidden');
 }
 
@@ -193,7 +196,7 @@ function renderThemeOptions() {
 
 function renderNotifState() {
   const el = $('notif-state');
-  const row = $('notif-row');
+  const row = /** @type {HTMLButtonElement} */ ($('notif-row'));
   const supported = 'Notification' in window &&
     'serviceWorker' in navigator && 'PushManager' in window;
   if (!supported) {

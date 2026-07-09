@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — feature #19(b): idle screensaver.
    Peeled out of app.js (round 1 of the ES-module split); behaviour unchanged.
 
@@ -55,6 +57,7 @@ function onUserActivity(e) {
 
 // A "moment" worth waking for: a new attention card or an inbound message.
 // Heartbeats, typing, status and reactions never wake the screensaver.
+/** @param {BridgeEvent} event @returns {boolean} */
 export function isMomentEvent(event) {
   return event.type === 'attention' || event.type === 'reply' ||
          event.type === 'mention' || event.type === 'peer' || event.type === 'paper';

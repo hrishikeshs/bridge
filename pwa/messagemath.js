@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — message & unread math.
    Peeled out of app.js (round 2 of the ES-module split); behaviour unchanged.
 
@@ -16,6 +18,7 @@
 
 import { state } from './app.js';
 
+/** @param {string} contactId */
 export function markSeen(contactId) {
   state.lastSeen[contactId] = state.lastEventId;
   localStorage.setItem('lastSeen', JSON.stringify(state.lastSeen));
@@ -25,6 +28,7 @@ export function markSeen(contactId) {
 // self events never count. This reads the SAME lastSeen cursor the old boolean
 // used (a per-contact event id), so existing devices need no migration — the
 // old hasUnread was just this count > 0.
+/** @param {string} contactId @returns {number} */
 export function unreadCount(contactId) {
   const seen = state.lastSeen[contactId] || 0;
   let n = 0;
@@ -37,7 +41,9 @@ export function unreadCount(contactId) {
 
 // Newest message-like item touching the contact — a stored reply/mention/sent
 // event or a not-yet-confirmed outbox echo — whichever is more recent.
+/** @param {string} id @returns {MessageLike | null} */
 export function newestMessage(id) {
+  /** @type {BridgeEvent | null} */
   let ev = null;
   for (let i = state.events.length - 1; i >= 0; i--) {
     const e = state.events[i];
@@ -46,6 +52,7 @@ export function newestMessage(id) {
       ev = e; break;
     }
   }
+  /** @type {PendingMsg | null} */
   let pend = null;
   for (const m of state.pending) if (m.agent === id) pend = m;   // last wins (chronological)
   if (ev && pend) return (Date.parse(pend.ts) || 0) >= (Date.parse(ev.ts) || 0) ? pend : ev;
@@ -54,6 +61,7 @@ export function newestMessage(id) {
 
 // Milliseconds of the last activity of ANY kind touching the contact (drives
 // ordering). 0 for a contact the phone has never seen an event for.
+/** @param {Contact | Room} contact @returns {number} */
 export function lastActivityMs(contact) {
   const id = contact.id;
   let ms = 0;
@@ -69,6 +77,7 @@ export function lastActivityMs(contact) {
 // Milliseconds of MY last message to a contact — the newest 'sent' event or a
 // pending outbox echo (both are mine). 0 if I haven't messaged them within the
 // loaded window. Drives the Focus floor ordering.
+/** @param {string} id @returns {number} */
 export function myLastSentMs(id) {
   let ms = 0;
   for (let i = state.events.length - 1; i >= 0; i--) {
@@ -85,6 +94,7 @@ export function myLastSentMs(id) {
 // contact — what "chatted with" means for Focus. Distinct from lastActivityMs,
 // which counts ANY event: a reconnect's 'connected' or a status/health tick
 // would otherwise keep a quiet agent in focus (e.g. right after a daemon restart).
+/** @param {string} id @returns {number} */
 export function lastMessageMs(id) {
   const m = newestMessage(id);
   return m ? (Date.parse(m.ts) || 0) : 0;

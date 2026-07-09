@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — appearance: theme, scenery (wallpaper + fog), and the light drift.
    Peeled out of app.js (the ES-module split); behaviour unchanged.
 
@@ -43,6 +45,7 @@ export function currentTheme() {
   return THEMES.includes(t) ? t : 'golden-hour';
 }
 
+/** @param {string} theme */
 function applyTheme(theme) {
   if (!THEMES.includes(theme)) theme = 'golden-hour';
   document.documentElement.setAttribute('data-theme', theme);
@@ -50,6 +53,7 @@ function applyTheme(theme) {
   if (meta) meta.setAttribute('content', THEME_META[theme]);
 }
 
+/** @param {string} theme */
 export function setTheme(theme) {
   if (!THEMES.includes(theme)) return;
   localStorage.setItem('theme', theme);
@@ -71,12 +75,14 @@ export function currentWallpaper() {   // exported: screensaver.js reads it for 
   return WALLPAPERS.includes(w) ? w : 'airy';
 }
 
+/** @param {string} w */
 function applyWallpaper(w) {
   if (!WALLPAPERS.includes(w)) w = 'airy';
   document.documentElement.setAttribute('data-wallpaper', w);
   updateFog();
 }
 
+/** @param {string} w */
 export function setWallpaper(w) {
   if (!WALLPAPERS.includes(w)) return;
   localStorage.setItem('wallpaper', w);
@@ -85,6 +91,7 @@ export function setWallpaper(w) {
 
 // SF marine layer, by local hour: thick mornings, clear afternoons, the bank
 // rolls back in around dusk, settles overnight. The app has weather.
+/** @param {number} hour @returns {number} */
 function fogDensity(hour) {
   if (hour >= 5 && hour < 11) return 1.0;
   if (hour >= 11 && hour < 17) return 0.35;
@@ -115,6 +122,7 @@ const SUNSET  = [17.2, 17.8, 19.0, 19.7, 20.2, 20.5, 20.4, 20.0, 19.3, 18.5, 17.
 // The phase for a moment, keyed off that month's sun. The narrow bands
 // (dawn / golden / dusk) hug sunrise and sunset; day fills the long middle;
 // night is everything left over — the evening and the small hours.
+/** @param {Date} date @returns {string} */
 function solarPhase(date) {
   const rise = SUNRISE[date.getMonth()];
   const set  = SUNSET[date.getMonth()];
@@ -139,6 +147,7 @@ export function applyPhase() {
   document.documentElement.setAttribute('data-phase', phase);
 }
 
+/** @param {boolean} on */
 export function setPaletteSun(on) {
   localStorage.setItem('paletteSun', on ? 'on' : 'off');
   applyPhase();

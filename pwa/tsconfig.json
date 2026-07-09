@@ -13,5 +13,5 @@
     "strictNullChecks": false,
     "skipLibCheck": true
   },
-  "include": ["types.d.ts", "list.js"]
+  "include": ["types.d.ts", "*.js"]
 }

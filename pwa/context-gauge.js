@@ -1,3 +1,5 @@
+// @ts-check — type-checked against ./types.d.ts (see tsconfig.json). Dev-only:
+// `@ts-check` + JSDoc are comments the browser ignores, so nothing ships changes.
 /* bridge — context gauge (+ compact confirm/POST flow).
    Peeled out of app.js (round 1 of the ES-module split); behaviour unchanged.
 
@@ -35,6 +37,7 @@ let ctxToastTimer = null;
 
 // Validate context_pct off a contact per the contract: an int 0-100, or null
 // when the field is absent / not a number (unknown / sessionless → no bar).
+/** @param {Contact | null | undefined} contact @returns {number | null} */
 function contextPct(contact) {
   if (!contact) return null;
   const v = contact.context_pct;
@@ -45,10 +48,11 @@ function contextPct(contact) {
 // Render (or remove) the header gauge for the selected contact. Called from
 // updateThreadHeader, so it re-runs on thread-open, every SSE frame, and every
 // status poll — the % moves and the enabled-state flips with health, live.
+/** @param {Contact | null | undefined} contact */
 export function renderContextGauge(contact) {
   const host = document.querySelector('.thread-header .thread-id');
   if (!host) return;
-  let gauge = $('ctx-gauge');
+  let gauge = /** @type {HTMLButtonElement | null} */ ($('ctx-gauge'));
   const pct = contextPct(contact);
   // No bar for rooms, unknown %, or anything below 70 — silence is the default.
   if (!contact || isRoomId(contact.id) || pct === null || pct < 70) {
@@ -78,8 +82,8 @@ export function renderContextGauge(contact) {
     gauge.addEventListener('click', onGaugeTap);
     host.appendChild(gauge);
   }
-  const fill = gauge.querySelector('.ctx-gauge-fill');
-  const label = gauge.querySelector('.ctx-gauge-label');
+  const fill = /** @type {HTMLElement} */ (gauge.querySelector('.ctx-gauge-fill'));
+  const label = /** @type {HTMLElement} */ (gauge.querySelector('.ctx-gauge-label'));
   fill.style.width = pct + '%';
   // Amber at 70 → red toward 100: 0% danger at 70, 100% danger at 100. CSSOM
   // writes are CSP-allowed (like avatarColor). var() resolves per active theme.
@@ -139,6 +143,7 @@ function ensureCompactUI() {
   root.appendChild(toast);
 }
 
+/** @param {Contact} contact */
 function openCompactConfirm(contact) {
   ensureCompactUI();
   compactTarget = contact.id;
@@ -157,6 +162,7 @@ function closeCompactConfirm() {
 // Confirmed: POST /api/compact (same device auth as every other /api/* POST via
 // api()). Show a brief optimistic "compacting…" state; on 200 the next poll
 // drops the bar; on 409/400/failure undo it and say so gently (never loudly).
+/** @param {string | null} id */
 async function doCompact(id) {
   closeCompactConfirm();
   if (!id) return;
@@ -176,6 +182,7 @@ async function doCompact(id) {
   }
 }
 
+/** @param {string} text */
 function showCompactToast(text) {
   ensureCompactUI();
   const el = $('ctx-toast');
