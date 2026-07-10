@@ -35,6 +35,9 @@ import {
 // markSeen (init / openThread / renderFeed). unreadCount rides into the list
 // module (updateUnreadTotals lives there now).
 import { markSeen, isDoubleTap, forwardText } from './messagemath.js';
+// #34: the conversation-fragment PNG export (selection UI lives here; the
+// canvas compositor and share-sheet handoff live in the module).
+import { exportSelectionPNG } from './export.js';
 // Notifications (browser Notification / ServiceWorker / PushManager + /api/push).
 // The module wires its own enable-push listener at import time; the spine calls
 // these four entry points back.
@@ -94,6 +97,8 @@ export const state = {
   reactions: new Map(),  // target event id -> array of emoji (folded from 'reaction' events)
   myReactions: new Map(),// target event id -> Set of emoji THIS phone sent this session
   quote: null,           // {name, excerpt} — the bubble the composer is replying to
+  selecting: false,      // #34: selection mode — taps toggle bubbles, gestures sleep
+  selectedIds: new Set(),// #34: event ids checked for export (Set<number>)
   view: 'list',          // 'list' (conversation list) | 'thread' (one contact)
   selected: null,        // contact id of the open thread, or null on the list
   focus: localStorage.getItem('focus') === '1', // list filter: only recent chats
@@ -590,6 +595,7 @@ function updateBanner() {
    the URL (refresh, back/forward). */
 
 function showList() {
+  exitSelectMode();          // #34: leaving the thread abandons the selection
   state.view = 'list';
   state.selected = null;
   document.documentElement.setAttribute('data-view', 'list');   // scenery on
@@ -602,6 +608,7 @@ function showList() {
 
 /** @param {string} id */
 function openThread(id) {
+  exitSelectMode();          // #34: a selection never crosses threads
   state.view = 'thread';
   state.selected = id;
   document.documentElement.setAttribute('data-view', 'thread');  // scenery off
@@ -915,6 +922,7 @@ function renderEvent(event, resolution) {
     }
     el.appendChild(richText(event.text));
     appendStamp(el, event.ts);
+    attachSelect(el, event.id);   // #34: your own messages export too
   } else if (event.type === 'reply') {
     return replyBubbles(event, 'msg reply', who(event.name || '?'));
   } else if (event.type === 'mention') {
@@ -979,6 +987,7 @@ function replyBubbles(event, cls, whoEl) {
     el.appendChild(richText(event.text));
     appendStamp(el, event.ts);
     attachBubbleActions(el, meta(event.text || ''));
+    attachSelect(el, event.id);   // #34
     appendReactions(el, event.id);
     return el;
   }
@@ -992,6 +1001,7 @@ function replyBubbles(event, cls, whoEl) {
     // bottom edge is the message's bottom edge).
     if (i === parts.length - 1) { appendStamp(el, event.ts); appendReactions(el, event.id); }
     attachBubbleActions(el, meta(p));
+    attachSelect(el, event.id);   // #34: any part toggles the WHOLE message
     frag.appendChild(el);
   });
   return frag;
@@ -1450,6 +1460,7 @@ let lastTap = null;   // the previous clean tap — the double-tap detector's me
 /** @param {HTMLElement} el @param {BubbleMeta} meta */
 function attachBubbleActions(el, meta) {
   el.addEventListener('touchstart', (e) => {
+    if (state.selecting) return;   // #34: selection mode owns every tap
     const t = e.touches && e.touches[0];
     if (!t) return;
     lpStart = { x: t.clientX, y: t.clientY };
@@ -1473,6 +1484,7 @@ function attachBubbleActions(el, meta) {
   }, { passive: true });
   el.addEventListener('touchend', () => {
     clearTimeout(lpTimer);
+    if (state.selecting) { lpStart = null; lastTap = null; return; }   // #34
     if (!lpStart) return;             // long-press already fired, or drift cancelled
     const at = { x: lpStart.x, y: lpStart.y };
     lpStart = null;
@@ -1494,9 +1506,11 @@ function attachBubbleActions(el, meta) {
   // Desktop mirrors: right-click = select menu, double-click = reactions.
   el.addEventListener('contextmenu', (e) => {
     e.preventDefault();
+    if (state.selecting) return;   // #34
     openActionSheet(meta, { x: e.clientX, y: e.clientY }, 'menu');
   });
   el.addEventListener('dblclick', (e) => {
+    if (state.selecting) return;   // #34
     openActionSheet(meta, { x: e.clientX, y: e.clientY }, 'react');
   });
 }
@@ -1526,10 +1540,12 @@ function openActionSheet(meta, at, mode, ghostGuard) {
   $('action-quote').classList.toggle('hidden', !menuMode);
   $('action-copy').classList.toggle('hidden', !menuMode);
   $('action-forward').classList.toggle('hidden', !menuMode);
+  $('action-select').classList.toggle('hidden', !menuMode);
   if (menuMode) {
     $('action-quote').onclick = armed(() => { setQuote(meta); closeActionSheet(); });
     $('action-copy').onclick = armed(() => { copyBubbleText(meta.text); closeActionSheet(); });
     $('action-forward').onclick = armed(() => { closeActionSheet(); openForwardSheet(meta); });
+    $('action-select').onclick = armed(() => { closeActionSheet(); enterSelectMode(meta.id); });
   } else {
     const mine = state.myReactions.get(meta.id);
     // The quick row: the 6 whitelisted taps (unchanged behaviour), wrapped so the
@@ -1652,6 +1668,63 @@ function forwardTo(targetId, meta) {
 
 $('forward-close').addEventListener('click', closeForwardSheet);
 $('forward-backdrop').addEventListener('click', closeForwardSheet);
+
+/* ---------- selection mode & PNG export (feature #34) ---------- */
+
+/* Selection mode: taps toggle bubbles onto the export list; every other bubble
+   gesture (double-tap react, long-press menu) sleeps until the mode exits, so
+   picking messages can never accidentally raise a sheet. The mode is
+   per-thread by construction — entering is only reachable from a bubble's
+   select menu, and leaving the thread exits it. */
+/** @param {number} [seedId] the long-pressed bubble starts selected */
+function enterSelectMode(seedId) {
+  state.selecting = true;
+  state.selectedIds = new Set(seedId != null ? [seedId] : []);
+  document.documentElement.classList.add('selecting');
+  renderSelectBar();
+  renderFeed();
+}
+
+function exitSelectMode() {
+  if (!state.selecting) return;
+  state.selecting = false;
+  state.selectedIds = new Set();
+  document.documentElement.classList.remove('selecting');
+  renderSelectBar();
+  renderFeed();
+}
+
+/** @param {number} id */
+function toggleSelect(id) {
+  if (state.selectedIds.has(id)) state.selectedIds.delete(id);
+  else state.selectedIds.add(id);
+  renderSelectBar();
+  renderFeed();
+}
+
+function renderSelectBar() {
+  $('select-bar').classList.toggle('hidden', !state.selecting);
+  if (!state.selecting) return;
+  const n = state.selectedIds.size;
+  $('select-count').textContent = n + ' selected';
+  /** @type {HTMLButtonElement} */ ($('select-export')).disabled = n === 0;
+}
+
+/* attachSelect rides on EVERY message bubble (sent included — they carry no
+   other gestures). A click toggles only while the mode is on; the checkmark
+   ring is applied at render time from state.selectedIds, so it survives the
+   full feed re-render each toggle causes. */
+/** @param {HTMLElement} el @param {number} id */
+function attachSelect(el, id) {
+  if (state.selecting && state.selectedIds.has(id)) el.classList.add('sel-on');
+  el.addEventListener('click', () => { if (state.selecting) toggleSelect(id); });
+}
+
+$('select-cancel').addEventListener('click', exitSelectMode);
+$('select-export').addEventListener('click', async () => {
+  const left = await exportSelectionPNG(flashToast);
+  if (left) exitSelectMode();   // a dismissed share sheet keeps the selection
+});
 
 /* A quiet self-dismissing toast (reuses the context-gauge's .ctx-toast look —
    same quiet register, its own element so the modules stay uncoupled). */

@@ -117,6 +117,10 @@ interface State {
   reactions: Map<number, string[]>;
   myReactions: Map<number, Set<string>>;
   quote: Quote | null;
+  /** #34 export: selection mode — taps toggle bubbles, gestures sleep. */
+  selecting: boolean;
+  /** #34 export: event ids checked for the PNG. */
+  selectedIds: Set<number>;
   view: 'list' | 'thread';
   selected: string | null;
   focus: boolean;

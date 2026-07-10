@@ -91,6 +91,13 @@
       <button id="attn-banner" class="hidden"></button>
       <main id="feed"></main>
       <footer>
+        <!-- Selection bar (#34): replaces the composer while picking messages
+             for an export. Count · Export image · ✕ cancel. -->
+        <div id="select-bar" class="hidden">
+          <span id="select-count">0 selected</span>
+          <button id="select-export">Export image</button>
+          <button id="select-cancel" aria-label="Cancel selection">✕</button>
+        </div>
         <div id="attach-preview" class="hidden">
           <img id="attach-thumb" alt="">
           <button id="attach-remove">✕</button>
@@ -128,6 +135,7 @@
         <button id="action-quote" class="action-item">↩ Quote</button>
         <button id="action-copy" class="action-item">⧉ Copy</button>
         <button id="action-forward" class="action-item">↪ Forward…</button>
+        <button id="action-select" class="action-item">☑ Select…</button>
         <div id="action-reactions"></div>
       </div>
     </div>

@@ -1183,6 +1183,60 @@ footer {
 .sheet-row:disabled { opacity: 0.55; }
 .sheet-row:active { background: var(--hairline); }
 
+/* ---- selection mode & export (#34) ---- */
+/* While selecting: the composer yields the footer to the bar, and every bubble
+   is a checkbox. The ring is drawn with an inset shadow so bubble layout never
+   shifts; the check chip sits on the bubble's leading corner. */
+:root.selecting #composer, :root.selecting #attach-preview, :root.selecting #quote-chip { display: none; }
+:root.selecting #feed .msg { cursor: pointer; }
+#feed .msg.sel-on {
+  box-shadow: inset 0 0 0 2px var(--ink), 0 0 0 2px rgba(255, 255, 255, 0.35);
+}
+#feed .msg.sel-on::before {
+  content: '✓';
+  position: absolute;
+  top: -7px; left: -7px;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--ground);
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+}
+#feed .msg { position: relative; }   /* anchors the ::before chip */
+#select-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+}
+#select-bar.hidden { display: none; }
+#select-count { flex: 1; font-size: 14px; font-weight: 600; color: var(--ink); }
+#select-export {
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--ground);
+  background: var(--ink);
+  border: none;
+  border-radius: 10px;
+}
+#select-export:disabled { opacity: 0.45; }
+#select-cancel {
+  width: 32px; height: 32px;
+  font-size: 15px;
+  color: var(--ink);
+  background: var(--hairline);
+  border: none;
+  border-radius: 50%;
+}
+/* The export painter's solid stand-in for the sent bubble's gradient — one
+   token per theme so the PNG matches the app's accent. */
+:root { --export-sent: #B3402A; }
+:root[data-theme="dusk"] { --export-sent: #2E4A68; }
+:root[data-theme="golden-hour"] { --export-sent: #B3542A; }
+
 /* ---- forward picker rows (#31) — the sheet-row register, roster flavour ---- */
 #forward-list { max-height: 52vh; overflow-y: auto; }
 .forward-row {
