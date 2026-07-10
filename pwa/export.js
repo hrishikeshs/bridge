@@ -85,11 +85,13 @@ const BUBBLE_MAX = Math.round(W * 0.74);
 const FONT = (px, weight = 400) =>
   `${weight} ${px * S}px -apple-system, "SF Pro Text", "Helvetica Neue", "Segoe UI", sans-serif`;
 
-/** @param {BridgeEvent[]} events @returns {HTMLCanvasElement | null} */
+/* paint returns the drawn canvas, or a string explaining why it couldn't —
+   the caller toasts the string verbatim, so each failure reads honestly. */
+/** @param {BridgeEvent[]} events @returns {HTMLCanvasElement | string} */
 function paint(events) {
   const canvas = document.createElement('canvas');
   const probe = canvas.getContext && canvas.getContext('2d');
-  if (!probe) return null;                       // jsdom / ancient engine
+  if (!probe) return 'Export isn’t supported here';   // jsdom / ancient engine
   const ctx = probe;
   const pal = exportPalette();
 
@@ -120,6 +122,10 @@ function paint(events) {
     total += h + gap;
   }
   total += PAD + 22 * S;                         // wordmark strip
+
+  // iOS Safari caps a canvas at ~16.7M pixels of AREA; past it the canvas is
+  // silently blank and toBlob returns garbage/null. Refuse honestly instead.
+  if (W * total > 16_000_000) return 'Too many messages for one image — select fewer';
 
   canvas.width = W;
   canvas.height = total;
@@ -208,7 +214,7 @@ export async function exportSelectionPNG(toast) {
   const events = selectedEventsInOrder(state.events, state.selected, state.selectedIds);
   if (!events.length) { toast('Nothing selected'); return false; }
   const canvas = paint(events);
-  if (!canvas) { toast('Export isn’t supported here'); return false; }
+  if (typeof canvas === 'string') { toast(canvas); return false; }
   /** @type {Blob | null} */
   const blob = await new Promise((r) => canvas.toBlob ? canvas.toBlob(r, 'image/png') : r(null));
   if (!blob) { toast('Couldn’t render the image'); return false; }
