@@ -1358,6 +1358,17 @@ footer {
 :root[data-theme="dusk"][data-wallpaper="whisper"][data-view="list"] { --band: #5A4747; background-color: var(--band); }
 #scenery .veil { display: none; }
 
+/* The burn-off group (#32 round 2, Hrishi's wish): all six fog layers live in
+   one full-bleed wrapper whose OPACITY carries the marine-layer day — sunlight
+   slowly burns the pack down to a third and the bridge underneath surfaces;
+   the fog swells back and it recedes. Group opacity composites over every
+   child, so the drift/warmth animations inside are untouched and the whole
+   cycle is one compositor-cheap property. Static mid here; motion below. */
+#scenery .fogpack {
+  position: absolute; inset: 0;
+  opacity: 0.66;
+}
+
 #scenery .fog {
   position: absolute; border-radius: 50%; filter: blur(16px);
   opacity: var(--fog-density);
@@ -1431,6 +1442,15 @@ footer {
     from { opacity: calc(var(--sun-a) * 0.65); }
     to   { opacity: var(--sun-a); }
   }
+  /* …the marine layer lives a whole slow day: three minutes of the sun burning
+     the pack down to a third — the bridge surfaces — then the fog rolls back in
+     and swallows it again. Slow enough to feel like weather, short enough that
+     one idle glance catches a phase turning. */
+  #scenery .fogpack { animation: fog-burnoff 180s ease-in-out infinite alternate; }
+  @keyframes fog-burnoff {
+    from { opacity: 1; }
+    to   { opacity: 0.3; }
+  }
   /* …and each warmth layer rides its bank's drift timeline (same keyframes,
      same duration, same alternate → identical pixel path) while its own
      opacity peaks at the sunward end of the journey. f1/w1 and f3/w3 begin at
@@ -1478,6 +1498,20 @@ footer {
 :root.screensaver #list-view { opacity: 0; pointer-events: none; }
 @media (prefers-reduced-motion: no-preference) {
   #list-view { transition: opacity 1.1s ease; }
+}
+/* While the screensaver is up there are no rows to keep legible — the veil's
+   one job is vacant — so it thins and the photo's real colours surface for the
+   idle show (#32 round 2; the burn-off cycle plays underneath). Static values,
+   restored the instant the list wakes; the 1.1s list fade covers the switch. */
+:root.screensaver[data-wallpaper="airy"] {
+  --veil-grad: linear-gradient(180deg,
+    rgba(var(--veil-c), 0.50) 0%, rgba(var(--veil-c), 0.36) 34%,
+    rgba(var(--veil-c), 0.16) 86%, var(--band) 100%);
+}
+:root.screensaver[data-wallpaper="whisper"] {
+  --veil-grad: linear-gradient(180deg,
+    rgba(var(--veil-c), 0.42) 0%, rgba(var(--veil-c), 0.28) 34%,
+    rgba(var(--veil-c), 0.12) 86%, var(--band) 100%);
 }
 /* ── end #19(b) ─────────────────────────────────────────────────────────────*/
 
