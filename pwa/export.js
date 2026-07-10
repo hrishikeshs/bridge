@@ -17,14 +17,20 @@
 'use strict';
 
 import { state, threadName } from './app.js';
+// The app's own clock formatting (leaf module, no cycle): the daemon stamps
+// events in UTC; the PNG must show the SAME local times and day labels the
+// thread does, or the artifact contradicts the app it exists to show off
+// (review H1: a 6:11 PM message exported as "01:11" with a phantom
+// next-day separator).
+import { localTime, dayLabel } from './textformat.js';
 
 /* ---------- pure layout helpers (unit-tested) ---------- */
 
 /* Greedy word-wrap against an injected measure function (tests pass a fake;
-   the painter passes ctx.measureText). Explicit newlines are respected; a
-   single word wider than maxWidth is emitted alone on its line rather than
-   looping forever (the canvas clips it — same behaviour as CSS word-wrap on
-   an unbreakable token). */
+   the painter passes ctx.measureText). Explicit newlines are respected; an
+   unbreakable oversize token (a long URL) is split at character level, the
+   way the app's word-wrap: break-word treats it — fillText clips nothing, so
+   an unsplit URL would paint clear across the image (review M3). */
 /** @param {(s: string) => number} measure @param {string} text @param {number} maxWidth @returns {string[]} */
 export function wrapLines(measure, text, maxWidth) {
   const out = [];
@@ -34,15 +40,18 @@ export function wrapLines(measure, text, maxWidth) {
     let line = '';
     for (const w of words) {
       const probe = line ? line + ' ' + w : w;
-      if (line && measure(probe) > maxWidth) {
-        out.push(line);
-        line = w;
-      } else if (!line && measure(w) > maxWidth) {
-        out.push(w);          // unbreakable oversize token: own line, clipped
-        line = '';
-      } else {
-        line = probe;
+      if (measure(probe) <= maxWidth) { line = probe; continue; }
+      if (line) { out.push(line); line = ''; }
+      if (measure(w) <= maxWidth) { line = w; continue; }
+      // Oversize token: hard-split by grapheme-ish chunks until it fits.
+      let rest = w;
+      while (measure(rest) > maxWidth && rest.length > 1) {
+        let cut = rest.length - 1;
+        while (cut > 1 && measure(rest.slice(0, cut)) > maxWidth) cut--;
+        out.push(rest.slice(0, cut));
+        rest = rest.slice(cut);
       }
+      line = rest;
     }
     if (line) out.push(line);
   }
@@ -105,7 +114,7 @@ function paint(events) {
   let lastDay = '';
   let total = PAD + 34 * S;                      // header strip
   for (const ev of events) {
-    const day = (ev.ts || '').slice(0, 10);
+    const day = ev.ts ? dayLabel(ev.ts) : '';    // LOCAL day (review H1)
     if (day && day !== lastDay) { lastDay = day; total += 22 * S; }
     ctx.font = FONT(15);
     const lines = wrapLines(measure, ev.text || '', BUBBLE_MAX - bubblePadX * 2);
@@ -145,7 +154,7 @@ function paint(events) {
   let y = PAD + 34 * S;
   lastDay = '';
   for (const b of boxes) {
-    const day = (b.ev.ts || '').slice(0, 10);
+    const day = b.ev.ts ? dayLabel(b.ev.ts) : '';   // LOCAL day (review H1)
     if (day && day !== lastDay) {
       lastDay = day;
       ctx.fillStyle = pal.dim;
@@ -159,7 +168,7 @@ function paint(events) {
     // who-line above the bubble, on its side
     ctx.fillStyle = pal.dim;
     ctx.font = FONT(11, 600);
-    ctx.fillText(b.whoLabel, b.mine ? x + b.w - Math.min(b.w, ctxWidth(ctx, b.whoLabel)) : x, y);
+    ctx.fillText(b.whoLabel, b.mine ? Math.max(PAD, x + b.w - ctxWidth(ctx, b.whoLabel)) : x, y);
     const by = y + whoH;
     const bh = b.lines.length * lineH + bubblePadY * 2;
     // bubble
@@ -172,7 +181,7 @@ function paint(events) {
     ctx.font = FONT(15);
     b.lines.forEach((ln, i) => ctx.fillText(ln, x + bubblePadX, by + bubblePadY + i * lineH));
     // stamp under the bubble, on its side
-    const t = (b.ev.ts || '').slice(11, 16);
+    const t = b.ev.ts ? localTime(b.ev.ts) : '';   // LOCAL time (review H1)
     ctx.fillStyle = pal.dim;
     ctx.font = FONT(10);
     ctx.fillText(t, b.mine ? x + b.w - ctxWidth(ctx, t) : x, by + bh + 3 * S);
@@ -222,10 +231,16 @@ export async function exportSelectionPNG(toast) {
              + '-' + new Date().toISOString().slice(0, 10) + '.png';
   const file = new File([blob], name, { type: 'image/png' });
   // The OS share sheet is the whole point on the phone; the anchor download is
-  // the desktop fallback. Share can reject (user cancels) — that's not an error.
+  // the desktop fallback. A dismissed sheet (AbortError) is not an error and
+  // keeps the selection; anything else gets an honest toast (review M5 — a
+  // NotAllowedError from an expired user-activation would otherwise read as a
+  // dead button).
   if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
     try { await navigator.share({ files: [file] }); return true; }
-    catch { return false; }                      // user dismissed the sheet
+    catch (err) {
+      if (!(err instanceof Error) || err.name !== 'AbortError') toast('Couldn’t open the share sheet — try again');
+      return false;
+    }
   }
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

@@ -1717,13 +1717,27 @@ function renderSelectBar() {
 /** @param {HTMLElement} el @param {number} id */
 function attachSelect(el, id) {
   if (state.selecting && state.selectedIds.has(id)) el.classList.add('sel-on');
-  el.addEventListener('click', () => { if (state.selecting) toggleSelect(id); });
+  el.addEventListener('click', (e) => {
+    if (!state.selecting) return;
+    // Bubbles carry live <a> links; while selecting, a tap on one must toggle
+    // the message — not eject the user into Safari (review M1). Cancelling the
+    // bubbled click also cancels the anchor's activation.
+    e.preventDefault();
+    toggleSelect(id);
+  });
 }
 
 $('select-cancel').addEventListener('click', exitSelectMode);
+let exporting = false;   // review L4: a double-tap must not run two exports
 $('select-export').addEventListener('click', async () => {
-  const left = await exportSelectionPNG(flashToast);
-  if (left) exitSelectMode();   // a dismissed share sheet keeps the selection
+  if (exporting) return;
+  exporting = true;
+  try {
+    const left = await exportSelectionPNG(flashToast);
+    if (left) exitSelectMode();   // a dismissed share sheet keeps the selection
+  } finally {
+    exporting = false;
+  }
 });
 
 /* A quiet self-dismissing toast (reuses the context-gauge's .ctx-toast look —
