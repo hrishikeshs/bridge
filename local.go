@@ -72,11 +72,19 @@ func handleLocal(w http.ResponseWriter, r *http.Request) {
 		handleLocalRetire(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/hello":
 		handleTransportHello(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/v2/hello":
+		handleTransportHello(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/attest":
 		handleTransportAttest(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/local/transport/mail":
 		handleTransportMail(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/ack":
+		handleTransportAck(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/local/transport/v2/commands":
+		handleTransportCommands(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/v2/events":
+		handleTransportEvents(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/local/transport/v2/ack":
 		handleTransportAck(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/local/lockdown":
 		revokeAllDevices()

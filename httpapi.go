@@ -411,9 +411,15 @@ func handleApprove(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not-waiting"})
 		return
 	}
-	if err := transportFor(c).SendKey(c, req.Key); err != nil {
-		audit("approve-failed", err.Error(), id)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	var deliverErr error
+	if remoteUsesSemanticProtocol(c.ID) {
+		deliverErr = deliverLegacySemanticApproval(c, req.Key)
+	} else {
+		deliverErr = transportFor(c).SendKey(c, req.Key)
+	}
+	if deliverErr != nil {
+		audit("approve-failed", deliverErr.Error(), id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": deliverErr.Error()})
 		return
 	}
 	audit("approve", c.Name+" <- "+req.Key, id)

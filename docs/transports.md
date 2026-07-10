@@ -94,6 +94,46 @@ Approvals ride the same drain as typed deliveries with a `key` field
 instead of `text`; the client maps them to its environment (vterm
 send-key). `SendKey` shares Deliver's ack discipline.
 
+## Semantic protocol v2 (additive)
+
+Clients backed by an agent API can negotiate `"protocol": 2` at hello (or use
+the `/local/transport/v2/hello` alias). Version 1 remains the default whenever
+the field is absent or unsupported, so existing Emacs and simulation clients
+retain their byte-for-byte response and delivery shapes.
+
+V2 replaces terminal text and keys with typed commands:
+
+    GET /local/transport/v2/commands?lease=…&wait=25
+    → { "commands": [
+          { "id":"…", "contact":"…", "type":"input", "text":"…" },
+          { "id":"…", "contact":"…", "type":"interrupt" },
+          { "id":"…", "contact":"…", "type":"approval",
+            "request_id":"…", "decision":"accept" } ] }
+    POST /local/transport/v2/ack { "lease":"…", "ids":["…"] }
+
+The same outbox, lease, timeout, and acknowledgement rules used by v1 remain
+in force. A semantic client publishes normalized, user-visible output through:
+
+    POST /local/transport/v2/events
+    { "lease":"…", "events":[
+        { "contact":"…", "type":"agent_message", "text":"…" },
+        { "contact":"…", "type":"plan", "text":"…" },
+        { "contact":"…", "type":"status", "status":"working" },
+        { "contact":"…", "type":"approval_requested",
+          "request_id":"…", "approval_kind":"command", "reason":"…" }
+      ] }
+
+There is intentionally no raw-reasoning or arbitrary-tool-output event. The
+current phone UI remains compatible: its established numeric approval keys are
+translated to semantic decisions only for a v2 lease (`1` accept, `2`
+accept-for-session, `3` decline, `esc` cancel). V1 continues to receive those
+values as literal whitelisted keystrokes.
+
+`bridge codex` is the first v2 client. It starts or resumes a Codex App Server
+thread and maps `input` to `turn/start` or `turn/steer`, `interrupt` to
+`turn/interrupt`, and App Server messages, plan summaries, and approval requests
+back to semantic events.
+
 ## What does NOT change
 
 - **Outbound is untouched.** Remote agents are Claude Code sessions; the
