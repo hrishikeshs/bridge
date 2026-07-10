@@ -1481,7 +1481,12 @@ function attachBubbleActions(el, meta) {
     const now = { id: meta.id, t: Date.now(), x: at.x, y: at.y };
     if (lastTap && lastTap.id === meta.id && isDoubleTap(lastTap, now)) {
       lastTap = null;
-      openActionSheet(meta, at, 'react');
+      // ghostGuard: this open happens ON a touchend, and iOS synthesizes the
+      // tap's click right after (touch-action: manipulation removes the 300ms
+      // delay), hit-testing into the sheet that now sits under the finger — it
+      // would press whichever reaction button it lands on. Long-press never had
+      // this (a >500ms hold suppresses the click), so only this path arms it.
+      openActionSheet(meta, at, 'react', true);
       return;
     }
     lastTap = now;
@@ -1499,9 +1504,22 @@ function attachBubbleActions(el, meta) {
 /* The one popover, two modes. 'react' (double-tap): the reaction row alone.
    'menu' (long-press): the select actions — Quote / Copy / Forward — and no
    reactions. Only the visible half is built, so neither mode pays for (or
-   leaks listeners into) the other. */
-/** @param {BubbleMeta} meta @param {{x:number, y:number}} at @param {'menu'|'react'} mode */
-function openActionSheet(meta, at, mode) {
+   leaks listeners into) the other.
+
+   ghostGuard (touch double-tap only): the sheet opens ON the second touchend,
+   directly under the finger, and iOS dispatches the tap's synthetic click
+   immediately after — hit-testing it into the sheet. The backdrop has always
+   guarded ITSELF against that click (the 350ms actionOpenedAt window below);
+   with buttons now under the finger, every button wears the same armor, or a
+   double-tap would instantly fire whichever reaction it landed on. Desktop
+   paths (contextmenu/dblclick) dispatch no trailing click and skip the guard,
+   so a mouse user's immediate click still lands. */
+/** @param {BubbleMeta} meta @param {{x:number, y:number}} at @param {'menu'|'react'} mode @param {boolean} [ghostGuard] */
+function openActionSheet(meta, at, mode, ghostGuard) {
+  /** @param {() => void} fn @returns {() => void} */
+  const armed = (fn) => ghostGuard
+    ? () => { if (Date.now() - actionOpenedAt < 350) return; fn(); }
+    : fn;
   const reactions = $('action-reactions');
   reactions.innerHTML = '';
   const menuMode = mode === 'menu';
@@ -1509,9 +1527,9 @@ function openActionSheet(meta, at, mode) {
   $('action-copy').classList.toggle('hidden', !menuMode);
   $('action-forward').classList.toggle('hidden', !menuMode);
   if (menuMode) {
-    $('action-quote').onclick = () => { setQuote(meta); closeActionSheet(); };
-    $('action-copy').onclick = () => { copyBubbleText(meta.text); closeActionSheet(); };
-    $('action-forward').onclick = () => { closeActionSheet(); openForwardSheet(meta); };
+    $('action-quote').onclick = armed(() => { setQuote(meta); closeActionSheet(); });
+    $('action-copy').onclick = armed(() => { copyBubbleText(meta.text); closeActionSheet(); });
+    $('action-forward').onclick = armed(() => { closeActionSheet(); openForwardSheet(meta); });
   } else {
     const mine = state.myReactions.get(meta.id);
     // The quick row: the 6 whitelisted taps (unchanged behaviour), wrapped so the
@@ -1526,7 +1544,7 @@ function openActionSheet(meta, at, mode) {
       if (already) {
         b.disabled = true;   // already reacted this session — pressed and inert
       } else {
-        b.onclick = () => { react(state.selected, meta.id, emoji); closeActionSheet(); };
+        b.onclick = armed(() => { react(state.selected, meta.id, emoji); closeActionSheet(); });
       }
       quick.appendChild(b);
     }
@@ -1534,7 +1552,7 @@ function openActionSheet(meta, at, mode) {
     // ── BUG 2 (react with ANY emoji) ──────────────────────────────────────────
     // …plus a "+" that hands off to the phone's NATIVE emoji keyboard, so the
     // user isn't limited to the 6. The pick flows through the SAME react() path.
-    addEmojiPicker(reactions, quick, meta);
+    addEmojiPicker(reactions, quick, meta, armed);
     // ── end BUG 2 ─────────────────────────────────────────────────────────────
   }
   actionOpenedAt = Date.now();
@@ -1665,8 +1683,8 @@ function flashToast(text) {
    (httpapi.go) opened up — today anything outside the 6 returns 400 "bad-emoji"
    and react() rolls the optimistic badge back. The PWA side is ready; the
    companion daemon change is out of this agent's file scope. */
-/** @param {HTMLElement} reactions @param {HTMLElement} quick @param {BubbleMeta} meta */
-function addEmojiPicker(reactions, quick, meta) {
+/** @param {HTMLElement} reactions @param {HTMLElement} quick @param {BubbleMeta} meta @param {(fn: () => void) => () => void} armed */
+function addEmojiPicker(reactions, quick, meta, armed) {
   const more = document.createElement('button');
   more.className = 'action-reaction action-reaction-more';
   more.textContent = '+';
@@ -1683,14 +1701,14 @@ function addEmojiPicker(reactions, quick, meta) {
   picker.placeholder = 'Pick any emoji…';
   reactions.appendChild(picker);
 
-  more.onclick = () => {
+  more.onclick = armed(() => {
     quick.classList.add('hidden');        // hand the row over to the picker
     picker.classList.remove('hidden');
     // Focus reveals the OS keyboard. The popover may end up behind the keyboard,
     // but that's immaterial: we capture the first emoji and close immediately, so
     // the user interacts with the keyboard, never the input itself.
     picker.focus();
-  };
+  });
 
   let fired = false;   // one reaction per open — guard against a double 'input'
   picker.addEventListener('input', (e) => {
