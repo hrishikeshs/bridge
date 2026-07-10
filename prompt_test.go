@@ -155,6 +155,157 @@ Would you like me to proceed?
 	}
 }
 
+// framelessModalPane is a hypothetical FUTURE dialog shape whose frame is NOT a
+// numbered ❯ option — the version-fragility hedge (2026-07-09). The ❯N. gate
+// misses it, but its modal "Esc to cancel" footer (with no REPL footer present)
+// is caught by the dialogFooterRe fallback, so delivery still refuses.
+const framelessModalPane = `
+ Approve this action?
+   Approve
+   Deny
+
+ Esc to cancel`
+
+// framelessTrustPane exercises the "Enter to confirm" arm of the footer fallback
+// on a frame the ❯N. test would miss.
+const framelessTrustPane = `
+ Do you trust the files in this directory?
+   Yes, proceed
+   No, exit
+
+ Enter to confirm`
+
+// proseWithCancelIdlePane is THE deadlock guard (2026-07-09). An idle agent whose
+// message text mentions "esc to cancel" — but whose bottom rows are the input
+// caret block and REPL footer — must NOT be read as a dialog: the footer fallback
+// matches cancel/confirm vocab only on the pane's last few non-blank lines, and
+// the prose sits ABOVE the caret block, out of that window. So mail is delivered,
+// not held forever. This is the quick-wolf class the bottom-row anchor closes.
+const proseWithCancelIdlePane = `  I'll run the migration now. To abort it mid-run, hit esc to cancel at the
+  confirm step and nothing gets written.
+
+  Ready when you are.
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ? for shortcuts · ← for agents`
+
+// framelessModalReplWordInBody and framelessModalPlanModeBody are the adversarial
+// review's Finding 1 (2026-07-09): a frameless modal whose BODY text happens to
+// read like a REPL-footer phrase must still hold. An earlier design vetoed the
+// hold when "accept edits on" / "plan mode on" appeared anywhere → blind-select.
+// The bottom-row anchor has no veto: the modal's own "Enter to confirm" / "Esc to
+// cancel" footer is on the last line and triggers the hold regardless. Both hold.
+const framelessModalReplWordInBody = ` Proceed with this command?
+   git commit -m 'accept edits on main'
+
+ Enter to confirm`
+
+const framelessModalPlanModeBody = ` Turn plan mode on for this session?
+   Yes
+   No
+
+ Esc to cancel`
+
+// TestPaneShowsDialogFooterFallback: a modal whose frame is not a numbered option
+// still blocks delivery via its confirm/cancel footer, so a CC dialog-UI change
+// cannot silently reopen the blind-select hole.
+func TestPaneShowsDialogFooterFallback(t *testing.T) {
+	for name, pane := range map[string]string{
+		"frameless approve/deny modal":   framelessModalPane,
+		"frameless trust modal":          framelessTrustPane,
+		"repl word in modal body":        framelessModalReplWordInBody,
+		"plan-mode phrase in modal body": framelessModalPlanModeBody,
+	} {
+		if dialogFrameRe.MatchString(pane) {
+			t.Fatalf("%s: fixture accidentally has a ❯N. frame; it must exercise the FOOTER path", name)
+		}
+		if !paneShowsDialog(pane) {
+			t.Errorf("%s: paneShowsDialog = false; a frameless modal would take a blind delivery", name)
+		}
+	}
+}
+
+// TestPaneShowsDialogIgnoresCancelVocabAboveFooter is the deadlock guard: footer
+// vocab in agent prose (above the input caret block) must not hold mail on an idle
+// screen. The bottom-row anchor closes this — the vocab is outside the last-few-
+// non-blank-lines window the fallback reads.
+func TestPaneShowsDialogIgnoresCancelVocabAboveFooter(t *testing.T) {
+	if !dialogFooterRe.MatchString(proseWithCancelIdlePane) {
+		t.Fatal("fixture should carry footer vocab up-tail, so the bottom-row anchor is what makes the difference")
+	}
+	if paneShowsDialog(proseWithCancelIdlePane) {
+		t.Error("paneShowsDialog = true on idle prose mentioning 'esc to cancel'; delivery would be held forever (the deadlock the anchor prevents)")
+	}
+	if looksLikePrompt(proseWithCancelIdlePane) {
+		t.Error("looksLikePrompt = true on idle prose; a false attention card would be raised")
+	}
+	// Every idle/working footer must leave an idle screen deliverable — INCLUDING a
+	// wrap-split one (Finding D: the daemon captures without -J, so a narrow pane
+	// records the footer as separate physical rows, shredding any single token).
+	// The anchor doesn't care: none of these bottom rows carry cancel/confirm vocab.
+	for name, footer := range map[string]string{
+		"accept-edits": "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+		"plan-mode":    "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+		"working":      "  esc to interrupt · ← for agents",
+		"shortcuts":    "  ? for shortcuts · ← for agents",
+		"wrap-split":   "  ⏵⏵ accept edits on (sh\nift+tab to cycle) · ← fo\nr agents",
+	} {
+		pane := "  earlier I noted you can press esc to cancel the job.\n────\n❯\n────\n" + footer
+		if paneShowsDialog(pane) {
+			t.Errorf("%s footer: delivery held on an idle screen (false-positive deadlock)", name)
+		}
+	}
+}
+
+// statuslineBelowFooterPane, autoCompactHintBelowFooterPane, and
+// bgTaskBelowFooterPane are adversarial-review round 2 (2026-07-09, Findings A–C):
+// Claude Code renders a custom /statusline, the "Context left until auto-compact"
+// hint, or a background-task row BELOW its "← for agents" footer. An idle agent
+// there — even with "esc to cancel" in its scrollback prose — must still be
+// delivered to. The bottom-row anchor keeps these deliverable: the prose vocab is
+// far up-tail, and the actual bottom rows (footer + the extra row) carry no
+// cancel/confirm vocab. A discarded bottom-LINE veto read only the extra row,
+// missed the footer, and held the mail forever.
+const statuslineBelowFooterPane = `  Sure — I'll drop the staging table. At the confirm prompt press esc to cancel.
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ? for shortcuts · ← for agents
+  ⎇ main ✚2 · claude-opus-4-8 · 34% context`
+
+const autoCompactHintBelowFooterPane = `  To abort the migration, hit esc to cancel at the confirmation step.
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents
+  Context left until auto-compact: 8%`
+
+const bgTaskBelowFooterPane = `  You can press esc to cancel that job once it starts running.
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ? for shortcuts · ← for agents
+  ⏵ 1 background task · ctrl+b to manage`
+
+// TestPaneShowsDialogDeliversWithRowsBelowFooter locks Findings A–C: an idle screen
+// with an extra CC-drawn row beneath its footer must stay deliverable — the anchor
+// reads the bottom rows (footer + extra row), neither of which carries cancel vocab.
+func TestPaneShowsDialogDeliversWithRowsBelowFooter(t *testing.T) {
+	for name, pane := range map[string]string{
+		"custom /statusline below footer":  statuslineBelowFooterPane,
+		"auto-compact hint below footer":   autoCompactHintBelowFooterPane,
+		"background-task row below footer": bgTaskBelowFooterPane,
+	} {
+		if !dialogFooterRe.MatchString(pane) {
+			t.Fatalf("%s: fixture must carry footer vocab up-tail so the bottom-row anchor is what decides", name)
+		}
+		if paneShowsDialog(pane) {
+			t.Errorf("%s: paneShowsDialog = true; idle mail would be held forever (the deadlock the bottom-row anchor prevents)", name)
+		}
+	}
+}
+
 func TestFirstPromptLine(t *testing.T) {
 	if got := firstPromptLine(realPromptPane); got != "Bash(git push origin master)" {
 		t.Errorf("firstPromptLine = %q, want the tool call", got)

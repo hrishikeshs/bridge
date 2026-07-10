@@ -70,11 +70,28 @@ func looksLikePrompt(pane string) bool {
 // tmux's capture-pane -p both strip ANSI/borders), and dialogFrameRe uses \d+ (not
 // [123]) so a selection past option 3 is still caught.
 //
-// KNOWN GAP (pre-existing, not closed here; tracked separately): a dialog with a
-// ❯ input field but NO numbered option — the "tell Claude what to do differently"
-// free-text box reachable by choosing option 3 — matches neither gate, so a queued
-// line could be typed into it. The old gate missed it too; closing it needs a
-// distinct text-input-frame detector, out of scope for this delivery-gate fix.
+// 2026-07-09 UPDATE (Vint, ground-truth probes in throwaway claude+tmux
+// sessions): CC v2.1.197 collapsed the old 3-option Bash dialog into "❯ 1. Yes /
+// 2. No / Tab to amend". The amend free-text renders INLINE into option 1
+// ("❯ 1. Yes, <typed text>"), so every interactive Bash-dialog state STILL
+// carries the ❯N. frame and is caught above; the old "option 3 → bare-❯ text
+// box" (#27) is no longer reachable there. What remains is VERSION FRAGILITY —
+// the frame glyph changed once and could change again under us. The dialogFooterRe
+// fallback hedges it: a modal confirm/cancel FOOTER ("esc to cancel/exit", "enter
+// to confirm") on the pane's BOTTOM ROWS (lastNonBlankLines) counts as a dialog
+// too. Anchoring to the bottom rows — where a real modal's footer sits — is what
+// keeps this off the idle caret without a separate REPL-footer veto: a genuine
+// REPL footer carries none of this vocab, and agent prose that merely mentions it
+// sits above the input caret block, out of the window. (Three adversarial passes,
+// 2026-07-09, each broke a veto-based design — whole-tail, bottom-line, and
+// wrap-split; the bottom-row anchor drops the veto entirely, docs/dialog-gate-
+// 2026-07-09.md.) Monotonic: the ❯N. gate is untouched; this only ever ADDS a
+// hold, for a shape CC does not render today. Route-health L1 ("stalled") and a
+// future L2 auto-esc self-heal are the backstops for whatever both layers miss.
+//
+// SHIP STATUS: staged on a branch, NOT deployed to prod (Hrishi's call, 6 days
+// pre-baby: the frame gate already covers 100% of current CC, so this hedge is not
+// worth prod risk near release). Finish/deploy post-baby.
 func paneShowsDialog(pane string) bool {
 	if pane == "" {
 		return false
@@ -84,7 +101,41 @@ func paneShowsDialog(pane string) bool {
 		lines = lines[len(lines)-18:]
 	}
 	tail := strings.Join(lines, "\n")
-	return dialogFrameRe.MatchString(tail)
+	// The proven numbered-option frame — every current CC dialog renders it.
+	if dialogFrameRe.MatchString(tail) {
+		return true
+	}
+	// Version-robust fallback for a hypothetical FRAMELESS future dialog: a modal's
+	// confirm/cancel footer on the pane's bottom rows. Anchoring to the last few
+	// non-blank lines — where a real modal's footer sits — is the whole trick, and
+	// it replaces the REPL-footer veto that three adversarial passes (2026-07-09)
+	// each broke (a whole-tail veto let a modal's own body text suppress it; a
+	// bottom-line veto and a wrap-split footer both deadlocked idle mail). No veto
+	// is needed: a genuine REPL footer ("? for shortcuts", "← for agents", "shift+
+	// tab to cycle", …) carries NO cancel/confirm vocab, so an idle screen never
+	// trips this — even wrapped, even with a /statusline or auto-compact hint drawn
+	// below it. And ordinary agent prose that merely mentions "esc to cancel" sits
+	// ABOVE the input caret block, out of this bottom window. Monotonic: the ❯N.
+	// gate is untouched and this only ever ADDS a hold, for a shape CC does not
+	// render today. (Deliberately conservative near release; see docs.)
+	if dialogFooterRe.MatchString(lastNonBlankLines(lines, 3)) {
+		return true
+	}
+	return false
+}
+
+// lastNonBlankLines joins the final n lines that carry non-whitespace content
+// (skipping blank/padding rows). The delivery gate reads a modal's confirm/cancel
+// FOOTER here: it sits on the pane's bottom rows, whereas agent prose that happens
+// to mention those words sits above the input caret block, outside this window.
+func lastNonBlankLines(lines []string, n int) string {
+	out := make([]string, 0, n)
+	for i := len(lines) - 1; i >= 0 && len(out) < n; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			out = append(out, lines[i])
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // paneReadyForDelivery reports whether it is safe to send-keys into c's pane
@@ -111,6 +162,17 @@ func paneReadyForDelivery(c *Contact) bool {
 // requires proceed vocabulary) key off this one frame test; \d+ (not [123]) so a
 // selection on option 4+ is still caught.
 var dialogFrameRe = regexp.MustCompile(`(?m)^\s*❯\s*\d+\.\s`)
+
+// dialogFooterRe matches the confirm/cancel FOOTER a modal permission dialog
+// prints in place of the REPL input line — "Esc to cancel", "Esc to exit",
+// "Enter to confirm". It is the version-robust half of the delivery gate: it can
+// recognize a dialog whose frame is NOT a numbered ❯ option (a future/other CC
+// shape). paneShowsDialog matches it only against the pane's bottom rows
+// (lastNonBlankLines), where a real modal's footer sits — so a genuine REPL
+// footer (which carries none of this vocab) and agent prose above the input caret
+// both fall outside it. It deliberately does NOT list "esc to interrupt" (the
+// WORKING-state footer) — that is a REPL line, not a modal.
+var dialogFooterRe = regexp.MustCompile(`(?i)\b(esc|escape) to (cancel|exit)\b|\benter to confirm\b`)
 
 // timeNowUnix returns the current unix time in seconds.
 func timeNowUnix() int64 { return time.Now().Unix() }
