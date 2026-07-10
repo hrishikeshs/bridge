@@ -125,8 +125,101 @@ test('Esc and backdrop dismiss the forward picker without sending', async (t) =>
   await h.flush();
   const before = h.callsTo('/api/send').length;
 
+  // Esc first (review F4: the handler must exist, not just the backdrop)…
+  const esc = new (h.document.defaultView.KeyboardEvent)('keydown', { key: 'Escape', bubbles: true });
+  h.document.dispatchEvent(esc);
+  await h.flush();
+  assert.equal(h.$('forward-sheet').classList.contains('hidden'), true, 'Esc closes the picker');
+
+  // …then the backdrop on a fresh open.
+  h.dispatch('contextmenu', bubble);
+  await h.flush();
+  await h.click('action-forward');
+  await h.flush();
   await h.click('forward-backdrop');
   await h.flush();
   assert.equal(h.$('forward-sheet').classList.contains('hidden'), true, 'backdrop closes the picker');
   assert.equal(h.callsTo('/api/send').length, before, 'nothing was sent');
+});
+
+test('Forward from a ROOM thread excludes that room (review F2)', async (t) => {
+  const h = await loadApp();
+  t.after(() => h.teardown());
+  await h.openContact('#crew');
+  await h.sse({ id: 300, type: 'peer', agent: 'room:crew', name: 'quick-wolf', text: 'den tip', ts: '2026-07-10T07:30:00Z' });
+  const bubble = h.qs('#feed .msg.peer');
+  assert.ok(bubble, 'a peer bubble in the room');
+
+  h.dispatch('contextmenu', bubble);
+  await h.flush();
+  await h.click('action-forward');
+  await h.flush();
+
+  const names = h.qsa('#forward-list .forward-row .forward-row-name').map((n) => n.textContent);
+  assert.ok(!names.includes('#crew'), 'the room we are standing in is not a forward target');
+  assert.deepEqual(names, ['vint', 'ludwig', 'marvin'], 'all contacts offered');
+});
+
+/* The touch path end-to-end — the actual phone gesture plus its ghost-click
+   armor (the F1 fix). Touch events are hand-built (jsdom has no TouchEvent):
+   a plain Event with a touches array is exactly what the handlers read. */
+function touchTap(h, el, x, y) {
+  const win = h.document.defaultView;
+  const start = new win.Event('touchstart', { bubbles: true });
+  start.touches = [{ clientX: x, clientY: y }];
+  el.dispatchEvent(start);
+  const end = new win.Event('touchend', { bubbles: true });
+  el.dispatchEvent(end);
+}
+
+test('touch double-tap opens reactions; the armor eats the ghost click, then real taps land', async (t) => {
+  const h = await loadApp();
+  t.after(() => h.teardown());
+  const bubble = await openThreadWithReply(h);
+
+  // Two clean taps, 200 fake-ms apart, 4px drift — a double-tap.
+  touchTap(h, bubble, 180, 300);
+  await h.tick(200);
+  touchTap(h, bubble, 184, 302);
+  await h.flush();
+  assert.equal(h.$('action-sheet').classList.contains('hidden'), false, 'double-tap opened the sheet');
+  assert.equal(h.qsa('#action-reactions .action-reaction').length > 0, true, 'react mode');
+
+  // The synthetic click lands on a reaction button within 350ms — swallowed.
+  const before = h.callsTo('/api/react').length;
+  const thumbs = h.qsa('#action-reactions .action-reaction').find((b) => b.textContent === '👍');
+  await h.click(thumbs);
+  assert.equal(h.callsTo('/api/react').length, before, 'ghost click within 350ms is swallowed');
+  assert.equal(h.$('action-sheet').classList.contains('hidden'), false, 'sheet survives the ghost');
+
+  // Past the armor window, a real tap reacts normally.
+  await h.tick(400);
+  await h.click(thumbs);
+  assert.equal(h.callsTo('/api/react').length, before + 1, 'a real tap lands after the window');
+  assert.equal(h.lastCallTo('/api/react').body.emoji, '👍');
+});
+
+test('two slow taps or a hold do NOT open the reaction sheet', async (t) => {
+  const h = await loadApp();
+  t.after(() => h.teardown());
+  const bubble = await openThreadWithReply(h);
+
+  // Slow pair (500 fake-ms apart) — not a double-tap.
+  touchTap(h, bubble, 180, 300);
+  await h.tick(500);
+  touchTap(h, bubble, 180, 300);
+  await h.flush();
+  assert.equal(h.$('action-sheet').classList.contains('hidden'), true, 'slow taps stay inert');
+
+  // A 500ms hold opens the MENU (and is not tap #1 of a double-tap).
+  const win = h.document.defaultView;
+  const start = new win.Event('touchstart', { bubbles: true });
+  start.touches = [{ clientX: 180, clientY: 300 }];
+  bubble.dispatchEvent(start);
+  await h.tick(520);   // the hold fires
+  bubble.dispatchEvent(new win.Event('touchend', { bubbles: true }));
+  await h.flush();
+  assert.equal(h.$('action-sheet').classList.contains('hidden'), false, 'hold opened the sheet');
+  assert.equal(h.$('action-copy').classList.contains('hidden'), false, 'menu mode (Copy offered)');
+  assert.equal(h.qsa('#action-reactions .action-reaction').length, 0, 'no reactions on a hold');
 });

@@ -1597,7 +1597,9 @@ function openForwardSheet(meta) {
   const list = $('forward-list');
   list.innerHTML = '';
   /** @type {Array<Room | Contact>} */
-  const targets = [...state.rooms, ...state.contacts.filter((c) => c.id !== state.selected)];
+  // Exclude the thread we're standing in — room OR contact: forwarding a #crew
+  // bubble back into #crew would re-post it to the whole crew (review F2).
+  const targets = [...state.rooms, ...state.contacts].filter((t) => t.id !== state.selected);
   for (const t of targets) {
     const row = document.createElement('button');
     row.className = 'forward-row';
@@ -1793,7 +1795,9 @@ $('action-sheet').addEventListener('click', (e) => {
   if (Date.now() - actionOpenedAt < 350) return;
   closeActionSheet();
 });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeActionSheet(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { closeActionSheet(); closeForwardSheet(); }
+});
 
 /* Send an emoji reaction. The badge itself arrives via the daemon's echoed
    'reaction' event over SSE; myReactions only tracks this session's taps for the

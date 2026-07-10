@@ -663,6 +663,9 @@ header {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* The whole feed, not just bubbles (review F3b): a double-tap that misses a
+     bubble by a few px must not fire iOS's double-tap zoom either. */
+  touch-action: manipulation;
 }
 
 .msg {
@@ -1397,15 +1400,23 @@ footer {
   opacity: calc(var(--sun-a) * 0.9);
   mix-blend-mode: screen;
 }
-#scenery .fog::after {
-  content: '';
-  position: absolute; inset: 0;
-  border-radius: 50%;
+/* The scatter layers are SIBLINGS of their banks, not ::after children: a
+   pseudo inside the blurred element changes the filter's input every frame,
+   forcing WebKit to re-run a 16px gaussian on three huge layers for as long as
+   the list is up (review F5 — battery heat). A sibling is blurred once and then
+   only composited: its transform rides the SAME drift keyframes as its bank
+   (same duration/alternate → identical pixel path) while its own opacity
+   carries the warmth — both compositor-cheap, like .sunglow. */
+#scenery .fogwarm {
+  position: absolute; border-radius: 50%; filter: blur(16px);
   background: radial-gradient(closest-side at 26% 55%,
     rgba(var(--sun-c), 0.6), rgba(var(--sun-c), 0) 70%);
-  opacity: calc(var(--sun-a) * 0.6);   /* static mid — animated below */
   mix-blend-mode: screen;
+  opacity: calc(var(--sun-a) * 0.6);   /* static mid — animated below */
 }
+#scenery .w1 { width: 150%; height: 14%; bottom: 12%; left: -30%; }
+#scenery .w2 { width: 130%; height: 11%; bottom: 22%; left: 10%; }
+#scenery .w3 { width: 170%; height: 17%; bottom: 3%; left: -50%; }
 
 @media (prefers-reduced-motion: no-preference) {
   #scenery .f1 { animation: fog-drift-1 52s ease-in-out infinite alternate; }
@@ -1420,13 +1431,17 @@ footer {
     from { opacity: calc(var(--sun-a) * 0.65); }
     to   { opacity: var(--sun-a); }
   }
-  /* …and each bank's warmth rides its own drift timeline (same duration,
-     same alternate), peaking at the sunward end of the journey. f1 and f3
-     begin at their LEFT extreme → warm at 0%; f2 travels leftward → warm at
-     100%. Alternate mirrors both together, so they can never fall out of sync. */
-  #scenery .f1::after { animation: fog-warm-wane 52s ease-in-out infinite alternate; }
-  #scenery .f2::after { animation: fog-warm-wax  74s ease-in-out infinite alternate; }
-  #scenery .f3::after { animation: fog-warm-wane 96s ease-in-out infinite alternate; }
+  /* …and each warmth layer rides its bank's drift timeline (same keyframes,
+     same duration, same alternate → identical pixel path) while its own
+     opacity peaks at the sunward end of the journey. f1/w1 and f3/w3 begin at
+     their LEFT extreme → warm at 0%; f2/w2 travels leftward → warm at 100%.
+     Alternate mirrors drift and warmth together — they can't fall out of sync. */
+  #scenery .w1 { animation: fog-drift-1 52s ease-in-out infinite alternate,
+                            fog-warm-wane 52s ease-in-out infinite alternate; }
+  #scenery .w2 { animation: fog-drift-2 74s ease-in-out infinite alternate,
+                            fog-warm-wax  74s ease-in-out infinite alternate; }
+  #scenery .w3 { animation: fog-drift-3 96s ease-in-out infinite alternate,
+                            fog-warm-wane 96s ease-in-out infinite alternate; }
   @keyframes fog-warm-wane {
     from { opacity: calc(var(--sun-a) * 1.2); }
     to   { opacity: calc(var(--sun-a) * 0.12); }

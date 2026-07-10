@@ -43,6 +43,10 @@
            (edge-anchored so viewport cover-crops can't strand it off-screen). -->
       <span class="sunglow"></span>
       <span class="fog f1"></span><span class="fog f2"></span><span class="fog f3"></span>
+      <!-- Warmth layers: siblings, not ::after — a child of a blurred element
+           re-runs the blur every animation frame (review F5). Each rides its
+           bank's drift keyframes so they move as one. -->
+      <span class="fogwarm w1"></span><span class="fogwarm w2"></span><span class="fogwarm w3"></span>
     </div>
 
     <!-- LIST VIEW — the conversation list; the home screen. -->
