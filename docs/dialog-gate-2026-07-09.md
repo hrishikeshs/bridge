@@ -81,6 +81,23 @@ window. All three prior bugs were *veto* bugs; removing the veto removes the cla
   approval-**card** gate (`looksLikePrompt` still needs `❯ N.`) — so it would be
   *noticed*, not silent — and route-health L1 surfaces held mail regardless.
 
+## Validation
+
+Four adversarial review passes (find→refute, independent agent). Passes 1–3 each
+broke a *veto*-based design (see the table above); pass 4, against the no-veto
+bottom-row anchor, **could not break direction B** (idle deadlock) against any real
+CC screen and reduced direction A (blind-select) to a compound improbability behind
+the frameless-future hedge. The structural reason: CC always renders its input as a
+bordered box (idle: separator / `❯` / separator) or a spinner block (working), so
+the model's nearest prose line is always ≥3 non-blank rows above the footer —
+outside the window `lastNonBlankLines(lines, 3)` reads. **`n=3` is not a magic
+number; it matches CC's minimum input-chrome height** — the very separation the
+veto was faking. The one screen the anchor holds on but the frame gate wouldn't — a
+raw subprocess TUI (an `apt`/installer drawing its own "Enter to confirm") — is
+*correct* to hold: typed mail would reach the subprocess's stdin, not CC. If CC
+ever adds a second always-on row below its footer, revisit `n` (it would be
+visible).
+
 ## Residual / follow-ups (post-baby)
 
 - **Finding 2:** `remote.go` `remoteTransport.Ready` has no `paneSessionID`
