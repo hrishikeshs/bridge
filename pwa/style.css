@@ -671,6 +671,9 @@ header {
   border-radius: var(--radius);
   font-size: 15px;
   word-wrap: break-word;
+  /* Double-tap now reacts (#31) — manipulation keeps pan/pinch but disables
+     iOS's own double-tap zoom, which would otherwise race our detector. */
+  touch-action: manipulation;
 }
 
 .msg .who {
@@ -1177,6 +1180,26 @@ footer {
 .sheet-row:disabled { opacity: 0.55; }
 .sheet-row:active { background: var(--hairline); }
 
+/* ---- forward picker rows (#31) — the sheet-row register, roster flavour ---- */
+#forward-list { max-height: 52vh; overflow-y: auto; }
+.forward-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 14px 6px;
+  font-size: 15px;
+  color: var(--ink);
+  text-align: left;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--hairline);
+}
+.forward-row:last-child { border-bottom: none; }
+.forward-row:active { background: var(--hairline); }
+.forward-row-name { font-weight: 600; }
+.forward-row-note { font-size: 12px; opacity: 0.6; }
+
 /* Palette-follows-the-sun switch: an iOS-style toggle sitting on a sheet row.
    The track is grey (off) / resolved-green (on); the knob slides between. */
 .toggle-row { justify-content: space-between; gap: 12px; }
@@ -1342,6 +1365,48 @@ footer {
   background: radial-gradient(closest-side, rgba(var(--fog-c), 0.7), rgba(var(--fog-c), 0)); }
 #scenery .f3 { width: 170%; height: 17%; bottom: 3%; left: -50%;
   background: radial-gradient(closest-side, rgba(var(--fog-c), 0.8), rgba(var(--fog-c), 0)); }
+
+/* ── sunlight ↔ fog (#32) ────────────────────────────────────────────────────
+   The photo's sun floods in from the LEFT horizon, and the banks drift through
+   that light. Two layers, both painted with the theme/phase-aware --sun-c:
+
+   · .sunglow — the light itself: a soft radial hugging the left edge (the crop
+     eats image-left on narrow screens, so anchor to the EDGE, not the sun's
+     pixel), breathing gently under the fog.
+   · .fog::after — the scatter: each bank carries a sun-side warm tint whose
+     opacity rides the SAME duration/alternate timeline as its drift, so a bank
+     glows exactly as it drifts sunward (left) and cools as it leaves. f1/f3
+     start at their left extreme (warm→cool); f2 drifts leftward (cool→warm).
+     Synchronized by construction — no JS, nothing to drift out of phase.
+
+   Both layers blend with screen (light ADDS; it can only brighten, so rows
+   above stay legible), sit inside the fog's own blur, and go near-silent at
+   night. Static mid-values here; the media block below adds the motion. */
+:root { --sun-c: 255, 186, 110; --sun-a: 0.34; }
+:root[data-theme="dusk"] { --sun-c: 255, 148, 96; --sun-a: 0.22; }
+:root[data-theme="golden-hour"][data-phase="dawn"]   { --sun-c: 255, 176, 150; --sun-a: 0.26; }
+:root[data-theme="golden-hour"][data-phase="golden"] { --sun-c: 255, 190, 104; --sun-a: 0.40; }
+:root[data-theme="golden-hour"][data-phase="dusk"]   { --sun-c: 255, 142, 92;  --sun-a: 0.30; }
+:root[data-theme="golden-hour"][data-phase="night"]  { --sun-c: 214, 224, 255; --sun-a: 0.10; }
+
+#scenery .sunglow {
+  position: absolute; left: -22%; top: 24%; width: 56%; height: 44%;
+  background: radial-gradient(closest-side,
+    rgba(var(--sun-c), 0.55), rgba(var(--sun-c), 0.20) 55%, rgba(var(--sun-c), 0) 74%);
+  filter: blur(22px);
+  opacity: calc(var(--sun-a) * 0.9);
+  mix-blend-mode: screen;
+}
+#scenery .fog::after {
+  content: '';
+  position: absolute; inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(closest-side at 26% 55%,
+    rgba(var(--sun-c), 0.6), rgba(var(--sun-c), 0) 70%);
+  opacity: calc(var(--sun-a) * 0.6);   /* static mid — animated below */
+  mix-blend-mode: screen;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   #scenery .f1 { animation: fog-drift-1 52s ease-in-out infinite alternate; }
   #scenery .f2 { animation: fog-drift-2 74s ease-in-out infinite alternate; }
@@ -1349,7 +1414,29 @@ footer {
   @keyframes fog-drift-1 { to { transform: translateX(18%); } }
   @keyframes fog-drift-2 { to { transform: translateX(-14%); } }
   @keyframes fog-drift-3 { to { transform: translateX(22%); } }
+  /* The light breathes on its own slow clock… */
+  #scenery .sunglow { animation: sun-breathe 22s ease-in-out infinite alternate; }
+  @keyframes sun-breathe {
+    from { opacity: calc(var(--sun-a) * 0.65); }
+    to   { opacity: var(--sun-a); }
+  }
+  /* …and each bank's warmth rides its own drift timeline (same duration,
+     same alternate), peaking at the sunward end of the journey. f1 and f3
+     begin at their LEFT extreme → warm at 0%; f2 travels leftward → warm at
+     100%. Alternate mirrors both together, so they can never fall out of sync. */
+  #scenery .f1::after { animation: fog-warm-wane 52s ease-in-out infinite alternate; }
+  #scenery .f2::after { animation: fog-warm-wax  74s ease-in-out infinite alternate; }
+  #scenery .f3::after { animation: fog-warm-wane 96s ease-in-out infinite alternate; }
+  @keyframes fog-warm-wane {
+    from { opacity: calc(var(--sun-a) * 1.2); }
+    to   { opacity: calc(var(--sun-a) * 0.12); }
+  }
+  @keyframes fog-warm-wax {
+    from { opacity: calc(var(--sun-a) * 0.12); }
+    to   { opacity: calc(var(--sun-a) * 1.2); }
+  }
 }
+/* ── end #32 ─────────────────────────────────────────────────────────────────*/
 
 /* The list anchors its own scenery; content floats on the weather as glass
    rows. Threads deliberately have NO wallpaper — words beat weather. The navy

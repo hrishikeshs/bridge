@@ -34,7 +34,7 @@ import {
 // event log + outbox). The list module imports the rest; the spine only calls
 // markSeen (init / openThread / renderFeed). unreadCount rides into the list
 // module (updateUnreadTotals lives there now).
-import { markSeen } from './messagemath.js';
+import { markSeen, isDoubleTap, forwardText } from './messagemath.js';
 // Notifications (browser Notification / ServiceWorker / PushManager + /api/push).
 // The module wires its own enable-push listener at import time; the spine calls
 // these four entry points back.
@@ -1432,13 +1432,19 @@ function appendReactions(bubble, id) {
   bubble.appendChild(row);
 }
 
-/* Long-press detection. A 500ms hold that doesn't drift into a scroll raises the
-   sheet; the sheet's own overlay then intercepts the trailing synthetic click,
-   so it can't close the sheet or fire a link under the finger (the backdrop
-   handler ignores clicks in the first 350ms after opening). */
+/* Gesture detection (feature #31): two gestures on a bubble, two surfaces.
+   · LONG-PRESS (500ms hold, no drift) — the SELECT menu: Quote / Copy / Forward.
+   · DOUBLE-TAP (two clean taps, same bubble, ≤350ms & ≤40px apart) — reactions.
+   The sheet's overlay intercepts the trailing synthetic click either way, so it
+   can't close the sheet or fire a link under the finger (the backdrop handler
+   ignores clicks in the first 350ms after opening). Desktop mirrors both:
+   right-click = menu, double-click = reactions. touch-action: manipulation on
+   the bubbles (style.css) suppresses iOS's own double-tap zoom on the feed. */
 let lpTimer = null;
 let lpStart = null;
 let actionOpenedAt = 0;
+/** @type {{id:number, t:number, x:number, y:number} | null} */
+let lastTap = null;   // the previous clean tap — the double-tap detector's memory
 
 /** @typedef {{id:number, name:string, type?:string, text:string}} BubbleMeta */
 /** @param {HTMLElement} el @param {BubbleMeta} meta */
@@ -1452,53 +1458,197 @@ function attachBubbleActions(el, meta) {
     // touch, which is how the menu used to fly to the top of the screen.
     const at = { x: t.clientX, y: t.clientY };
     clearTimeout(lpTimer);
-    lpTimer = setTimeout(() => { lpStart = null; openActionSheet(meta, at); }, 500);
+    lpTimer = setTimeout(() => {
+      lpStart = null;
+      lastTap = null;   // the hold consumed this touch — it is not tap #1
+      openActionSheet(meta, at, 'menu');
+    }, 500);
   }, { passive: true });
   el.addEventListener('touchmove', (e) => {
     if (!lpStart) return;
     const t = e.touches && e.touches[0];
     if (t && Math.hypot(t.clientX - lpStart.x, t.clientY - lpStart.y) > 10) {
-      clearTimeout(lpTimer); lpStart = null;   // it's a scroll, not a press
+      clearTimeout(lpTimer); lpStart = null; lastTap = null;  // a scroll is neither press nor tap
     }
   }, { passive: true });
-  el.addEventListener('touchend', () => { clearTimeout(lpTimer); lpStart = null; }, { passive: true });
-  // Desktop: right-click / trackpad long-press raises the same sheet at the cursor.
+  el.addEventListener('touchend', () => {
+    clearTimeout(lpTimer);
+    if (!lpStart) return;             // long-press already fired, or drift cancelled
+    const at = { x: lpStart.x, y: lpStart.y };
+    lpStart = null;
+    // A clean short tap. Second one on the SAME bubble completes a double-tap →
+    // the reaction sheet. (Single taps keep doing what they always did: nothing.)
+    const now = { id: meta.id, t: Date.now(), x: at.x, y: at.y };
+    if (lastTap && lastTap.id === meta.id && isDoubleTap(lastTap, now)) {
+      lastTap = null;
+      openActionSheet(meta, at, 'react');
+      return;
+    }
+    lastTap = now;
+  }, { passive: true });
+  // Desktop mirrors: right-click = select menu, double-click = reactions.
   el.addEventListener('contextmenu', (e) => {
     e.preventDefault();
-    openActionSheet(meta, { x: e.clientX, y: e.clientY });
+    openActionSheet(meta, { x: e.clientX, y: e.clientY }, 'menu');
+  });
+  el.addEventListener('dblclick', (e) => {
+    openActionSheet(meta, { x: e.clientX, y: e.clientY }, 'react');
   });
 }
 
-/** @param {BubbleMeta} meta @param {{x:number, y:number}} at */
-function openActionSheet(meta, at) {
+/* The one popover, two modes. 'react' (double-tap): the reaction row alone.
+   'menu' (long-press): the select actions — Quote / Copy / Forward — and no
+   reactions. Only the visible half is built, so neither mode pays for (or
+   leaks listeners into) the other. */
+/** @param {BubbleMeta} meta @param {{x:number, y:number}} at @param {'menu'|'react'} mode */
+function openActionSheet(meta, at, mode) {
   const reactions = $('action-reactions');
   reactions.innerHTML = '';
-  const mine = state.myReactions.get(meta.id);
-  // The quick row: the 6 whitelisted taps (unchanged behaviour), wrapped so the
-  // emoji picker below can swap the whole row out with one class toggle.
-  const quick = document.createElement('div');
-  quick.className = 'reaction-quick';
-  for (const emoji of REACTIONS) {
-    const already = !!(mine && mine.has(emoji));
-    const b = document.createElement('button');
-    b.className = 'action-reaction' + (already ? ' reacted' : '');
-    b.textContent = emoji;
-    if (already) {
-      b.disabled = true;   // already reacted this session — pressed and inert
-    } else {
-      b.onclick = () => { react(state.selected, meta.id, emoji); closeActionSheet(); };
+  const menuMode = mode === 'menu';
+  $('action-quote').classList.toggle('hidden', !menuMode);
+  $('action-copy').classList.toggle('hidden', !menuMode);
+  $('action-forward').classList.toggle('hidden', !menuMode);
+  if (menuMode) {
+    $('action-quote').onclick = () => { setQuote(meta); closeActionSheet(); };
+    $('action-copy').onclick = () => { copyBubbleText(meta.text); closeActionSheet(); };
+    $('action-forward').onclick = () => { closeActionSheet(); openForwardSheet(meta); };
+  } else {
+    const mine = state.myReactions.get(meta.id);
+    // The quick row: the 6 whitelisted taps (unchanged behaviour), wrapped so the
+    // emoji picker below can swap the whole row out with one class toggle.
+    const quick = document.createElement('div');
+    quick.className = 'reaction-quick';
+    for (const emoji of REACTIONS) {
+      const already = !!(mine && mine.has(emoji));
+      const b = document.createElement('button');
+      b.className = 'action-reaction' + (already ? ' reacted' : '');
+      b.textContent = emoji;
+      if (already) {
+        b.disabled = true;   // already reacted this session — pressed and inert
+      } else {
+        b.onclick = () => { react(state.selected, meta.id, emoji); closeActionSheet(); };
+      }
+      quick.appendChild(b);
     }
-    quick.appendChild(b);
+    reactions.appendChild(quick);
+    // ── BUG 2 (react with ANY emoji) ──────────────────────────────────────────
+    // …plus a "+" that hands off to the phone's NATIVE emoji keyboard, so the
+    // user isn't limited to the 6. The pick flows through the SAME react() path.
+    addEmojiPicker(reactions, quick, meta);
+    // ── end BUG 2 ─────────────────────────────────────────────────────────────
   }
-  reactions.appendChild(quick);
-  // ── BUG 2 (react with ANY emoji) ────────────────────────────────────────────
-  // …plus a "+" that hands off to the phone's NATIVE emoji keyboard, so the user
-  // isn't limited to the 6. The chosen emoji flows through the SAME react() path.
-  addEmojiPicker(reactions, quick, meta);
-  // ── end BUG 2 ────────────────────────────────────────────────────────────────
-  $('action-quote').onclick = () => { setQuote(meta); closeActionSheet(); };
   actionOpenedAt = Date.now();
   positionActionMenu(at);
+}
+
+/* ---------- select-menu actions: copy & forward (feature #31) ---------- */
+
+/* Copy the pressed bubble's text. navigator.clipboard needs a secure context
+   and can still reject inside some gesture timings; the execCommand path is the
+   time-tested fallback and works from any user gesture. Either way the toast
+   answers the tap — silence here would read as a broken button. */
+/** @param {string} text */
+async function copyBubbleText(text) {
+  let ok = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch { /* fall through to execCommand */ }
+  if (!ok) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    ta.remove();
+  }
+  flashToast(ok ? 'Copied' : 'Couldn’t copy');
+}
+
+/* The forward picker: every room and contact except the thread we're in.
+   Tapping a row sends "↪ from <author>: <text>" to that agent through the SAME
+   pending/deliver pipeline as a typed message — durable outbox, offline
+   queueing, retry, and a normal echo in the receiving thread, all for free. */
+/** @param {BubbleMeta} meta */
+function openForwardSheet(meta) {
+  const list = $('forward-list');
+  list.innerHTML = '';
+  /** @type {Array<Room | Contact>} */
+  const targets = [...state.rooms, ...state.contacts.filter((c) => c.id !== state.selected)];
+  for (const t of targets) {
+    const row = document.createElement('button');
+    row.className = 'forward-row';
+    const name = document.createElement('span');
+    name.className = 'forward-row-name';
+    name.textContent = t.name;
+    row.appendChild(name);
+    if (!isRoomId(t.id) && /** @type {Contact} */ (t).status !== 'live') {
+      const off = document.createElement('span');
+      off.className = 'forward-row-note';
+      off.textContent = 'offline — will queue';
+      row.appendChild(off);
+    }
+    row.onclick = () => {
+      forwardTo(t.id, meta);
+      closeForwardSheet();
+      flashToast('Forwarded to ' + t.name);
+    };
+    list.appendChild(row);
+  }
+  $('forward-sheet').classList.remove('hidden');
+}
+
+function closeForwardSheet() { $('forward-sheet').classList.add('hidden'); }
+
+/** @param {string} targetId @param {BubbleMeta} meta */
+function forwardTo(targetId, meta) {
+  /** @type {PendingMsg} */
+  const msg = {
+    clientId: crypto.randomUUID(),
+    agent: targetId,
+    name: threadName(targetId) || '?',
+    text: forwardText(meta.name, meta.text),
+    image: null,
+    quote: null,
+    ts: new Date().toISOString(),
+    mstate: 'sending',
+    inflight: false,
+  };
+  state.pending.push(msg);
+  savePending();
+  renderList();          // the target's row preview shows the forward immediately
+  if (!state.connected) {
+    msg.mstate = 'queued';
+    savePending();
+    return;
+  }
+  deliver(msg);
+}
+
+$('forward-close').addEventListener('click', closeForwardSheet);
+$('forward-backdrop').addEventListener('click', closeForwardSheet);
+
+/* A quiet self-dismissing toast (reuses the context-gauge's .ctx-toast look —
+   same quiet register, its own element so the modules stay uncoupled). */
+let toastTimer = null;
+/** @param {string} text */
+function flashToast(text) {
+  let el = document.getElementById('app-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'app-toast';
+    el.className = 'ctx-toast hidden';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 1600);
 }
 
 /* ── BUG 2 helper: the "react with any emoji" affordance ─────────────────────

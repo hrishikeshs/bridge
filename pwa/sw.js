@@ -5,7 +5,7 @@
 
 'use strict';
 
-const CACHE = 'bridge-v42';
+const CACHE = 'bridge-v43';
 // app.js is a native ES module that imports these peeled modules; every one must
 // be precached (a missed entry = a broken PWA offline on the phone). Bump CACHE
 // whenever this list or any shell file changes.

@@ -99,3 +99,27 @@ export function lastMessageMs(id) {
   const m = newestMessage(id);
   return m ? (Date.parse(m.ts) || 0) : 0;
 }
+
+/* ---- bubble gestures (feature #31) ---- */
+
+// Whether a second tap completes a double-tap: same bubble, quick (≤350ms — a
+// beat slower than the ~300ms convention, forgiving of one-thumb use), and
+// near (≤40px — two relaxed taps land wider than a drag's 10px drift budget).
+// Pure math so the timing/geometry contract is testable without a DOM; the
+// caller owns the "same bubble" check via the ids it stores.
+/** @param {{t:number, x:number, y:number}} prev @param {{t:number, x:number, y:number}} cur @returns {boolean} */
+export function isDoubleTap(prev, cur) {
+  if (!prev) return false;
+  return (cur.t - prev.t) <= 350 &&
+         Math.hypot(cur.x - prev.x, cur.y - prev.y) <= 40;
+}
+
+// The forwarded line as it rides to the OTHER agent: attribution + the pressed
+// bubble's text. The receiving agent already gets a daemon-authored
+// "[From Hrishi (phone)]:" provenance frame around the whole line — this prefix
+// only says who SAID the forwarded words. Plain "↪ from" (not "[fwd …]"): never
+// bracket-frame-shaped, so it can't even resemble the H9 surface.
+/** @param {string} name @param {string} text @returns {string} */
+export function forwardText(name, text) {
+  return '↪ from ' + (name || '?') + ': ' + (text || '');
+}

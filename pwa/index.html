@@ -38,6 +38,10 @@
          ground for maximum legibility (both field lessons, 2026-07-06). -->
     <div id="scenery" aria-hidden="true">
       <span class="veil"></span>
+      <!-- The sun's presence, under the fog so the banks scatter it: a warm
+           glow hugging the left edge where the photo's sun floods the horizon
+           (edge-anchored so viewport cover-crops can't strand it off-screen). -->
+      <span class="sunglow"></span>
       <span class="fog f1"></span><span class="fog f2"></span><span class="fog f3"></span>
     </div>
 
@@ -102,13 +106,33 @@
       </footer>
     </section>
 
-    <!-- Long-press action popover: quote a bubble or react to it. Anchored near
-         the pressed bubble by app.js; a tap on the backdrop (this container) or
-         Esc dismisses. The menu holds a Quote action and the reaction row. -->
+    <!-- Bubble action popover, two modes (app.js openActionSheet):
+         · react mode (double-tap / double-click): the reaction row alone.
+         · menu mode (long-press / right-click): select actions — Quote, Copy,
+           Forward — no reactions.
+         Anchored near the pressed bubble; a tap on the backdrop (this
+         container) or Esc dismisses. -->
     <div id="action-sheet" class="hidden">
       <div id="action-menu">
         <button id="action-quote" class="action-item">↩ Quote</button>
+        <button id="action-copy" class="action-item">⧉ Copy</button>
+        <button id="action-forward" class="action-item">↪ Forward…</button>
         <div id="action-reactions"></div>
+      </div>
+    </div>
+
+    <!-- FORWARD — slide-up picker over the thread: send a bubble's text to
+         another agent (or a room). Rows are built by app.js from the live
+         roster; the forwarded text rides the normal pending/deliver pipeline. -->
+    <div id="forward-sheet" class="sheet hidden">
+      <div class="sheet-backdrop" id="forward-backdrop"></div>
+      <div class="sheet-panel">
+        <div class="sheet-grip"></div>
+        <div class="sheet-header">
+          <span class="sheet-title">Forward to…</span>
+          <button id="forward-close">Cancel</button>
+        </div>
+        <div id="forward-list"></div>
       </div>
     </div>
 

@@ -22,8 +22,8 @@ const { loadApp } = require('./harness');
 
 const REPLY = { id: 100, type: 'reply', agent: 'vint', name: 'vint', text: 'shipped the fix', ts: '2026-07-07T10:00:00Z' };
 
-// Raise the long-press action sheet on the reply bubble. The desktop
-// 'contextmenu' seam opens the SAME sheet as a touch long-press (app.js wires
+// Raise the SELECT menu (feature #31: long-press / right-click). The desktop
+// 'contextmenu' seam opens the same sheet as a touch long-press (app.js wires
 // both to openActionSheet), without needing the fake clock's 500ms hold.
 async function raiseSheetOnReply(h) {
   await h.openContact('vint');
@@ -33,6 +33,19 @@ async function raiseSheetOnReply(h) {
   h.dispatch('contextmenu', bubble);
   await h.flush();
   assert.equal(h.$('action-sheet').classList.contains('hidden'), false, 'action sheet is open');
+  return bubble;
+}
+
+// Raise the REACTION sheet (feature #31: reactions moved off the long-press
+// menu onto double-tap; 'dblclick' is its desktop seam).
+async function raiseReactionsOnReply(h) {
+  await h.openContact('vint');
+  await h.sse(REPLY);
+  const bubble = h.qs('#feed .msg.reply');
+  assert.ok(bubble, 'a reply bubble to double-tap');
+  h.dispatch('dblclick', bubble);
+  await h.flush();
+  assert.equal(h.$('action-sheet').classList.contains('hidden'), false, 'reaction sheet is open');
   return bubble;
 }
 
@@ -54,7 +67,7 @@ test('BUG 1 — Quote arms the quote WITHOUT focusing the composer (no keyboard 
 test('BUG 2 — the 6 quick reactions remain, plus a "+" more affordance', async (t) => {
   const h = await loadApp();
   t.after(() => h.teardown());
-  await raiseSheetOnReply(h);
+  await raiseReactionsOnReply(h);
 
   const quick = h.qsa('#action-reactions .action-reaction:not(.action-reaction-more)');
   assert.equal(quick.length, 6, 'the 6 quick-tap reactions are still offered');
@@ -71,7 +84,7 @@ test('BUG 2 — the 6 quick reactions remain, plus a "+" more affordance', async
 test('BUG 2 — a quick tap sends its emoji via /api/react (covers react())', async (t) => {
   const h = await loadApp();
   t.after(() => h.teardown());
-  await raiseSheetOnReply(h);
+  await raiseReactionsOnReply(h);
 
   const thumbs = h.qsa('#action-reactions .action-reaction').find((b) => b.textContent === '👍');
   await h.click(thumbs);
@@ -83,7 +96,7 @@ test('BUG 2 — a quick tap sends its emoji via /api/react (covers react())', as
 test('BUG 2 — "+" reveals the native picker; the first emoji routes through /api/react', async (t) => {
   const h = await loadApp();
   t.after(() => h.teardown());
-  await raiseSheetOnReply(h);
+  await raiseReactionsOnReply(h);
 
   await h.click(h.qs('#action-reactions .action-reaction-more'));
   const picker = h.$('action-emoji-input');
@@ -104,7 +117,7 @@ test('BUG 2 — "+" reveals the native picker; the first emoji routes through /a
 test('BUG 2 — a stray non-emoji keystroke does not fire a reaction', async (t) => {
   const h = await loadApp();
   t.after(() => h.teardown());
-  await raiseSheetOnReply(h);
+  await raiseReactionsOnReply(h);
 
   await h.click(h.qs('#action-reactions .action-reaction-more'));
   const picker = h.$('action-emoji-input');
