@@ -17,6 +17,11 @@ package main
 // window differs from the default; anything absent uses defaultContextWindow.
 var contextWindows = map[string]int{
 	"claude-opus-4-8": 1_000_000,
+	// Found live 2026-07-10: Vint ran at a true 40% (397k of Fable's 1M) while
+	// the gauge pinned at 100% — Fable was absent here, so his 397k was divided
+	// by the conservative 200k default (198% → clamp). The table was born inside
+	// an Opus session (#23, July 8) and nobody told it about the brain swap.
+	"claude-fable-5": 1_000_000,
 }
 
 // defaultContextWindow is the window assumed for any model absent from the

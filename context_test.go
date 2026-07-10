@@ -47,6 +47,13 @@ func TestContextWindowFor(t *testing.T) {
 	if got := contextWindowFor("claude-opus-4-8"); got != 1_000_000 {
 		t.Errorf("contextWindowFor(opus-4-8) = %d, want 1000000", got)
 	}
+	// The 2026-07-10 live find: Fable 5 (a 1M window) was missing from the
+	// table, so a Fable agent at a true 40% pinned the phone's gauge at 100%
+	// (397k divided by the 200k default). The gauge must know every brain the
+	// crew actually wears.
+	if got := contextWindowFor("claude-fable-5"); got != 1_000_000 {
+		t.Errorf("contextWindowFor(fable-5) = %d, want 1000000", got)
+	}
 	// Unknown models (and "", and the synthetic placeholder) fall to the
 	// conservative 200k floor, so pressure is never under-reported by assuming a
 	// bigger window than a model actually has.
