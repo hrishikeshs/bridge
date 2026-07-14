@@ -32,6 +32,7 @@ func handleLocalRetire(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not-found-or-live"})
 		return
 	}
+	clearSemanticApproval(c.ID)
 	audit("retire", c.Name+" ("+c.ID[:8]+")", "local")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": c.Name})
 }

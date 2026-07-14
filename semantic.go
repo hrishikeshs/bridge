@@ -21,6 +21,7 @@ const (
 	SemanticCommandInput     SemanticCommandType = "input"
 	SemanticCommandInterrupt SemanticCommandType = "interrupt"
 	SemanticCommandApproval  SemanticCommandType = "approval"
+	SemanticCommandCompact   SemanticCommandType = "compact"
 )
 
 // SemanticCommand is provider-neutral. A Codex client maps input to turn/start
@@ -33,6 +34,11 @@ type SemanticCommand struct {
 	Text      string              `json:"text,omitempty"`
 	RequestID string              `json:"request_id,omitempty"`
 	Decision  string              `json:"decision,omitempty"`
+	// ApprovalKind selects the app-server response schema. Permissions carries
+	// the exact profile Codex requested so an approval can grant no more than
+	// that profile; both are empty for non-approval commands.
+	ApprovalKind string          `json:"approval_kind,omitempty"`
+	Permissions  json.RawMessage `json:"permissions,omitempty"`
 }
 
 type SemanticEventType string
@@ -56,17 +62,43 @@ type SemanticEvent struct {
 	Command            string            `json:"command,omitempty"`
 	Cwd                string            `json:"cwd,omitempty"`
 	AvailableDecisions []string          `json:"available_decisions,omitempty"`
+	Permissions        json.RawMessage   `json:"permissions,omitempty"`
 }
 
 type semanticApproval struct {
-	RequestID string
-	Kind      string
+	RequestID   string
+	Kind        string
+	Permissions json.RawMessage
 }
 
 var (
 	semanticApprovalMu sync.Mutex
 	semanticApprovals  = map[string]semanticApproval{} // contact id -> current request
 )
+
+func semanticApprovalPending(contactID string) bool {
+	semanticApprovalMu.Lock()
+	defer semanticApprovalMu.Unlock()
+	_, ok := semanticApprovals[contactID]
+	return ok
+}
+
+func clearSemanticApproval(contactID string) {
+	semanticApprovalMu.Lock()
+	delete(semanticApprovals, contactID)
+	semanticApprovalMu.Unlock()
+}
+
+func resolveSemanticApproval(contactID, requestID string) bool {
+	semanticApprovalMu.Lock()
+	defer semanticApprovalMu.Unlock()
+	pending, exists := semanticApprovals[contactID]
+	if !exists || requestID == "" || pending.RequestID != requestID {
+		return false
+	}
+	delete(semanticApprovals, contactID)
+	return true
+}
 
 // handleTransportCommands is the v2 equivalent of /mail. It returns only
 // semantic commands, retaining the v1 all-unacked/idempotent drain contract.
@@ -175,7 +207,10 @@ func applySemanticEvent(c *Contact, ev SemanticEvent) bool {
 			return false
 		}
 		semanticApprovalMu.Lock()
-		semanticApprovals[c.ID] = semanticApproval{RequestID: ev.RequestID, Kind: ev.ApprovalKind}
+		previous, existed := semanticApprovals[c.ID]
+		semanticApprovals[c.ID] = semanticApproval{
+			RequestID: ev.RequestID, Kind: ev.ApprovalKind, Permissions: ev.Permissions,
+		}
 		semanticApprovalMu.Unlock()
 		caption := strings.TrimSpace(ev.Reason)
 		if caption == "" {
@@ -184,20 +219,20 @@ func applySemanticEvent(c *Contact, ev SemanticEvent) bool {
 		if caption == "" {
 			caption = "Codex wants your approval"
 		}
-		registry.MarkPrompt(c.ID, caption)
+		change := registry.MarkPrompt(c.ID, caption)
+		// Event delivery is at-least-once. A retry for the same request must not
+		// ring the phone again, while a genuinely newer request must refresh the
+		// card even when it happens to have the same human caption.
+		if existed && previous.RequestID == ev.RequestID && change == promptNoChange {
+			return true
+		}
 		body := formatSemanticApproval(ev, caption)
 		Emit("attention", c.ID, c.Name, body)
 		notifyPush(c.Name+" needs you", caption, "attn-"+c.ID, c.ID)
 		markAttnPushed(c.ID)
 		return true
 	case SemanticEventApprovalResolved:
-		semanticApprovalMu.Lock()
-		pending, exists := semanticApprovals[c.ID]
-		if exists && (ev.RequestID == "" || pending.RequestID == ev.RequestID) {
-			delete(semanticApprovals, c.ID)
-		}
-		semanticApprovalMu.Unlock()
-		if exists {
+		if resolveSemanticApproval(c.ID, ev.RequestID) {
 			registry.SetPrompt(c.ID, false)
 			Emit("attention-clear", c.ID, c.Name, "")
 			clearAttnPush(c.ID, c.Name)
@@ -253,6 +288,7 @@ func deliverLegacySemanticApproval(c *Contact, key string) error {
 	}
 	return remoteParkCommandAndWait(c, SemanticCommand{
 		Type: SemanticCommandApproval, RequestID: pending.RequestID, Decision: decision,
+		ApprovalKind: pending.Kind, Permissions: pending.Permissions,
 	})
 }
 
@@ -293,7 +329,10 @@ func handleSemanticApprove(w http.ResponseWriter, r *http.Request, actor string)
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "not-semantic"})
 		return
 	}
-	command := SemanticCommand{Type: SemanticCommandApproval, RequestID: req.RequestID, Decision: req.Decision}
+	command := SemanticCommand{
+		Type: SemanticCommandApproval, RequestID: req.RequestID, Decision: req.Decision,
+		ApprovalKind: pending.Kind, Permissions: pending.Permissions,
+	}
 	if err := remoteParkCommandAndWait(c, command); err != nil {
 		audit("semantic-approve-failed", err.Error(), actor)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -302,4 +341,15 @@ func handleSemanticApprove(w http.ResponseWriter, r *http.Request, actor string)
 	audit("semantic-approve", fmt.Sprintf("%s <- %s", c.Name, req.Decision), actor)
 	Emit("approved", c.ID, c.Name, req.Decision)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// deliverCompact preserves the terminal behavior for v1 clients while giving
+// semantic clients a typed command. Treating the literal "/compact" as normal
+// input would create a user turn instead of invoking app-server's dedicated
+// thread/compact/start operation.
+func deliverCompact(c *Contact) error {
+	if remoteUsesSemanticProtocol(c.ID) {
+		return remoteParkCommandAndWait(c, SemanticCommand{Type: SemanticCommandCompact})
+	}
+	return transportFor(c).Deliver(c, compactCommand)
 }

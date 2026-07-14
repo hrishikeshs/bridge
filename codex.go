@@ -9,9 +9,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -94,17 +96,7 @@ func (c *appServerClient) readLoop(r io.Reader) {
 			}
 			continue
 		}
-		if len(msg.ID) > 0 && msg.Method != "" {
-			// Approval requests must never be dropped: losing one leaves the turn
-			// blocked behind a prompt that no Bridge client can see.
-			c.events <- msg
-		} else {
-			select {
-			case c.events <- msg:
-			default:
-				// Never deadlock app-server's stdout on high-volume deltas.
-			}
-		}
+		queueAppServerEvent(c.events, msg)
 	}
 	err := sc.Err()
 	waitErr := c.cmd.Wait()
@@ -113,6 +105,26 @@ func (c *appServerClient) readLoop(r io.Reader) {
 	}
 	c.done <- err
 	close(c.events)
+}
+
+func droppableAppServerNotification(msg appRPCMessage) bool {
+	return len(msg.ID) == 0 && strings.HasSuffix(msg.Method, "/delta")
+}
+
+func queueAppServerEvent(events chan appRPCMessage, msg appRPCMessage) {
+	if droppableAppServerNotification(msg) {
+		select {
+		case events <- msg:
+		default:
+			// The completed item contains the full message, so a delta may be
+			// discarded under pressure without losing user-visible content.
+		}
+		return
+	}
+	// Server requests and lifecycle notifications are lossless. Dropping
+	// item/completed loses the reply; dropping turn/completed leaves the bridge
+	// believing a finished turn is still active.
+	events <- msg
 }
 
 func (c *appServerClient) send(v any) error {
@@ -182,13 +194,25 @@ func (c *appServerClient) respondError(requestID string, code int, message strin
 type codexBridge struct {
 	ctx      context.Context
 	rpc      *appServerClient
-	lease    string
-	contact  string
 	threadID string
+	name     string
+	cwd      string
 
-	mu         sync.Mutex
-	turnID     string
-	messageBuf map[string]string
+	mu              sync.Mutex
+	lease           string
+	contact         string
+	contactName     string
+	heartbeatEvery  time.Duration
+	turnID          string
+	messageBuf      map[string]string
+	pendingApproval *SemanticEvent
+	executed        map[string]bool
+
+	registerMu sync.Mutex
+	eventMu    sync.Mutex
+	eventQueue []SemanticEvent
+	eventWake  chan struct{}
+	retryDelay time.Duration
 }
 
 type codexPlanStep struct {
@@ -257,31 +281,19 @@ func runCodexBridge(ctx context.Context, name, threadID, model, executable strin
 		name = generateName(map[string]bool{})
 	}
 
-	var hello struct {
-		Agents []struct{ ID, Name string } `json:"agents"`
-		Lease  string                      `json:"lease"`
-		TTLS   int                         `json:"ttl_s"`
+	b := &codexBridge{
+		ctx: ctx, rpc: rpc, threadID: threadID, name: name, cwd: cwd,
+		messageBuf: map[string]string{}, executed: map[string]bool{},
+		eventWake: make(chan struct{}, 1), retryDelay: time.Second,
 	}
-	err = semanticDaemonRequest(ctx, http.MethodPost, "/local/transport/v2/hello", map[string]any{
-		"transport": "codex", "protocol": 2, "provider": "codex",
-		"agents": []map[string]string{{"name": name, "directory": cwd, "session_id": threadID}},
-	}, &hello)
-	if err != nil {
+	if _, err := b.register(""); err != nil {
 		return err
 	}
-	if hello.Lease == "" || len(hello.Agents) != 1 {
-		return fmt.Errorf("bridge daemon returned an incomplete v2 lease")
-	}
-	b := &codexBridge{
-		ctx: ctx, rpc: rpc, lease: hello.Lease, contact: hello.Agents[0].ID,
-		threadID: threadID, messageBuf: map[string]string{},
-	}
-	if hello.TTLS < 3 {
-		hello.TTLS = 30
-	}
-	fmt.Printf("%s is connected through Codex App Server (thread %s).\n", hello.Agents[0].Name, shortID(threadID))
+	_, _, contactName := b.route()
+	fmt.Printf("%s is connected through Codex App Server (thread %s).\n", contactName, shortID(threadID))
 
-	go b.heartbeat(time.Duration(hello.TTLS) * time.Second / 3)
+	go b.postLoop()
+	go b.heartbeat()
 	go b.commandLoop()
 	for {
 		select {
@@ -315,53 +327,187 @@ func shortID(id string) string {
 	return id
 }
 
-func (b *codexBridge) heartbeat(every time.Duration) {
-	t := time.NewTicker(every)
+var errCodexLeaseReplaced = errors.New("Codex bridge lease replaced")
+
+// register obtains a protocol-v2 lease. expectedLease serializes recovery: if
+// another goroutine already replaced the failed lease, the late caller does no
+// work. This is the same hello used at startup, so daemon restarts preserve the
+// contact identity through ConnectRemote's name+directory adoption rule.
+func (b *codexBridge) register(expectedLease string) (bool, error) {
+	b.registerMu.Lock()
+	defer b.registerMu.Unlock()
+
+	b.mu.Lock()
+	if expectedLease != "" && b.lease != expectedLease {
+		b.mu.Unlock()
+		return false, nil
+	}
+	b.mu.Unlock()
+
+	var hello struct {
+		Agents   []struct{ ID, Name string } `json:"agents"`
+		Lease    string                      `json:"lease"`
+		TTLS     int                         `json:"ttl_s"`
+		Protocol int                         `json:"protocol"`
+	}
+	requestCtx, cancel := context.WithTimeout(b.ctx, 15*time.Second)
+	defer cancel()
+	if err := semanticDaemonRequest(requestCtx, http.MethodPost, "/local/transport/v2/hello", map[string]any{
+		"transport": "codex", "protocol": 2, "provider": "codex",
+		"agents": []map[string]string{{"name": b.name, "directory": b.cwd, "session_id": b.threadID}},
+	}, &hello); err != nil {
+		return false, err
+	}
+	if hello.Lease == "" || len(hello.Agents) != 1 || hello.Protocol != 2 {
+		return false, fmt.Errorf("bridge daemon returned an incomplete v2 lease")
+	}
+	if hello.TTLS < 3 {
+		hello.TTLS = 30
+	}
+	b.mu.Lock()
+	b.lease = hello.Lease
+	b.contact = hello.Agents[0].ID
+	b.contactName = hello.Agents[0].Name
+	b.heartbeatEvery = time.Duration(hello.TTLS) * time.Second / 3
+	b.mu.Unlock()
+	b.enqueuePendingApproval()
+	return true, nil
+}
+
+func (b *codexBridge) route() (lease, contact, name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lease, b.contact, b.contactName
+}
+
+func (b *codexBridge) recoverLease(expiredLease string) error {
+	recovered, err := b.register(expiredLease)
+	if err != nil {
+		return err
+	}
+	if recovered {
+		fmt.Fprintln(os.Stderr, "bridge codex: reconnected to the Bridge daemon")
+	}
+	return nil
+}
+
+func (b *codexBridge) retryWait() bool {
+	delay := b.retryDelay
+	if delay <= 0 {
+		delay = time.Second
+	}
+	t := time.NewTimer(delay)
 	defer t.Stop()
-	for {
-		b.attest()
+	select {
+	case <-b.ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func (b *codexBridge) heartbeat() {
+	for b.ctx.Err() == nil {
+		if err := b.attest(); err != nil && b.ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "bridge codex heartbeat:", err)
+		}
+		b.mu.Lock()
+		every := b.heartbeatEvery
+		b.mu.Unlock()
+		if every <= 0 {
+			every = 10 * time.Second
+		}
+		t := time.NewTimer(every)
 		select {
 		case <-b.ctx.Done():
+			t.Stop()
 			return
 		case <-t.C:
 		}
 	}
 }
 
-func (b *codexBridge) attest() {
+func (b *codexBridge) attest() error {
 	b.mu.Lock()
-	ready := b.turnID == ""
+	lease, contact := b.lease, b.contact
+	promptOpen := b.pendingApproval != nil
+	ready := b.turnID == "" && !promptOpen
 	b.mu.Unlock()
-	_ = semanticDaemonRequest(b.ctx, http.MethodPost, "/local/transport/attest", map[string]any{
-		"lease":  b.lease,
-		"states": []map[string]any{{"id": b.contact, "ready": ready, "prompt_open": false}},
+	err := semanticDaemonRequest(b.ctx, http.MethodPost, "/local/transport/attest", map[string]any{
+		"lease":  lease,
+		"states": []map[string]any{{"id": contact, "ready": ready, "prompt_open": promptOpen}},
 	}, nil)
+	if daemonLeaseGone(err) {
+		return b.recoverLease(lease)
+	}
+	return err
 }
 
 func (b *codexBridge) commandLoop() {
 	for b.ctx.Err() == nil {
+		lease, _, _ := b.route()
 		var resp struct {
 			Commands []SemanticCommand `json:"commands"`
 		}
-		path := "/local/transport/v2/commands?lease=" + b.lease + "&wait=25"
+		path := "/local/transport/v2/commands?lease=" + url.QueryEscape(lease) + "&wait=25"
 		if err := semanticDaemonRequest(b.ctx, http.MethodGet, path, nil, &resp); err != nil {
-			select {
-			case <-b.ctx.Done():
-				return
-			case <-time.After(time.Second):
-				continue
+			if daemonLeaseGone(err) {
+				err = b.recoverLease(lease)
 			}
+			if err != nil && b.ctx.Err() == nil {
+				fmt.Fprintln(os.Stderr, "bridge codex commands:", err)
+			}
+			if !b.retryWait() {
+				return
+			}
+			continue
 		}
 		for _, command := range resp.Commands {
-			if err := b.execute(command); err != nil {
+			if err := b.processCommand(lease, command); err != nil {
+				if errors.Is(err, errCodexLeaseReplaced) {
+					break
+				}
 				fmt.Fprintln(os.Stderr, "bridge codex:", err)
-				continue // no ack: daemon retains/redelivers under the v1 contract
+				continue // no ack: daemon retains/redelivers the command
 			}
-			_ = semanticDaemonRequest(b.ctx, http.MethodPost, "/local/transport/v2/ack", map[string]any{
-				"lease": b.lease, "ids": []string{command.ID},
-			}, nil)
 		}
 	}
+}
+
+func (b *codexBridge) processCommand(lease string, command SemanticCommand) error {
+	key := lease + ":" + command.ID
+	b.mu.Lock()
+	alreadyExecuted := b.executed[key]
+	b.mu.Unlock()
+	if !alreadyExecuted {
+		if err := b.execute(command); err != nil {
+			return err
+		}
+		b.mu.Lock()
+		b.executed[key] = true
+		b.mu.Unlock()
+	}
+	for b.ctx.Err() == nil {
+		err := semanticDaemonRequest(b.ctx, http.MethodPost, "/local/transport/v2/ack", map[string]any{
+			"lease": lease, "ids": []string{command.ID},
+		}, nil)
+		if err == nil {
+			b.mu.Lock()
+			delete(b.executed, key)
+			b.mu.Unlock()
+			return nil
+		}
+		if daemonLeaseGone(err) {
+			if recoverErr := b.recoverLease(lease); recoverErr != nil {
+				return recoverErr
+			}
+			return errCodexLeaseReplaced
+		}
+		if !b.retryWait() {
+			return b.ctx.Err()
+		}
+	}
+	return b.ctx.Err()
 }
 
 func (b *codexBridge) execute(command SemanticCommand) error {
@@ -399,9 +545,48 @@ func (b *codexBridge) execute(command SemanticCommand) error {
 		}
 		return b.rpc.request(ctx, "turn/interrupt", map[string]string{"threadId": b.threadID, "turnId": turnID}, nil)
 	case SemanticCommandApproval:
-		return b.rpc.respond(command.RequestID, map[string]string{"decision": command.Decision})
+		result, err := codexApprovalResponse(command)
+		if err != nil {
+			return err
+		}
+		return b.rpc.respond(command.RequestID, result)
+	case SemanticCommandCompact:
+		return b.rpc.request(ctx, "thread/compact/start", map[string]string{"threadId": b.threadID}, nil)
 	default:
 		return fmt.Errorf("unknown semantic command %q", command.Type)
+	}
+}
+
+// codexApprovalResponse selects the response schema for the request method.
+// Command and file approvals use a named decision. Permission requests instead
+// expect the granted subset and scope: accept grants exactly what Codex asked
+// for, while decline/cancel grants an empty profile (Codex's documented deny).
+func codexApprovalResponse(command SemanticCommand) (any, error) {
+	switch command.ApprovalKind {
+	case "", "command", "file_change":
+		return map[string]string{"decision": command.Decision}, nil
+	case "permissions":
+		permissions := map[string]any{}
+		scope := "turn"
+		switch command.Decision {
+		case "accept", "acceptForSession":
+			if len(command.Permissions) == 0 {
+				return nil, fmt.Errorf("permission approval %s has no requested profile", command.RequestID)
+			}
+			if err := json.Unmarshal(command.Permissions, &permissions); err != nil {
+				return nil, fmt.Errorf("decode requested permission profile: %w", err)
+			}
+			if command.Decision == "acceptForSession" {
+				scope = "session"
+			}
+		case "decline", "cancel":
+			// An empty GrantedPermissionProfile is the app-server denial shape.
+		default:
+			return nil, fmt.Errorf("unsupported permission decision %q", command.Decision)
+		}
+		return map[string]any{"permissions": permissions, "scope": scope}, nil
+	default:
+		return nil, fmt.Errorf("unsupported approval kind %q", command.ApprovalKind)
 	}
 }
 
@@ -432,7 +617,7 @@ func (b *codexBridge) handleRPC(msg appRPCMessage) {
 		b.mu.Lock()
 		b.turnID = p.Turn.ID
 		b.mu.Unlock()
-		b.post(SemanticEvent{Type: SemanticEventStatus, Status: "working"})
+		b.enqueueEvent(SemanticEvent{Type: SemanticEventStatus, Status: "working"})
 	case "item/agentMessage/delta":
 		b.mu.Lock()
 		b.messageBuf[p.ItemID] += p.Delta
@@ -443,7 +628,7 @@ func (b *codexBridge) handleRPC(msg appRPCMessage) {
 			Plan        []codexPlanStep `json:"plan"`
 		}
 		if json.Unmarshal(msg.Params, &plan) == nil {
-			b.post(SemanticEvent{Type: SemanticEventPlan, Text: formatCodexPlan(plan.Explanation, plan.Plan)})
+			b.enqueueEvent(SemanticEvent{Type: SemanticEventPlan, Text: formatCodexPlan(plan.Explanation, plan.Plan)})
 		}
 	case "item/completed":
 		itemID := p.Item.ID
@@ -455,9 +640,9 @@ func (b *codexBridge) handleRPC(msg appRPCMessage) {
 			if message == "" {
 				message = p.Item.Text
 			}
-			b.post(SemanticEvent{Type: SemanticEventAgentMessage, Text: message})
+			b.enqueueEvent(SemanticEvent{Type: SemanticEventAgentMessage, Text: message})
 		} else if p.Item.Type == "plan" {
-			b.post(SemanticEvent{Type: SemanticEventPlan, Text: p.Item.Text})
+			b.enqueueEvent(SemanticEvent{Type: SemanticEventPlan, Text: p.Item.Text})
 		}
 	case "turn/completed":
 		b.mu.Lock()
@@ -467,25 +652,33 @@ func (b *codexBridge) handleRPC(msg appRPCMessage) {
 		if status == "" {
 			status = "completed"
 		}
-		b.post(SemanticEvent{Type: SemanticEventStatus, Status: status})
+		b.enqueueEvent(SemanticEvent{Type: SemanticEventStatus, Status: status})
 	case "serverRequest/resolved":
 		requestID := string(p.RequestID)
-		b.post(SemanticEvent{Type: SemanticEventApprovalResolved, RequestID: requestID})
+		b.mu.Lock()
+		if b.pendingApproval != nil && b.pendingApproval.RequestID == requestID {
+			b.pendingApproval = nil
+		}
+		b.mu.Unlock()
+		b.enqueueEvent(SemanticEvent{Type: SemanticEventApprovalResolved, RequestID: requestID})
 	}
 }
 
 func (b *codexBridge) handleServerRequest(msg appRPCMessage) {
-	if msg.Method != "item/commandExecution/requestApproval" && msg.Method != "item/fileChange/requestApproval" {
+	if msg.Method != "item/commandExecution/requestApproval" &&
+		msg.Method != "item/fileChange/requestApproval" &&
+		msg.Method != "item/permissions/requestApproval" {
 		// Different approval methods have different response schemas. Return a
 		// protocol error instead of fabricating a shape that could grant access.
 		_ = b.rpc.respondError(string(msg.ID), -32601, "unsupported approval request")
 		return
 	}
 	var p struct {
-		Reason             string   `json:"reason"`
-		Command            any      `json:"command"`
-		Cwd                string   `json:"cwd"`
-		AvailableDecisions []string `json:"availableDecisions"`
+		Reason             string          `json:"reason"`
+		Command            any             `json:"command"`
+		Cwd                string          `json:"cwd"`
+		AvailableDecisions []string        `json:"availableDecisions"`
+		Permissions        json.RawMessage `json:"permissions"`
 	}
 	_ = json.Unmarshal(msg.Params, &p)
 	command := ""
@@ -500,13 +693,21 @@ func (b *codexBridge) handleServerRequest(msg appRPCMessage) {
 		command = strings.Join(parts, " ")
 	}
 	kind := "command"
-	if msg.Method == "item/fileChange/requestApproval" {
+	switch msg.Method {
+	case "item/fileChange/requestApproval":
 		kind = "file_change"
+	case "item/permissions/requestApproval":
+		kind = "permissions"
 	}
-	b.post(SemanticEvent{
+	event := SemanticEvent{
 		Type: SemanticEventApprovalRequested, RequestID: string(msg.ID), ApprovalKind: kind,
 		Reason: p.Reason, Command: command, Cwd: p.Cwd, AvailableDecisions: p.AvailableDecisions,
-	})
+		Permissions: p.Permissions,
+	}
+	b.mu.Lock()
+	b.pendingApproval = &event
+	b.mu.Unlock()
+	b.enqueueEvent(event)
 }
 
 func formatCodexPlan(explanation string, steps []codexPlanStep) string {
@@ -520,11 +721,98 @@ func formatCodexPlan(explanation string, steps []codexPlanStep) string {
 	return strings.Join(lines, "\n")
 }
 
-func (b *codexBridge) post(event SemanticEvent) {
-	event.Contact = b.contact
-	_ = semanticDaemonRequest(b.ctx, http.MethodPost, "/local/transport/v2/events", map[string]any{
-		"lease": b.lease, "events": []SemanticEvent{event},
-	}, nil)
+func (b *codexBridge) enqueueEvent(event SemanticEvent) {
+	b.eventMu.Lock()
+	b.eventQueue = append(b.eventQueue, event)
+	b.eventMu.Unlock()
+	select {
+	case b.eventWake <- struct{}{}:
+	default:
+	}
+}
+
+// enqueuePendingApproval replays an unresolved app-server request after a
+// daemon re-hello. If its original event is already waiting for delivery, the
+// queue check keeps the replay idempotent.
+func (b *codexBridge) enqueuePendingApproval() {
+	b.mu.Lock()
+	if b.pendingApproval == nil {
+		b.mu.Unlock()
+		return
+	}
+	event := *b.pendingApproval
+	b.mu.Unlock()
+
+	b.eventMu.Lock()
+	for _, queued := range b.eventQueue {
+		if queued.Type == SemanticEventApprovalRequested && queued.RequestID == event.RequestID {
+			b.eventMu.Unlock()
+			return
+		}
+	}
+	b.eventQueue = append(b.eventQueue, event)
+	b.eventMu.Unlock()
+	select {
+	case b.eventWake <- struct{}{}:
+	default:
+	}
+}
+
+// postLoop provides ordered, retryable delivery for user-visible semantic
+// events. It is deliberately separate from app-server stdout consumption: a
+// daemon outage can delay delivery, but cannot back up the RPC reader until it
+// starts dropping completion notifications.
+func (b *codexBridge) postLoop() {
+	for b.ctx.Err() == nil {
+		b.eventMu.Lock()
+		if len(b.eventQueue) == 0 {
+			b.eventMu.Unlock()
+			select {
+			case <-b.ctx.Done():
+				return
+			case <-b.eventWake:
+				continue
+			}
+		}
+		event := b.eventQueue[0]
+		b.eventMu.Unlock()
+
+		lease, contact, _ := b.route()
+		event.Contact = contact
+		err := semanticDaemonRequest(b.ctx, http.MethodPost, "/local/transport/v2/events", map[string]any{
+			"lease": lease, "events": []SemanticEvent{event},
+		}, nil)
+		if err == nil {
+			b.eventMu.Lock()
+			b.eventQueue = b.eventQueue[1:]
+			b.eventMu.Unlock()
+			continue
+		}
+		if daemonLeaseGone(err) {
+			err = b.recoverLease(lease)
+		}
+		if err != nil && b.ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "bridge codex events:", err)
+		}
+		if !b.retryWait() {
+			return
+		}
+	}
+}
+
+type daemonHTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *daemonHTTPError) Error() string {
+	return fmt.Sprintf("bridge daemon returned %s: %s", e.Status, e.Body)
+}
+
+func daemonLeaseGone(err error) bool {
+	var responseErr *daemonHTTPError
+	return errors.As(err, &responseErr) && responseErr.StatusCode == http.StatusGone
 }
 
 func semanticDaemonRequest(ctx context.Context, method, path string, body, out any) error {
@@ -551,7 +839,11 @@ func semanticDaemonRequest(ctx context.Context, method, path string, body, out a
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("bridge daemon returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return &daemonHTTPError{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       strings.TrimSpace(string(data)),
+		}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)

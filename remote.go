@@ -198,10 +198,10 @@ func (remoteTransport) Alive(c *Contact) bool {
 	return remoteFreshLeaseLocked(c.ID) != nil
 }
 
-// Ready: fresh AND not suspect AND the last attestation said ready AND no dialog
-// on the attested screen. No attest yet, a stale lease, or a Deliver that just
-// timed out all read false — the guarded flush then defers and the durable
-// mailbox retries, never a blind type.
+// Ready: fresh AND not suspect AND the last attestation said ready. Terminal
+// clients also get the screen-dialog belt; semantic clients additionally get
+// the structured prompt_open belt. No attest yet, a stale lease, or a Deliver
+// that timed out all read false, so guarded delivery always fails safe.
 func (remoteTransport) Ready(c *Contact) bool {
 	remoteMu.Lock()
 	defer remoteMu.Unlock()
@@ -219,7 +219,7 @@ func (remoteTransport) Ready(c *Contact) bool {
 	// in-memory string parse — fine under remoteMu — and paneShowsDialog("") is
 	// false, so a client that attests no screen_tail keeps its boolean's word: the
 	// belt only ever SUBTRACTS, and only on a dialog it actually has bytes for.
-	return ok && st.Ready && !paneShowsDialog(st.ScreenTail)
+	return ok && st.Ready && !(l.protocol >= 2 && st.PromptOpen) && !paneShowsDialog(st.ScreenTail)
 }
 
 // Capture: the last attested screen tail while fresh, "" when stale — callers
@@ -423,10 +423,7 @@ func handleTransportHello(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flavor := sanitizeFlavor(req.Transport)
-	protocol := req.Protocol
-	if protocol != 2 {
-		protocol = 1
-	}
+	protocol := negotiatedTransportProtocol(r.URL.Path, req.Protocol)
 	provider := sanitizeFlavor(req.Provider)
 	if req.Provider == "" {
 		provider = ""
@@ -474,9 +471,19 @@ func handleTransportHello(w http.ResponseWriter, r *http.Request) {
 	}
 	if protocol >= 2 {
 		resp["protocol"] = 2
-		resp["capabilities"] = []string{"input", "steer", "interrupt", "approval", "events"}
+		resp["capabilities"] = []string{"input", "steer", "interrupt", "approval", "compact", "events"}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// The versioned URL is itself a negotiation signal. Keeping explicit protocol
+// support on the legacy hello route is backwards-compatible, while making the
+// documented /v2/hello alias impossible to accidentally downgrade to v1.
+func negotiatedTransportProtocol(path string, requested int) int {
+	if path == "/local/transport/v2/hello" || requested == 2 {
+		return 2
+	}
+	return 1
 }
 
 // handleTransportAttest is the heartbeat that answers Alive/Ready/Capture: it
@@ -627,7 +634,17 @@ func handleTransportAck(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(data, &req)
 
 	remoteMu.Lock()
-	if l := remoteLeases[req.Lease]; l != nil {
+	l := remoteLeases[req.Lease]
+	if r.URL.Path == "/local/transport/v2/ack" &&
+		(l == nil || l.stale() || l.protocol < 2) {
+		if l != nil && l.stale() {
+			remoteDeleteLeaseLocked(req.Lease)
+		}
+		remoteMu.Unlock()
+		writeJSON(w, http.StatusGone, map[string]string{"error": "lease-expired-or-not-v2"})
+		return
+	}
+	if l != nil {
 		for _, id := range req.IDs {
 			for _, pd := range l.outbox {
 				if pd.ID == id {
