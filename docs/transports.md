@@ -94,6 +94,67 @@ Approvals ride the same drain as typed deliveries with a `key` field
 instead of `text`; the client maps them to its environment (vterm
 send-key). `SendKey` shares Deliver's ack discipline.
 
+## Semantic protocol v2 (additive)
+
+Clients backed by an agent API can negotiate `"protocol": 2` on the legacy
+hello route, or use `/local/transport/v2/hello`, which always selects v2. The
+unversioned route remains v1 when the field is absent or unsupported, so
+existing Emacs and simulation clients retain their byte-for-byte response and
+delivery shapes.
+
+V2 replaces terminal text and keys with typed commands:
+
+    GET /local/transport/v2/commands?lease=…&wait=25
+    → { "commands": [
+          { "id":"…", "delivery_id":"…", "contact":"…",
+            "type":"input", "text":"…" },
+          { "id":"…", "contact":"…", "type":"interrupt" },
+          { "id":"…", "contact":"…", "type":"compact" },
+          { "id":"…", "contact":"…", "type":"approval",
+            "request_id":"…", "approval_kind":"command",
+            "decision":"accept" } ] }
+    POST /local/transport/v2/ack { "lease":"…", "ids":["…"] }
+
+The same outbox, lease, timeout, and acknowledgement rules used by v1 remain
+in force. A semantic client publishes normalized, user-visible output through:
+
+    POST /local/transport/v2/events
+    { "lease":"…", "events":[
+        { "id":"…", "contact":"…", "type":"agent_message", "text":"…" },
+        { "id":"…", "contact":"…", "type":"plan", "text":"…" },
+        { "id":"…", "contact":"…", "type":"status", "status":"working" },
+        { "id":"…", "contact":"…", "type":"approval_requested",
+          "request_id":"…", "approval_kind":"command", "reason":"…" }
+      ] }
+
+There is intentionally no raw-reasoning or arbitrary-tool-output event. The
+current phone UI remains compatible: its established numeric approval keys are
+translated to semantic decisions only for a v2 lease (`1` accept, `2`
+accept-for-session, `3` decline, `esc` cancel). V1 continues to receive those
+values as literal whitelisted keystrokes.
+
+Semantic events are ordered and retried across transient daemon outages. A 410
+from commands, events, attest, or acknowledgement spends the lease: the client
+re-hellos, resumes draining, and replays any unresolved structured approval.
+The daemon persists one `delivery_id` for each frozen mailbox group; the Codex
+client uses it as the execution receipt and, for input, as
+`clientUserMessageId`. Thus an acknowledged execution is not repeated when an
+old-lease acknowledgement fails and the same mail returns under a new wire id.
+Clients likewise assign a stable event `id` before their first post. Reply and
+plan events retain that source id in retained durable history, so a retry after
+a lost HTTP response or daemon restart does not create a second user-visible
+event.
+Only streaming delta notifications may be dropped under local queue pressure;
+completion, turn-lifecycle, and approval notifications are lossless.
+
+`bridge codex` is the first v2 client. It starts or resumes a Codex App Server
+thread and maps `input` to `turn/start` or `turn/steer`, `interrupt` to
+`turn/interrupt`, `compact` to `thread/compact/start`, and App Server messages,
+plan summaries, and approval requests back to semantic events. Command, file,
+and permission-profile approvals use their distinct App Server response shapes.
+For streamed agent messages, the final `item/completed` text is authoritative;
+buffered deltas are used only when the completion omits text.
+
 ## What does NOT change
 
 - **Outbound is untouched.** Remote agents are Claude Code sessions; the
@@ -142,12 +203,13 @@ send-key). `SendKey` shares Deliver's ack discipline.
    label ("emacs", "sim") stored on the contact and surfaced in
    `/api/status` — one implementation serves every future environment.
 
-5. **One judge for prompts.** The daemon's `looksLikePrompt`, run on the
-   attested tail, decides both the RAISE (attest-time, transition-only,
-   the full hook-path ceremony) and the CLEAR (verifyPrompt's two-strike,
-   which already rode the transport interface). The client's
-   `prompt_open` field is advisory only — two judges would flap the card
-   and ring the phone in a loop. Attest-time detection is the primary
+5. **One judge per transport kind.** For terminal/v1 clients, the daemon's
+   `looksLikePrompt`, run on the attested tail, decides both the RAISE
+   (attest-time, transition-only, the full hook-path ceremony) and the CLEAR
+   (verifyPrompt's two-strike rule); their `prompt_open` field is advisory.
+   Semantic/v2 clients have no screen to scrape, so structured
+   `approval_requested` / matching `approval_resolved` events are authoritative.
+   Attest-time terminal detection is the primary
    rung for remote agents: the user-global Notification hook fires the
    instant a dialog opens but judges the last attested tail, usually
    stale at that moment; the attest that carries the dialog is the

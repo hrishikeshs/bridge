@@ -411,9 +411,15 @@ func handleApprove(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not-waiting"})
 		return
 	}
-	if err := transportFor(c).SendKey(c, req.Key); err != nil {
-		audit("approve-failed", err.Error(), id)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	var deliverErr error
+	if remoteUsesSemanticProtocol(c.ID) {
+		deliverErr = deliverLegacySemanticApproval(c, req.Key)
+	} else {
+		deliverErr = transportFor(c).SendKey(c, req.Key)
+	}
+	if deliverErr != nil {
+		audit("approve-failed", deliverErr.Error(), id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": deliverErr.Error()})
 		return
 	}
 	audit("approve", c.Name+" <- "+req.Key, id)
@@ -472,7 +478,7 @@ func handleCompact(w http.ResponseWriter, r *http.Request, id string) {
 	// coalescing mailbox (holdInbound): for tmux it types "/compact"+Enter, for a
 	// remote client it parks "/compact" for the client to type, exactly as the
 	// client types any daemon-delivered line. Nothing request-supplied is here.
-	if err := transportFor(c).Deliver(c, compactCommand); err != nil {
+	if err := deliverCompact(c); err != nil {
 		audit("compact-failed", c.Name+": "+err.Error(), id)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

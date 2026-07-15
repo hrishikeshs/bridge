@@ -44,8 +44,8 @@ schedule by local time. The same list at golden hour:</i></sub>
    phone (installable PWA)
         ⇅   tailnet-only HTTPS · paired-device tokens · Web Push
    bridge daemon  (one Go binary on 127.0.0.1)
-        ⇅   tmux send-keys in · session-JSONL tail out · hooks for prompts
-   your Claude Code sessions  (in daemon-managed tmux — or hosted by a connected client)
+        ⇅   terminal transport v1 · semantic agent transport v2
+   Claude Code sessions or opt-in Codex App Server threads
 ```
 
 - **One daemon on your Mac.** A single Go binary binds `127.0.0.1` and owns every managed agent. `launchd` keeps it alive across logout, reboot, and crash.
@@ -55,6 +55,7 @@ schedule by local time. The same list at golden hour:</i></sub>
 - **Permission prompts ring your phone.** Claude Code's Notification hook fires a push and raises a card with the real dialog — approve or redirect from the couch.
 - **A switchboard too.** Agents on the same daemon message each other (`--to <agent>`) and share one `#crew` room — the same wire your phone rides.
 - **tmux is the default home, not the only one.** Delivery is a pluggable transport: any environment that speaks four localhost endpoints (register, heartbeat, drain, ack) can host agents itself — the daemon reaches agents, it never assumes where they live. An Emacs client is in progress; every `bridge` command works the same from either home. See [docs/transports.md](docs/transports.md).
+- **Codex is opt-in and semantic.** `bridge codex` hosts a Codex thread through the official App Server protocol, so messages, plans, interrupts, and approvals cross Bridge without terminal scraping or raw reasoning traces.
 
 ## Quick start
 
@@ -62,6 +63,7 @@ schedule by local time. The same list at golden hour:</i></sub>
 go install github.com/hrishikeshs/bridge@latest   # or clone + `go build` · a Homebrew tap exists too
 bridge install-daemon        # supervise with launchd (or just run: bridge serve)
 bridge expose                # publish to your tailnet — prints your https://<host>.ts.net URL
+# optional: bridge codex --name sol   # host a Codex thread instead of Claude/tmux
 # then, to a running agent:  "use bridge so we can text"
 bridge pair                  # one-time code for your phone
 ```
@@ -90,6 +92,7 @@ speaks as you.
 | `bridge install-daemon` | supervise the daemon with launchd (`--uninstall` removes it) | `bridge install-daemon` |
 | `bridge lockdown` | revoke every device and stop the daemon | `bridge lockdown` |
 | `bridge hook` | internal Notification-hook shim (installed for you on connect) | — |
+| `bridge codex [--name <n>]` | host an opt-in Codex App Server thread | `bridge codex --name sol` |
 
 **#crew cooldown:** in the party line each agent may post at most once per human
 turn — the daemon refuses a second, and the next human message reopens every slot.
@@ -129,8 +132,9 @@ Every change ships against a written review — the trail:
 [review-pr1-2026-07-05](docs/review-pr1-2026-07-05.md).
 The full wire protocol is [docs/protocol.md](docs/protocol.md).
 
-Built only on Claude Code's *ungated* primitives — `--resume`, session JSONL,
-settings.json hooks — so no platform toggle or allowlist can revoke your line.
+The established Claude path still uses its ungated primitives—`--resume`,
+session JSONL, and settings hooks. Optional Codex support uses the local Codex
+App Server API and does not change that path or its wire contracts.
 
 ## Two flavors
 

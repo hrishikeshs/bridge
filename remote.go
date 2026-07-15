@@ -53,6 +53,9 @@ type parkedDelivery struct {
 	Contact string
 	Text    string
 	Key     string
+	// Command is set only for protocol-v2 semantic clients.  V1 clients keep
+	// seeing the exact text/key delivery shape they have always understood.
+	Command *SemanticCommand
 	acked   bool
 }
 
@@ -64,6 +67,8 @@ type parkedDelivery struct {
 type remoteLease struct {
 	token    string
 	flavor   string                 // client-supplied environment label ("emacs", "sim")
+	protocol int                    // 1 = legacy text/key drain; 2 = semantic command/event lane
+	provider string                 // optional semantic runtime label ("codex", etc.)
 	lastSeen time.Time              // last hello/attest; the freshness clock
 	suspect  bool                   // a Deliver timed out against this lease; the next attest clears it
 	agents   map[string]bool        // contact ids this lease hosts
@@ -193,10 +198,10 @@ func (remoteTransport) Alive(c *Contact) bool {
 	return remoteFreshLeaseLocked(c.ID) != nil
 }
 
-// Ready: fresh AND not suspect AND the last attestation said ready AND no dialog
-// on the attested screen. No attest yet, a stale lease, or a Deliver that just
-// timed out all read false — the guarded flush then defers and the durable
-// mailbox retries, never a blind type.
+// Ready: fresh AND not suspect AND the last attestation said ready. Terminal
+// clients also get the screen-dialog belt; semantic clients additionally get
+// the structured prompt_open belt. No attest yet, a stale lease, or a Deliver
+// that timed out all read false, so guarded delivery always fails safe.
 func (remoteTransport) Ready(c *Contact) bool {
 	remoteMu.Lock()
 	defer remoteMu.Unlock()
@@ -214,7 +219,7 @@ func (remoteTransport) Ready(c *Contact) bool {
 	// in-memory string parse — fine under remoteMu — and paneShowsDialog("") is
 	// false, so a client that attests no screen_tail keeps its boolean's word: the
 	// belt only ever SUBTRACTS, and only on a dialog it actually has bytes for.
-	return ok && st.Ready && !paneShowsDialog(st.ScreenTail)
+	return ok && st.Ready && !(l.protocol >= 2 && st.PromptOpen) && !paneShowsDialog(st.ScreenTail)
 }
 
 // Capture: the last attested screen tail while fresh, "" when stale — callers
@@ -232,6 +237,9 @@ func (remoteTransport) Capture(c *Contact) string {
 // ack timeout elapses, or the lease dies (error). An error leaves the mail queued
 // for the next flush — identical to a failed tmux send-keys.
 func (remoteTransport) Deliver(c *Contact, text string) error {
+	if remoteUsesSemanticProtocol(c.ID) {
+		return remoteParkCommandAndWait(c, SemanticCommand{Type: SemanticCommandInput, Text: text})
+	}
 	return remoteParkAndWait(c, text, "")
 }
 
@@ -242,7 +250,27 @@ func (remoteTransport) SendKey(c *Contact, key string) error {
 	if !approveKeys[key] {
 		return fmt.Errorf("remote: key %q not in the approve whitelist", key)
 	}
+	// Escape is the legacy Transport spelling of interrupt.  A v2 client gets
+	// the provider-neutral semantic command instead of a fake terminal key.
+	if key == "esc" && remoteUsesSemanticProtocol(c.ID) {
+		return remoteParkCommandAndWait(c, SemanticCommand{Type: SemanticCommandInterrupt})
+	}
 	return remoteParkAndWait(c, "", key)
+}
+
+// remoteUsesSemanticProtocol reports whether the contact's current fresh
+// lease negotiated v2. It deliberately returns false for missing/stale leases,
+// preserving the v1 fail-safe path and allowing remoteParkAndWait to produce
+// the existing disconnected error.
+func remoteUsesSemanticProtocol(contactID string) bool {
+	remoteMu.Lock()
+	defer remoteMu.Unlock()
+	l := remoteFreshLeaseLocked(contactID)
+	return l != nil && l.protocol >= 2
+}
+
+func remoteParkCommandAndWait(c *Contact, command SemanticCommand) error {
+	return remotePark(c, "", "", &command)
 }
 
 // remoteParkAndWait is Deliver/SendKey's shared body: park a delivery in the
@@ -251,6 +279,10 @@ func (remoteTransport) SendKey(c *Contact, key string) error {
 // until an attest proves the client back) and audits, then returns an error so
 // the mailbox — the source of truth — redelivers under a fresh id on a later tick.
 func remoteParkAndWait(c *Contact, text, key string) error {
+	return remotePark(c, text, key, nil)
+}
+
+func remotePark(c *Contact, text, key string, command *SemanticCommand) error {
 	remoteMu.Lock()
 	l := remoteFreshLeaseLocked(c.ID)
 	if l == nil {
@@ -265,7 +297,11 @@ func remoteParkAndWait(c *Contact, text, key string) error {
 		return fmt.Errorf("remote outbox for %s is full", c.Name)
 	}
 	token := l.token
-	pd := &parkedDelivery{ID: newID(), Contact: c.ID, Text: text, Key: key}
+	pd := &parkedDelivery{ID: newID(), Contact: c.ID, Text: text, Key: key, Command: command}
+	if pd.Command != nil {
+		pd.Command.ID = pd.ID
+		pd.Command.Contact = c.ID
+	}
 	l.outbox = append(l.outbox, pd)
 	remoteMu.Unlock()
 
@@ -366,6 +402,8 @@ func handleTransportHello(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Transport string `json:"transport"`
+		Protocol  int    `json:"protocol"`
+		Provider  string `json:"provider"`
 		Agents    []struct {
 			Name      string `json:"name"`
 			Directory string `json:"directory"`
@@ -385,6 +423,11 @@ func handleTransportHello(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flavor := sanitizeFlavor(req.Transport)
+	protocol := negotiatedTransportProtocol(r.URL.Path, req.Protocol)
+	provider := sanitizeFlavor(req.Provider)
+	if req.Provider == "" {
+		provider = ""
+	}
 
 	type outAgent struct {
 		ID   string `json:"id"`
@@ -410,6 +453,8 @@ func handleTransportHello(w http.ResponseWriter, r *http.Request) {
 	remoteLeases[token] = &remoteLease{
 		token:    token,
 		flavor:   flavor,
+		protocol: protocol,
+		provider: provider,
 		lastSeen: time.Now(),
 		agents:   ids,
 		states:   map[string]remoteState{},
@@ -419,11 +464,26 @@ func handleTransportHello(w http.ResponseWriter, r *http.Request) {
 	}
 	remoteMu.Unlock()
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"agents": agents,
 		"lease":  token,
 		"ttl_s":  remoteTTLSeconds(),
-	})
+	}
+	if protocol >= 2 {
+		resp["protocol"] = 2
+		resp["capabilities"] = []string{"input", "steer", "interrupt", "approval", "compact", "events"}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// The versioned URL is itself a negotiation signal. Keeping explicit protocol
+// support on the legacy hello route is backwards-compatible, while making the
+// documented /v2/hello alias impossible to accidentally downgrade to v1.
+func negotiatedTransportProtocol(path string, requested int) int {
+	if path == "/local/transport/v2/hello" || requested == 2 {
+		return 2
+	}
+	return 1
 }
 
 // handleTransportAttest is the heartbeat that answers Alive/Ready/Capture: it
@@ -574,7 +634,17 @@ func handleTransportAck(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(data, &req)
 
 	remoteMu.Lock()
-	if l := remoteLeases[req.Lease]; l != nil {
+	l := remoteLeases[req.Lease]
+	if r.URL.Path == "/local/transport/v2/ack" &&
+		(l == nil || l.stale() || l.protocol < 2) {
+		if l != nil && l.stale() {
+			remoteDeleteLeaseLocked(req.Lease)
+		}
+		remoteMu.Unlock()
+		writeJSON(w, http.StatusGone, map[string]string{"error": "lease-expired-or-not-v2"})
+		return
+	}
+	if l != nil {
 		for _, id := range req.IDs {
 			for _, pd := range l.outbox {
 				if pd.ID == id {

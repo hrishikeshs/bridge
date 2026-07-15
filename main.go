@@ -49,6 +49,7 @@ pair' (put it on your phone).`,
 		lockdownCmd(),
 		installDaemonCmd(),
 		paperCmd(),
+		codexCmd(),
 	)
 	return root
 }
