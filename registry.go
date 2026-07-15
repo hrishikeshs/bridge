@@ -97,9 +97,15 @@ type MailMessage struct {
 	Via  string `json:"via"`  // channel it arrived on ("phone" | "bridge")
 	Text string `json:"text"`
 	TS   string `json:"ts"`
+	// DeliveryID is minted when this message's mailbox group is first claimed
+	// for delivery. Every member of that frozen group receives the same id, and
+	// it persists until successful removal so semantic redelivery across a new
+	// lease keeps one idempotency identity. Additive/omitempty keeps old mailbox
+	// files and the v1 wire format compatible.
+	DeliveryID string `json:"delivery_id,omitempty"`
 	// Room is the room this message was fanned out to ("#crew"), empty for a 1:1
 	// message. It authors the " in #crew" fragment of the delivered frame
-	// (formatInbound) and is part of the mailbox grouping key (PeekMailboxGroup),
+	// (formatInbound) and is part of the mailbox grouping key (mailboxGroupEnd),
 	// so a room message and a 1:1 message from the same sender never merge into
 	// one frame. Additive and omitempty — a pre-rooms mailbox file loads unchanged.
 	Room string `json:"room,omitempty"`
@@ -637,7 +643,7 @@ func (r *Registry) EndFlush(id string) {
 	r.mu.Unlock()
 }
 
-// Group caps for PeekMailboxGroup: a combined delivery stays a readable,
+// Mailbox group caps: a combined delivery stays a readable,
 // send-keys-safe single line.
 const (
 	mailGroupMaxMsgs  = 8
@@ -703,22 +709,59 @@ func (r *Registry) PeekMailboxGroup(id string) []MailMessage {
 	if len(q) == 0 {
 		return nil
 	}
-	out := []MailMessage{q[0]}
+	end := mailboxGroupEnd(q)
+	return append([]MailMessage(nil), q[:end]...)
+}
+
+// ClaimMailboxGroup returns the next group and durably freezes its boundary.
+// A first claim stamps one UUID on every selected message; a retry returns only
+// the consecutive messages carrying that UUID, so newly appended same-sender
+// mail cannot expand a previously executed semantic command.
+func (r *Registry) ClaimMailboxGroup(id string) []MailMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	q := r.mailbox[id]
+	if len(q) == 0 {
+		return nil
+	}
+	if q[0].DeliveryID != "" {
+		deliveryID := q[0].DeliveryID
+		end := 1
+		for end < len(q) && q[end].DeliveryID == deliveryID {
+			end++
+		}
+		return append([]MailMessage(nil), q[:end]...)
+	}
+
+	end := mailboxGroupEnd(q)
+	deliveryID := newID()
+	for i := 0; i < end; i++ {
+		r.mailbox[id][i].DeliveryID = deliveryID
+	}
+	r.save()
+	return append([]MailMessage(nil), r.mailbox[id][:end]...)
+}
+
+func mailboxGroupEnd(q []MailMessage) int {
+	if len(q) == 0 {
+		return 0
+	}
 	total := len(q[0].Text)
-	for _, m := range q[1:] {
-		// Room joins From+Via in the same-group predicate: the frame is applied
-		// once per group from group[0], so a 1:1 message must never be swallowed
-		// into a room frame (or a room message into a 1:1 one).
+	end := 1
+	for end < len(q) {
+		m := q[end]
+		// Room is part of the key so a room message and a 1:1 message from the
+		// same sender never share a provenance frame.
 		if m.From != q[0].From || m.Via != q[0].Via || m.Room != q[0].Room {
 			break
 		}
-		if len(out) >= mailGroupMaxMsgs || total+len(m.Text) > mailGroupMaxBytes {
+		if end >= mailGroupMaxMsgs || total+len(m.Text) > mailGroupMaxBytes {
 			break
 		}
-		out = append(out, m)
 		total += len(m.Text)
+		end++
 	}
-	return out
+	return end
 }
 
 // DropMailbox removes the given delivered messages and persists. Each is

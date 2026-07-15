@@ -475,7 +475,12 @@ func (b *codexBridge) commandLoop() {
 }
 
 func (b *codexBridge) processCommand(lease string, command SemanticCommand) error {
-	key := lease + ":" + command.ID
+	key := command.DeliveryID
+	if key == "" {
+		// Non-mailbox commands retain the lease-local wire identity. Input
+		// commands from flushMailbox always carry the durable DeliveryID.
+		key = lease + ":" + command.ID
+	}
 	b.mu.Lock()
 	alreadyExecuted := b.executed[key]
 	b.mu.Unlock()
@@ -520,16 +525,24 @@ func (b *codexBridge) execute(command SemanticCommand) error {
 		b.mu.Unlock()
 		input := []map[string]string{{"type": "text", "text": command.Text}}
 		if turnID != "" {
-			return b.rpc.request(ctx, "turn/steer", map[string]any{
+			params := map[string]any{
 				"threadId": b.threadID, "expectedTurnId": turnID, "input": input,
-			}, nil)
+			}
+			if command.DeliveryID != "" {
+				params["clientUserMessageId"] = command.DeliveryID
+			}
+			return b.rpc.request(ctx, "turn/steer", params, nil)
 		}
 		var started struct {
 			Turn struct {
 				ID string `json:"id"`
 			} `json:"turn"`
 		}
-		if err := b.rpc.request(ctx, "turn/start", map[string]any{"threadId": b.threadID, "input": input}, &started); err != nil {
+		params := map[string]any{"threadId": b.threadID, "input": input}
+		if command.DeliveryID != "" {
+			params["clientUserMessageId"] = command.DeliveryID
+		}
+		if err := b.rpc.request(ctx, "turn/start", params, &started); err != nil {
 			return err
 		}
 		b.mu.Lock()
@@ -637,7 +650,9 @@ func (b *codexBridge) handleRPC(msg appRPCMessage) {
 		delete(b.messageBuf, itemID)
 		b.mu.Unlock()
 		if p.Item.Type == "agentMessage" {
-			if message == "" {
+			// item/completed is authoritative. Deltas are explicitly droppable,
+			// so a non-empty accumulated buffer may still be only a prefix.
+			if p.Item.Text != "" {
 				message = p.Item.Text
 			}
 			b.enqueueEvent(SemanticEvent{Type: SemanticEventAgentMessage, Text: message})
@@ -700,6 +715,7 @@ func (b *codexBridge) handleServerRequest(msg appRPCMessage) {
 		kind = "permissions"
 	}
 	event := SemanticEvent{
+		ID:   newID(),
 		Type: SemanticEventApprovalRequested, RequestID: string(msg.ID), ApprovalKind: kind,
 		Reason: p.Reason, Command: command, Cwd: p.Cwd, AvailableDecisions: p.AvailableDecisions,
 		Permissions: p.Permissions,
@@ -722,6 +738,9 @@ func formatCodexPlan(explanation string, steps []codexPlanStep) string {
 }
 
 func (b *codexBridge) enqueueEvent(event SemanticEvent) {
+	if event.ID == "" {
+		event.ID = newID()
+	}
 	b.eventMu.Lock()
 	b.eventQueue = append(b.eventQueue, event)
 	b.eventMu.Unlock()

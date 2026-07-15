@@ -28,12 +28,13 @@ const (
 // or turn/steer, interrupt to turn/interrupt, and approval to the response for
 // the app-server request identified by RequestID.
 type SemanticCommand struct {
-	ID        string              `json:"id"`
-	Contact   string              `json:"contact"`
-	Type      SemanticCommandType `json:"type"`
-	Text      string              `json:"text,omitempty"`
-	RequestID string              `json:"request_id,omitempty"`
-	Decision  string              `json:"decision,omitempty"`
+	ID         string              `json:"id"`
+	Contact    string              `json:"contact"`
+	Type       SemanticCommandType `json:"type"`
+	Text       string              `json:"text,omitempty"`
+	DeliveryID string              `json:"delivery_id,omitempty"`
+	RequestID  string              `json:"request_id,omitempty"`
+	Decision   string              `json:"decision,omitempty"`
 	// ApprovalKind selects the app-server response schema. Permissions carries
 	// the exact profile Codex requested so an approval can grant no more than
 	// that profile; both are empty for non-approval commands.
@@ -52,6 +53,7 @@ const (
 )
 
 type SemanticEvent struct {
+	ID                 string            `json:"id,omitempty"`
 	Contact            string            `json:"contact"`
 	Type               SemanticEventType `json:"type"`
 	Text               string            `json:"text,omitempty"`
@@ -179,8 +181,13 @@ func applySemanticEvent(c *Contact, ev SemanticEvent) bool {
 	case SemanticEventAgentMessage:
 		if text := strings.TrimSpace(stripControl(ev.Text)); text != "" {
 			registry.SetHealth(c.ID, "ok")
-			Emit("reply", c.ID, c.Name, text)
-			dispatchPluginEvent("reply.out", c, map[string]any{"text": text})
+			_, fresh := emitEventOnce(Event{
+				Type: "reply", Agent: c.ID, Name: c.Name, Text: text,
+				SourceID: semanticEventSourceID(c.ID, ev.ID),
+			})
+			if fresh {
+				dispatchPluginEvent("reply.out", c, map[string]any{"text": text})
+			}
 			return true
 		}
 	case SemanticEventStatus:
@@ -199,7 +206,10 @@ func applySemanticEvent(c *Contact, ev SemanticEvent) bool {
 		return true
 	case SemanticEventPlan:
 		if text := strings.TrimSpace(stripControl(ev.Text)); text != "" {
-			Emit("plan", c.ID, c.Name, text)
+			emitEventOnce(Event{
+				Type: "plan", Agent: c.ID, Name: c.Name, Text: text,
+				SourceID: semanticEventSourceID(c.ID, ev.ID),
+			})
 			return true
 		}
 	case SemanticEventApprovalRequested:
@@ -240,6 +250,13 @@ func applySemanticEvent(c *Contact, ev SemanticEvent) bool {
 		}
 	}
 	return false
+}
+
+func semanticEventSourceID(contactID, eventID string) string {
+	if eventID == "" {
+		return "" // backwards-compatible v2 clients remain accepted, without dedup
+	}
+	return contactID + ":" + eventID
 }
 
 func formatSemanticApproval(ev SemanticEvent, caption string) string {
@@ -352,4 +369,16 @@ func deliverCompact(c *Contact) error {
 		return remoteParkCommandAndWait(c, SemanticCommand{Type: SemanticCommandCompact})
 	}
 	return transportFor(c).Deliver(c, compactCommand)
+}
+
+// deliverMailboxGroup carries the registry's durable group identity only on
+// the semantic lane. Terminal/v1 transports still receive exactly the prepared
+// text line, while a v2 redelivery under a fresh lease retains DeliveryID.
+func deliverMailboxGroup(c *Contact, text, deliveryID string) error {
+	if remoteUsesSemanticProtocol(c.ID) {
+		return remoteParkCommandAndWait(c, SemanticCommand{
+			Type: SemanticCommandInput, Text: text, DeliveryID: deliveryID,
+		})
+	}
+	return transportFor(c).Deliver(c, text)
 }

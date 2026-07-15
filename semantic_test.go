@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -128,6 +130,23 @@ func TestQueuePressureDropsOnlyDeltas(t *testing.T) {
 	}
 	if got := <-events; got.Method != "turn/completed" {
 		t.Fatalf("queued method = %q, want turn/completed", got.Method)
+	}
+}
+
+func TestCompletedItemTextWinsAfterPartialDeltas(t *testing.T) {
+	b := &codexBridge{
+		messageBuf: map[string]string{"item-1": "only the prefix"},
+		eventWake:  make(chan struct{}, 1),
+	}
+	b.handleRPC(appRPCMessage{
+		Method: "item/completed",
+		Params: json.RawMessage(`{"item":{"id":"item-1","type":"agentMessage","text":"the complete authoritative answer"}}`),
+	})
+	if len(b.eventQueue) != 1 {
+		t.Fatalf("queued events = %d, want 1", len(b.eventQueue))
+	}
+	if got := b.eventQueue[0].Text; got != "the complete authoritative answer" {
+		t.Fatalf("completed reply = %q, want authoritative item.text", got)
 	}
 }
 
@@ -266,6 +285,43 @@ func TestCompactCommandCallsDedicatedAppServerMethod(t *testing.T) {
 	}
 }
 
+func TestSteerCarriesStableClientUserMessageID(t *testing.T) {
+	w := &channelWriteCloser{writes: make(chan []byte, 1)}
+	rpc := &appServerClient{stdin: w, waits: map[string]chan appRPCMessage{}}
+	b := &codexBridge{ctx: context.Background(), rpc: rpc, threadID: "thread-42", turnID: "turn-active"}
+	done := make(chan error, 1)
+	go func() {
+		done <- b.execute(SemanticCommand{
+			Type: SemanticCommandInput, Text: "follow-up", DeliveryID: "group-follow-up",
+		})
+	}()
+
+	var request map[string]any
+	select {
+	case data := <-w.writes:
+		if err := json.Unmarshal(bytes.TrimSpace(data), &request); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("steer did not call app-server")
+	}
+	if request["method"] != "turn/steer" {
+		t.Fatalf("method = %#v, want turn/steer", request["method"])
+	}
+	params := request["params"].(map[string]any)
+	if params["clientUserMessageId"] != "group-follow-up" {
+		t.Fatalf("clientUserMessageId = %#v, want group-follow-up", params["clientUserMessageId"])
+	}
+	rpc.mu.Lock()
+	response := rpc.waits["1"]
+	rpc.mu.Unlock()
+	response <- appRPCMessage{Result: json.RawMessage(`{}`)}
+	close(response)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCodexBridgeReHellosAfterLeaseExpiry(t *testing.T) {
 	var hellos atomic.Int32
 	installTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -303,11 +359,196 @@ func TestCodexBridgeReHellosAfterLeaseExpiry(t *testing.T) {
 	}
 }
 
+func TestSemanticCommandIdentitySurvivesLeaseRedelivery(t *testing.T) {
+	var hellos atomic.Int32
+	var acks atomic.Int32
+	installTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/local/transport/v2/ack":
+			acks.Add(1)
+			var req struct {
+				Lease string `json:"lease"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Lease == "lease-old" {
+				w.WriteHeader(http.StatusGone)
+				_, _ = w.Write([]byte(`{"error":"lease-expired"}`))
+				return
+			}
+			if req.Lease != "lease-new" {
+				t.Errorf("ack lease = %q, want lease-old or lease-new", req.Lease)
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/local/transport/v2/hello":
+			hellos.Add(1)
+			_, _ = w.Write([]byte(`{"agents":[{"id":"contact","name":"wise-deer"}],"lease":"lease-new","ttl_s":30,"protocol":2}`))
+		default:
+			t.Errorf("unexpected daemon path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+
+	writes := &channelWriteCloser{writes: make(chan []byte, 2)}
+	rpc := &appServerClient{stdin: writes, waits: map[string]chan appRPCMessage{}}
+	b := &codexBridge{
+		ctx: context.Background(), rpc: rpc, threadID: "thread-1", name: "wise-deer", cwd: "/project",
+		lease: "lease-old", contact: "contact", contactName: "wise-deer",
+		messageBuf: map[string]string{}, executed: map[string]bool{},
+		eventWake: make(chan struct{}, 1), retryDelay: time.Millisecond,
+	}
+	first := SemanticCommand{
+		ID: "wire-old", Type: SemanticCommandInput, Text: "one user message", DeliveryID: "group-stable",
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.processCommand("lease-old", first) }()
+
+	var request map[string]any
+	select {
+	case data := <-writes.writes:
+		if err := json.Unmarshal(bytes.TrimSpace(data), &request); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first delivery did not reach app-server")
+	}
+	params := request["params"].(map[string]any)
+	if params["clientUserMessageId"] != "group-stable" {
+		t.Fatalf("clientUserMessageId = %#v, want group-stable", params["clientUserMessageId"])
+	}
+	rpc.mu.Lock()
+	response := rpc.waits["1"]
+	rpc.mu.Unlock()
+	response <- appRPCMessage{Result: json.RawMessage(`{"turn":{"id":"turn-1"}}`)}
+	close(response)
+	if err := <-done; !errors.Is(err, errCodexLeaseReplaced) {
+		t.Fatalf("first processCommand error = %v, want lease replacement", err)
+	}
+
+	second := first
+	second.ID = "wire-new"
+	if err := b.processCommand("lease-new", second); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case duplicate := <-writes.writes:
+		t.Fatalf("redelivery executed a second app-server request: %s", duplicate)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if hellos.Load() != 1 || acks.Load() != 2 {
+		t.Fatalf("hello/ack counts = %d/%d, want 1/2", hellos.Load(), acks.Load())
+	}
+	b.mu.Lock()
+	stillExecuted := b.executed["group-stable"]
+	b.mu.Unlock()
+	if stillExecuted {
+		t.Fatal("stable execution receipt remained after fresh-lease ack")
+	}
+}
+
+func TestMailboxClaimFreezesSemanticGroupAcrossRetry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	r := &Registry{
+		contacts: map[string]*Contact{}, mailbox: map[string][]MailMessage{}, flushing: map[string]bool{},
+	}
+	const contactID = "mailbox-identity-contact"
+	r.Queue(contactID, MailMessage{From: "Hrishi", Via: "phone", Text: "one"})
+	r.Queue(contactID, MailMessage{From: "Hrishi", Via: "phone", Text: "two"})
+	first := r.ClaimMailboxGroup(contactID)
+	if len(first) != 2 || first[0].DeliveryID == "" || first[1].DeliveryID != first[0].DeliveryID {
+		t.Fatalf("first claimed group = %#v", first)
+	}
+	persistedData, err := os.ReadFile(bridgePath("contacts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted registryFile
+	if err := json.Unmarshal(persistedData, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	persistedGroup := persisted.Mailbox[contactID]
+	if len(persistedGroup) != 2 || persistedGroup[0].DeliveryID != first[0].DeliveryID ||
+		persistedGroup[1].DeliveryID != first[0].DeliveryID {
+		t.Fatalf("claimed identity was not persisted: %#v", persistedGroup)
+	}
+
+	r.Queue(contactID, MailMessage{From: "Hrishi", Via: "phone", Text: "three"})
+	retry := r.ClaimMailboxGroup(contactID)
+	if len(retry) != 2 || retry[0].DeliveryID != first[0].DeliveryID {
+		t.Fatalf("retry group expanded or changed identity: %#v", retry)
+	}
+	r.DropMailbox(contactID, retry)
+	next := r.ClaimMailboxGroup(contactID)
+	if len(next) != 1 || next[0].Text != "three" || next[0].DeliveryID == first[0].DeliveryID {
+		t.Fatalf("new mail did not form a fresh group: %#v", next)
+	}
+}
+
+func TestSemanticEventDedupSurvivesDaemonHistoryReload(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := ensureBridgeDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRegistry := registry
+	registry = &Registry{
+		contacts: map[string]*Contact{}, mailbox: map[string][]MailMessage{}, flushing: map[string]bool{},
+	}
+	const contactID = "event-dedup-contact"
+	registry.contacts[contactID] = &Contact{ID: contactID, Name: "wise-deer", Status: "live", Health: "working"}
+
+	eventsMu.Lock()
+	oldEvents, oldCounter, oldAppends := events, eventCounter, historyAppends
+	events, eventCounter, historyAppends = nil, 0, 0
+	eventsMu.Unlock()
+	t.Cleanup(func() {
+		registry = oldRegistry
+		eventsMu.Lock()
+		events, eventCounter, historyAppends = oldEvents, oldCounter, oldAppends
+		eventsMu.Unlock()
+	})
+
+	c := registry.Resolve(contactID)
+	event := SemanticEvent{ID: "semantic-event-1", Type: SemanticEventAgentMessage, Text: "only once"}
+	if !applySemanticEvent(c, event) {
+		t.Fatal("first semantic event was not accepted")
+	}
+	eventsMu.Lock()
+	events, eventCounter, historyAppends = nil, 0, 0
+	eventsMu.Unlock()
+	loadHistory() // simulate a fresh daemon restoring its durable receipt
+	if !applySemanticEvent(c, event) {
+		t.Fatal("retried semantic event was not accepted as an idempotent duplicate")
+	}
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	count := 0
+	for _, stored := range events {
+		if stored.SourceID == contactID+":"+event.ID {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("durable semantic event count = %d, want 1", count)
+	}
+}
+
 func TestSemanticEventPostingRetriesTransientFailure(t *testing.T) {
 	var posts atomic.Int32
+	postedIDs := make(chan string, 2)
 	installTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/local/transport/v2/events" {
-			t.Fatalf("unexpected daemon path %s", r.URL.Path)
+			t.Errorf("unexpected daemon path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req struct {
+			Events []SemanticEvent `json:"events"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Events) != 1 {
+			t.Errorf("decode semantic event post: %v (%d events)", err, len(req.Events))
+		} else {
+			postedIDs <- req.Events[0].ID
 		}
 		if posts.Add(1) == 1 {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -345,6 +586,10 @@ func TestSemanticEventPostingRetriesTransientFailure(t *testing.T) {
 	b.eventMu.Unlock()
 	if remaining != 0 || posts.Load() != 2 {
 		t.Fatalf("post retries=%d remaining=%d, want 2/0", posts.Load(), remaining)
+	}
+	firstID, secondID := <-postedIDs, <-postedIDs
+	if firstID == "" || secondID != firstID {
+		t.Fatalf("retried event ids = %q/%q, want one stable non-empty id", firstID, secondID)
 	}
 	cancel()
 	select {
@@ -439,6 +684,51 @@ func TestSemanticCompactParksTypedCommand(t *testing.T) {
 	}
 	if parked.Command.Text != "" || parked.Text != "" {
 		t.Fatalf("compact leaked literal input: %#v", parked)
+	}
+
+	remoteMu.Lock()
+	parked.acked = true
+	remoteRemoveParkedLocked(remoteLeases[token], parked.ID)
+	remoteMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV1MailboxDeliveryDoesNotExposeSemanticIdentity(t *testing.T) {
+	const contactID = "v1-delivery-contact"
+	const token = "v1-delivery-lease"
+	remoteMu.Lock()
+	remoteLeases[token] = &remoteLease{
+		token: token, protocol: 1, lastSeen: time.Now(),
+		agents: map[string]bool{contactID: true}, states: map[string]remoteState{},
+	}
+	remoteLeaseByContact[contactID] = token
+	remoteMu.Unlock()
+	defer func() {
+		remoteMu.Lock()
+		remoteDeleteLeaseLocked(token)
+		remoteMu.Unlock()
+	}()
+
+	c := &Contact{ID: contactID, Name: "v1-agent", Transport: "remote"}
+	done := make(chan error, 1)
+	go func() { done <- deliverMailboxGroup(c, "hello", "durable-semantic-id") }()
+
+	deadline := time.Now().Add(time.Second)
+	var parked *parkedDelivery
+	for parked == nil && time.Now().Before(deadline) {
+		remoteMu.Lock()
+		if lease := remoteLeases[token]; lease != nil && len(lease.outbox) > 0 {
+			parked = lease.outbox[0]
+		}
+		remoteMu.Unlock()
+		if parked == nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if parked == nil || parked.Text != "hello" || parked.Command != nil {
+		t.Fatalf("v1 parked delivery changed shape: %#v", parked)
 	}
 
 	remoteMu.Lock()

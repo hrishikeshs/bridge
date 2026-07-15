@@ -106,7 +106,8 @@ V2 replaces terminal text and keys with typed commands:
 
     GET /local/transport/v2/commands?lease=…&wait=25
     → { "commands": [
-          { "id":"…", "contact":"…", "type":"input", "text":"…" },
+          { "id":"…", "delivery_id":"…", "contact":"…",
+            "type":"input", "text":"…" },
           { "id":"…", "contact":"…", "type":"interrupt" },
           { "id":"…", "contact":"…", "type":"compact" },
           { "id":"…", "contact":"…", "type":"approval",
@@ -119,10 +120,10 @@ in force. A semantic client publishes normalized, user-visible output through:
 
     POST /local/transport/v2/events
     { "lease":"…", "events":[
-        { "contact":"…", "type":"agent_message", "text":"…" },
-        { "contact":"…", "type":"plan", "text":"…" },
-        { "contact":"…", "type":"status", "status":"working" },
-        { "contact":"…", "type":"approval_requested",
+        { "id":"…", "contact":"…", "type":"agent_message", "text":"…" },
+        { "id":"…", "contact":"…", "type":"plan", "text":"…" },
+        { "id":"…", "contact":"…", "type":"status", "status":"working" },
+        { "id":"…", "contact":"…", "type":"approval_requested",
           "request_id":"…", "approval_kind":"command", "reason":"…" }
       ] }
 
@@ -135,6 +136,14 @@ values as literal whitelisted keystrokes.
 Semantic events are ordered and retried across transient daemon outages. A 410
 from commands, events, attest, or acknowledgement spends the lease: the client
 re-hellos, resumes draining, and replays any unresolved structured approval.
+The daemon persists one `delivery_id` for each frozen mailbox group; the Codex
+client uses it as the execution receipt and, for input, as
+`clientUserMessageId`. Thus an acknowledged execution is not repeated when an
+old-lease acknowledgement fails and the same mail returns under a new wire id.
+Clients likewise assign a stable event `id` before their first post. Reply and
+plan events retain that source id in retained durable history, so a retry after
+a lost HTTP response or daemon restart does not create a second user-visible
+event.
 Only streaming delta notifications may be dropped under local queue pressure;
 completion, turn-lifecycle, and approval notifications are lossless.
 
@@ -143,6 +152,8 @@ thread and maps `input` to `turn/start` or `turn/steer`, `interrupt` to
 `turn/interrupt`, `compact` to `thread/compact/start`, and App Server messages,
 plan summaries, and approval requests back to semantic events. Command, file,
 and permission-profile approvals use their distinct App Server response shapes.
+For streamed agent messages, the final `item/completed` text is authoritative;
+buffered deltas are used only when the completion omits text.
 
 ## What does NOT change
 

@@ -210,7 +210,7 @@ func flushMailbox(c *Contact) {
 	}
 	defer registry.EndFlush(c.ID)
 	for {
-		group := registry.PeekMailboxGroup(c.ID)
+		group := registry.ClaimMailboxGroup(c.ID)
 		if len(group) == 0 {
 			return
 		}
@@ -241,10 +241,10 @@ func flushMailbox(c *Contact) {
 		text := strings.Join(parts, " ⏎ ")
 		if group[0].From != "" {
 			// The frame is authored once from group[0]; Room is part of the group
-			// key (PeekMailboxGroup), so every message in this run shares it.
+			// key (mailboxGroupEnd), so every message in this run shares it.
 			text = formatInbound(group[0].From, group[0].Via, group[0].Room, text)
 		}
-		if err := transportFor(c).Deliver(c, text); err != nil {
+		if err := deliverMailboxGroup(c, text, group[0].DeliveryID); err != nil {
 			return // leave the group (and the rest) queued for the next flush
 		}
 		for _, m := range group {
