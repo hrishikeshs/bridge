@@ -28,7 +28,7 @@ import {
   WALLPAPERS, WALLPAPER_NAMES, currentWallpaper, setWallpaper,
   paletteFollowsSun, setPaletteSun,
 } from './appearance.js';
-import { updatePushButton, requestNotifyPermission } from './notifications.js';
+import { updatePushButton, setPushEnabled, pushUserOff } from './notifications.js';
 
 // The gear opens a slide-up sheet: a theme picker (applies + persists on tap)
 // and the notification control (state + enable flow, relocated from the gear).
@@ -57,7 +57,11 @@ document.getElementById('settings-btn').addEventListener('click', openSettings);
 document.getElementById('settings-close').addEventListener('click', closeSettings);
 document.getElementById('settings-backdrop').addEventListener('click', closeSettings);
 document.getElementById('notif-row').addEventListener('click', async () => {
-  await requestNotifyPermission();
+  // The row is a real switch now: flip to the opposite of the current state.
+  // From 'default' permission the ON direction runs the iOS permission prompt
+  // (which requires a user tap — this click is exactly that tap).
+  const granted = ('Notification' in window) && Notification.permission === 'granted';
+  await setPushEnabled(!(granted && !pushUserOff()));
   updatePushButton();
   renderNotifState();
 });
@@ -194,24 +198,45 @@ function renderThemeOptions() {
   }
 }
 
+// The notifications row is a live switch (was: enable-once, then inert — the
+// one-way flow meant "On" could never become "Off" again). Two states stay
+// text-only and disabled because JS genuinely cannot act on them: no push
+// support, and an OS-level denial (only iOS Settings can undo that). The
+// switch itself mirrors renderPaletteSun's toggle markup.
 function renderNotifState() {
   const el = $('notif-state');
   const row = /** @type {HTMLButtonElement} */ ($('notif-row'));
   const supported = 'Notification' in window &&
     'serviceWorker' in navigator && 'PushManager' in window;
+  const oldToggle = row.querySelector('.toggle');
+  if (oldToggle) oldToggle.remove();
+  row.classList.remove('toggle-row');
+  row.removeAttribute('role');
+  row.removeAttribute('aria-checked');
   if (!supported) {
     el.textContent = 'Notifications · not supported here';
     row.disabled = true;
-  } else if (Notification.permission === 'granted') {
-    el.textContent = 'Notifications · On';
-    row.disabled = true;
-  } else if (Notification.permission === 'denied') {
+    return;
+  }
+  if (Notification.permission === 'denied') {
     el.textContent = 'Notifications · blocked in iOS Settings';
     row.disabled = true;
-  } else {
-    el.textContent = 'Notifications · tap to enable';
-    row.disabled = false;
+    return;
   }
+  // 'granted' and 'default' both render the switch: ON = granted and not
+  // user-disabled; tapping ON from 'default' runs the permission prompt.
+  const on = Notification.permission === 'granted' && !pushUserOff();
+  el.textContent = 'Notifications';
+  row.disabled = false;
+  row.classList.add('toggle-row');
+  row.setAttribute('role', 'switch');
+  row.setAttribute('aria-checked', on ? 'true' : 'false');
+  const sw = document.createElement('span');
+  sw.className = on ? 'toggle on' : 'toggle';
+  const knob = document.createElement('span');
+  knob.className = 'toggle-knob';
+  sw.appendChild(knob);
+  row.appendChild(sw);
 }
 
 // The subtle "You: <status>" line under the list header — your own away line,

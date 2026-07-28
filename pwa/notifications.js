@@ -43,15 +43,25 @@ export async function clearDeliveredNotifications() {
 // defined, so every push error path (incl. the catch) threw a ReferenceError.
 const pushDebug = (m) => console.debug('[push]', m);
 
+/* The user's own switch, persisted: '1' = notifications turned OFF on this
+   phone from the settings sheet. The OS permission stays granted — JS has no
+   way to hand a granted permission back — so "off" is an app-level choice:
+   unsubscribe now AND gate every auto-(re)subscribe path until turned back on.
+   Without the gate, the next app open would silently re-enable (line below:
+   enablePush runs on every load once granted). */
+const PUSH_OFF_KEY = 'push-off';
+export function pushUserOff() { return localStorage.getItem(PUSH_OFF_KEY) === '1'; }
+
 // Show the enable-notifications button whenever push is supported but not yet
 // granted+subscribed. iOS requires the permission prompt to come from a tap.
+// A user who turned notifications OFF in settings is not nagged by the banner.
 export function updatePushButton() {
   const btn = $('enable-push');
   if (!btn) return;
   const supported = 'Notification' in window && 'serviceWorker' in navigator && 'PushManager' in window;
   const granted = supported && Notification.permission === 'granted';
-  btn.classList.toggle('hidden', !supported || granted);
-  if (granted) enablePush();   // already allowed on a prior visit: (re)subscribe
+  btn.classList.toggle('hidden', !supported || granted || pushUserOff());
+  if (granted && !pushUserOff()) enablePush();   // already allowed on a prior visit: (re)subscribe
 }
 
 // Wired at import time (same startup point as in app.js). This runs while the
@@ -70,6 +80,34 @@ export async function requestNotifyPermission() {
     await Notification.requestPermission().catch(() => {});
   }
   if (Notification.permission === 'granted') enablePush();
+}
+
+/* The settings toggle's two directions. ON clears the off-flag first (so the
+   subscribe paths are un-gated), then walks the normal permission flow — from
+   'default' that shows the iOS prompt, which must come from a tap. OFF records
+   the choice, silences the daemon first (an orphaned endpoint would otherwise
+   only die by a later 410), then releases the browser-side subscription. Both
+   halves of OFF are best-effort and independently recoverable: a failed POST is
+   healed by the daemon's 410 pruning; a failed local unsubscribe is harmless
+   because the daemon no longer knows the endpoint. */
+/** @param {boolean} on */
+export async function setPushEnabled(on) {
+  if (on) {
+    localStorage.removeItem(PUSH_OFF_KEY);
+    await requestNotifyPermission();
+    return;
+  }
+  localStorage.setItem(PUSH_OFF_KEY, '1');
+  try {
+    await fetch('/api/push/unsubscribe', { method: 'POST' });
+  } catch (e) { pushDebug('unsubscribe POST failed (offline?) — daemon prunes on 410 later'); }
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) await sub.unsubscribe();
+    }
+  } catch (e) { pushDebug('local unsubscribe failed: ' + (e && e.message ? e.message : e)); }
 }
 
 /* Subscribe this device to Web Push so the daemon can ring it with the app

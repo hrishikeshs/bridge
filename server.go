@@ -215,6 +215,8 @@ func route(w http.ResponseWriter, r *http.Request) {
 		handlePushKey(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/push/subscribe":
 		handlePushSubscribe(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/push/unsubscribe":
+		handlePushUnsubscribe(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not-found"})
 	}

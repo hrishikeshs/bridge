@@ -215,6 +215,25 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handlePushUnsubscribe drops THIS device's subscription (keyed by its token).
+// The PWA's notifications toggle calls it so "off" silences the daemon side
+// immediately instead of waiting for Apple to 410 a dead endpoint. Idempotent:
+// a device with nothing stored still gets ok — the goal state already holds.
+func handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	token := requestToken(r)
+	pushMu.Lock()
+	sub := pushSubs[token]
+	delete(pushSubs, token)
+	pushMu.Unlock()
+	savePushSubs()
+	// Mirror handlePushSubscribe: audit only real changes so the log stays a
+	// signal (the toggle can be tapped twice; the second tap removed nothing).
+	if sub != nil {
+		audit("push-unsubscribed", sub.Endpoint, "-")
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // pushPayload is the notification shape the service worker renders.
 type pushPayload struct {
 	Title   string `json:"title"`
