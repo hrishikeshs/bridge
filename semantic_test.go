@@ -533,6 +533,131 @@ func TestSemanticEventDedupSurvivesDaemonHistoryReload(t *testing.T) {
 	}
 }
 
+func TestSemanticTerminalStatusRetryAfterAmbiguousResponseIsIdempotent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := ensureBridgeDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRegistry := registry
+	registry = &Registry{
+		contacts: map[string]*Contact{}, mailbox: map[string][]MailMessage{}, flushing: map[string]bool{},
+	}
+	const contactID = "status-dedup-contact"
+	registry.contacts[contactID] = &Contact{ID: contactID, Name: "wise-deer", Status: "live", Health: "working"}
+
+	eventsMu.Lock()
+	oldEvents, oldCounter, oldAppends := events, eventCounter, historyAppends
+	events, eventCounter, historyAppends = nil, 0, 0
+	eventsMu.Unlock()
+	t.Cleanup(func() {
+		registry = oldRegistry
+		eventsMu.Lock()
+		events, eventCounter, historyAppends = oldEvents, oldCounter, oldAppends
+		eventsMu.Unlock()
+	})
+
+	c := registry.Resolve(contactID)
+	for _, status := range []string{"interrupted", "failed", "declined"} {
+		event := SemanticEvent{
+			ID: "status-" + status, Type: SemanticEventStatus, Status: status,
+		}
+		if !applySemanticEvent(c, event) {
+			t.Fatalf("first %s status was not accepted", status)
+		}
+		// Model the ambiguous-response boundary: the daemon applied the event,
+		// but the client did not receive the response and retried the same ID.
+		if !applySemanticEvent(c, event) {
+			t.Fatalf("retried %s status was not accepted", status)
+		}
+	}
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	if len(events) != 3 {
+		t.Fatalf("durable status events = %d, want 3", len(events))
+	}
+	for _, status := range []string{"interrupted", "failed", "declined"} {
+		sourceID := contactID + ":status-" + status
+		count := 0
+		for _, stored := range events {
+			if stored.SourceID == sourceID {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("%s durable event count = %d, want 1", status, count)
+		}
+	}
+}
+
+func TestSemanticEventsRejectContactOutsideLease(t *testing.T) {
+	oldRegistry := registry
+	registry = &Registry{
+		contacts: map[string]*Contact{}, mailbox: map[string][]MailMessage{}, flushing: map[string]bool{},
+	}
+	const (
+		hostedID   = "hosted-semantic-contact"
+		unhostedID = "unhosted-semantic-contact"
+		token      = "forging-guard-lease"
+	)
+	registry.contacts[hostedID] = &Contact{ID: hostedID, Name: "wise-deer", Status: "live", Health: "working"}
+	registry.contacts[unhostedID] = &Contact{ID: unhostedID, Name: "other-agent", Status: "live", Health: "working"}
+	t.Cleanup(func() { registry = oldRegistry })
+
+	remoteMu.Lock()
+	remoteLeases[token] = &remoteLease{
+		token: token, protocol: 2, lastSeen: time.Now(),
+		agents: map[string]bool{hostedID: true}, states: map[string]remoteState{},
+	}
+	remoteLeaseByContact[hostedID] = token
+	remoteMu.Unlock()
+	t.Cleanup(func() {
+		remoteMu.Lock()
+		remoteDeleteLeaseLocked(token)
+		remoteMu.Unlock()
+	})
+
+	eventsMu.Lock()
+	before := eventCounter
+	eventsMu.Unlock()
+	body := bytes.NewBufferString(`{
+		"lease":"forging-guard-lease",
+		"events":[{
+			"id":"forged-event",
+			"contact":"unhosted-semantic-contact",
+			"type":"agent_message",
+			"text":"pretend I came from another agent"
+		}]
+	}`)
+	recorder := httptest.NewRecorder()
+	handleTransportEvents(
+		recorder,
+		httptest.NewRequest(http.MethodPost, "/local/transport/v2/events", body),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("event post status = %d, want 200", recorder.Code)
+	}
+	var response struct {
+		Accepted int `json:"accepted"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Accepted != 0 {
+		t.Fatalf("forged event accepted count = %d, want 0", response.Accepted)
+	}
+	eventsMu.Lock()
+	after := eventCounter
+	eventsMu.Unlock()
+	if after != before {
+		t.Fatalf("forged event advanced history from %d to %d", before, after)
+	}
+	if got := registry.Resolve(unhostedID).Health; got != "working" {
+		t.Fatalf("forged event changed unhosted contact health to %q", got)
+	}
+}
+
 func TestSemanticEventPostingRetriesTransientFailure(t *testing.T) {
 	var posts atomic.Int32
 	postedIDs := make(chan string, 2)

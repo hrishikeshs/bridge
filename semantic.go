@@ -160,6 +160,9 @@ func handleTransportEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	remoteMu.Unlock()
 
+	// The local-token threat model trusts same-machine client pacing, and the
+	// reference client serializes posts. The batch cap above still bounds the
+	// work admitted by any one request.
 	accepted := 0
 	for _, ev := range req.Events {
 		if !hosted[ev.Contact] {
@@ -199,7 +202,10 @@ func applySemanticEvent(c *Contact, ev SemanticEvent) bool {
 			registry.SetHealth(c.ID, "ok")
 		case "interrupted", "failed", "declined":
 			registry.SetHealth(c.ID, "ok")
-			Emit("agent-status", c.ID, c.Name, ev.Status)
+			emitEventOnce(Event{
+				Type: "agent-status", Agent: c.ID, Name: c.Name, Text: ev.Status,
+				SourceID: semanticEventSourceID(c.ID, ev.ID),
+			})
 		default:
 			return false
 		}
