@@ -51,6 +51,7 @@ func startSessionManager() {
 						break
 					}
 					delete(aliveStrikes, c.ID)
+					clearSemanticApproval(c.ID)
 					registry.SetOffline(c.ID)
 					Emit("attention-clear", c.ID, c.Name, "")
 					clearAttnPush(c.ID, c.Name)
@@ -146,6 +147,14 @@ var promptStrikes = map[string]int{}
 // dialog still painting.
 func verifyPrompt(c *Contact) {
 	if !c.PromptOpen {
+		delete(promptStrikes, c.ID)
+		return
+	}
+	// A semantic prompt has no terminal screen to scrape. Its structured
+	// approval_requested event is the source of truth and only the matching
+	// approval_resolved event may clear it. Applying the terminal two-miss rule
+	// here erased valid Codex cards after roughly four seconds.
+	if semanticApprovalPending(c.ID) {
 		delete(promptStrikes, c.ID)
 		return
 	}

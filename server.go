@@ -203,6 +203,8 @@ func route(w http.ResponseWriter, r *http.Request) {
 		handleReact(w, r, id)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/approve":
 		handleApprove(w, r, id)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v2/approve":
+		handleSemanticApprove(w, r, id)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/compact":
 		handleCompact(w, r, id)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/interrupt":

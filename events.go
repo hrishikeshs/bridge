@@ -35,6 +35,10 @@ type Event struct {
 	// the PWA can dedup its optimistic local echo by id rather than by text
 	// (M5). Empty (and omitted) for every server-originated event.
 	ClientID string `json:"client_id,omitempty"`
+	// SourceID is the stable id of a retryable semantic-transport event. It is
+	// stored in ordinary durable history so a daemon restart can recognize that
+	// an already-visible reply/plan is a retry, not a second phone bubble.
+	SourceID string `json:"source_id,omitempty"`
 	// Target is the id of the event a "reaction" decorates (0/omitted on every
 	// other type), so the phone can fold an emoji onto the bubble it points at.
 	Target int64 `json:"target,omitempty"`
@@ -119,7 +123,24 @@ func Emit(typ, agent, name, text string, clientID ...string) Event {
 // assignment, durable append and broadcast keep living in exactly one place. The
 // caller leaves ID and TS zero; both are stamped here under eventsMu.
 func emitEvent(ev Event) Event {
+	stored, _ := emitEventOnce(ev)
+	return stored
+}
+
+// emitEventOnce files ev unless its non-empty SourceID is already present in
+// durable history. The duplicate check and in-memory append share eventsMu;
+// disk append completes before broadcast, so every user-visible semantic event
+// has a persisted receipt before a client can observe it.
+func emitEventOnce(ev Event) (Event, bool) {
 	eventsMu.Lock()
+	if ev.SourceID != "" {
+		for _, existing := range events {
+			if existing.SourceID == ev.SourceID {
+				eventsMu.Unlock()
+				return existing, false
+			}
+		}
+	}
 	eventCounter++
 	ev.ID = eventCounter
 	ev.TS = nowUTC()
@@ -139,7 +160,7 @@ func emitEvent(ev Event) Event {
 		historyWriteMu.Unlock()
 		eventsMu.Unlock()
 		broadcast(frameFor(ev))
-		return ev
+		return ev, true
 	}
 	eventsMu.Unlock()
 
@@ -155,7 +176,7 @@ func emitEvent(ev Event) Event {
 	historyWriteMu.Unlock()
 
 	broadcast(frameFor(ev))
-	return ev
+	return ev, true
 }
 
 // EmitTyping broadcasts an ephemeral typing indicator for a contact. Transient
