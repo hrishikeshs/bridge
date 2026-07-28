@@ -140,10 +140,10 @@ The daemon persists one `delivery_id` for each frozen mailbox group; the Codex
 client uses it as the execution receipt and, for input, as
 `clientUserMessageId`. Thus an acknowledged execution is not repeated when an
 old-lease acknowledgement fails and the same mail returns under a new wire id.
-Clients likewise assign a stable event `id` before their first post. Reply and
-plan events retain that source id in retained durable history, so a retry after
-a lost HTTP response or daemon restart does not create a second user-visible
-event.
+Clients likewise assign a stable event `id` before their first post. Reply,
+plan, and terminal status events retain that source id in retained durable
+history, so a retry after a lost HTTP response or daemon restart does not
+create a second user-visible event.
 Only streaming delta notifications may be dropped under local queue pressure;
 completion, turn-lifecycle, and approval notifications are lossless.
 

@@ -37,7 +37,7 @@ type Event struct {
 	ClientID string `json:"client_id,omitempty"`
 	// SourceID is the stable id of a retryable semantic-transport event. It is
 	// stored in ordinary durable history so a daemon restart can recognize that
-	// an already-visible reply/plan is a retry, not a second phone bubble.
+	// already-visible semantic output is a retry, not a second phone bubble.
 	SourceID string `json:"source_id,omitempty"`
 	// Target is the id of the event a "reaction" decorates (0/omitted on every
 	// other type), so the phone can fold an emoji onto the bubble it points at.
