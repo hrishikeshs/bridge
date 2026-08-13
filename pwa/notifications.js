@@ -61,7 +61,27 @@ export function updatePushButton() {
   const supported = 'Notification' in window && 'serviceWorker' in navigator && 'PushManager' in window;
   const granted = supported && Notification.permission === 'granted';
   btn.classList.toggle('hidden', !supported || granted || pushUserOff());
+  if (granted && pushUserOff()) reconcilePushOff();   // heal any leaked subscription
   if (granted && !pushUserOff()) enablePush();   // already allowed on a prior visit: (re)subscribe
+}
+
+/* OFF but subscribed = a leak (found live, 2026-08-13: sendMessage()'s
+   requestNotifyPermission() call re-subscribed a toggled-off phone on every
+   send — four toggle-offs in a row silently undone, one per app use). The
+   flag is the INTENT; on every open the subscription state converges to it:
+   tear down anything that slipped through, daemon first, then the browser. */
+async function reconcilePushOff() {
+  try {
+    if (!('serviceWorker' in navigator)) return;
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (!sub) return;
+    try {
+      await fetch('/api/push/unsubscribe', { method: 'POST' });
+    } catch (e) { pushDebug('reconcile POST failed (offline?) — daemon prunes on 410 later'); }
+    await sub.unsubscribe();
+    pushDebug('reconciled: leaked subscription removed');
+  } catch (e) { pushDebug('reconcile failed: ' + (e && e.message ? e.message : e)); }
 }
 
 // Wired at import time (same startup point as in app.js). This runs while the
@@ -111,9 +131,16 @@ export async function setPushEnabled(on) {
 }
 
 /* Subscribe this device to Web Push so the daemon can ring it with the app
-   closed. Idempotent — safe to call on every load once permission is granted. */
+   closed. Idempotent — safe to call on every load once permission is granted.
+   The user-off gate lives HERE, at the choke point, not at the callers: the
+   spine calls requestNotifyPermission() on every message send (app.js), and
+   guarding only some callers is how the 2026-08-13 leak shipped — a send
+   while toggled-off quietly re-subscribed the phone. Every subscribe path
+   funnels through this check by construction (setPushEnabled(true) clears
+   the flag BEFORE walking the permission flow, so the ON path passes). */
 async function enablePush() {
   try {
+    if (pushUserOff()) { pushDebug('push is OFF by user choice'); return; }
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) { return;
     }
     if (Notification.permission !== 'granted') { pushDebug('not granted'); return; }
