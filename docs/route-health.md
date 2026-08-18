@@ -149,3 +149,86 @@ unretirable forever — a stale-after-N-minutes rule would have let us
 self-serve."* This doc is that insight generalized to the whole silence class.
 The sharper *delivering-but-unconfirmed — two bugs, one detector* framing is also
 quick-wolf's, July 8, from the bold-wren survey-gag.
+
+---
+
+# L2 — self-heal (August revision; drafted Aug 18 2026, Vint)
+
+Status: **draft for Hrishi's yes/no.** L1 shipped July 8 and has been honest ever
+since — the phone shows amber, the escalations fire. L2 exists because honesty
+without hands turned out to be a vigil: the alarm rings a room that is,
+correctly and by design, empty.
+
+## The evidence (six freezes, one silent multiplier)
+
+| when | who | dialog | stuck | how it ended |
+|---|---|---|---|---|
+| Jul 19 | marvin | permission (his own memory edit) | 38h | reboot killed it (edit LOST) |
+| Aug 4–7 | professor | permission (his own memory edit) | ~71h | self-cleared in a gap |
+| Aug 10 | lucius | permission | 11h | phone-approve |
+| Aug 11–14 | quick-wren | permission ×4 | up to 6h | phone-approve / Emacs-side |
+| Aug 13–? | ludwig+marvin+professor | **resume-class** ("Resume from summary (recommended)") | **120h+ and counting** | — |
+| Aug 15–? | quick-wolf | (Emacs-side) ×2 cycles | 29h+ | — |
+
+The multiplier: since Aug 13 the phone has been *correctly* unsubscribed (the
+notifications toggle, working as fixed) — so ~500 escalations pushed to **zero
+devices**. The toggle's success made the trap silent. Alarms need either ears
+or hands; L2 is the hands.
+
+## Mechanism 1 — dialog-class policy (the hands)
+
+The daemon already attests dialog frames (looksLikePrompt / dialogFrameRe).
+L2 classifies the attested tail into three classes with a compile-time
+allowlist of patterns — same posture as every typed key in this daemon
+(H9: constants only, never request-supplied text):
+
+- **resume-class** (benign, self-referential, carries a "(recommended)"
+  option; e.g. CC's "Resume from summary"): after `grace_resume` (default
+  30m) unanswered, the daemon types the RECOMMENDED option via the existing
+  whitelisted-key path and audits `auto-resolve <agent> resume-class -> 1`.
+  Rationale: the recommended default is what the human presses 100% of the
+  time (observed n=everyone); five days of frozen crew is a worse outcome
+  than any resume mode.
+- **permission-class** (an action wants approval): NEVER auto-approved,
+  ever, under any timeout. After `grace_perm` (default 2h) unanswered, the
+  daemon types the DECLINE option (Hrishi's July-9 rule: "get past the stuck
+  prompt by always selecting no") and audits `auto-resolve <agent>
+  permission-class -> decline`. The agent unwedges, sees the denial, adapts,
+  and re-asks when a human is around. The action is refused, not lost.
+- **unknown-class** (anything the allowlist doesn't match): no keys, ever.
+  Escalation only. Unknown dialogs are where the H9 monsters would live.
+
+Auto-resolve is OFF per-contact until Hrishi enables it (a `self_heal` flag
+in config; default on for the crew he names, off for guests).
+
+## Mechanism 2 — escalation cap + decay
+
+Per freeze: pushes at +5m, +35m, +2h, then once per 24h — capped, with the
+suppressed count carried in the held-chip ("held 3d · 4 alarms, 138
+suppressed"). A firehose into a void is not more honest than a bell that
+rings four times and keeps count.
+
+## Mechanism 3 — zero-subscriber honesty (folds in #36)
+
+`sendPush` with no subscribers currently evaporates silently. L2: audit
+`push-skipped no-subscribers (n=N)` (one line per freeze, counted, not per
+attempt), and on the next PWA open surface a one-time banner: "while
+notifications were off: N alarms found no device." The void becomes a
+number. (#36's failed-push logging rides the same patch.)
+
+## Non-goals, restated for the record
+
+No raw shell. No auto-approve of any permission, at any timeout, for any
+agent. No keys typed from request-supplied text — the allowlist and the
+typed answers are compile-time constants. Unknown dialogs are sacred:
+escalate, never touch.
+
+## Open questions (for Hrishi)
+
+1. `grace_resume` = 30m and `grace_perm` = 2h — right defaults?
+2. Auto-resolve enablement: per-contact allowlist in config, or one global
+   switch? (I lean per-contact.)
+3. Should a resume-class auto-resolve ALSO notify once ("auto-resumed ludwig
+   after 30m"), or stay silent-but-audited? (I lean notify-once — it's an
+   action taken on his behalf.)
+4. L3 (route probes / corpse detection) stays deferred — agreed?
