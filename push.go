@@ -22,32 +22,69 @@ import (
 
 // vapidKeys is this daemon's application-server keypair (persisted 0600).
 type vapidKeys struct {
-	Public  string `json:"public"`
-	Private string `json:"private"`
+	Public     string `json:"public"`
+	Private    string `json:"private"`
+	Generation uint64 `json:"generation"`
 }
 
+// Generations cross the wire as JSON numbers and are ordered by JavaScript in
+// the service worker, so stop before integer precision could become ambiguous.
+const maxDaemonGeneration = uint64(1<<53 - 1)
+
 var (
-	vapid     vapidKeys
-	pushMu    sync.Mutex
-	pushSubs  = map[string]*webpush.Subscription{} // device token -> subscription
-	vapidPath = func() string { return bridgePath("vapid.json") }
-	subsPath  = func() string { return bridgePath("push-subs.json") }
+	vapid vapidKeys
+	// daemonGeneration is a durable, monotonic boot counter. Random daemonEpoch
+	// proves equality to the open PWA; this counter additionally lets the
+	// service worker order delayed Web Push deliveries across daemon restarts.
+	daemonGeneration uint64
+	pushMu           sync.Mutex
+	pushSubs         = map[string]*webpush.Subscription{} // device token -> subscription
+	vapidPath        = func() string { return bridgePath("vapid.json") }
+	subsPath         = func() string { return bridgePath("push-subs.json") }
+	writeVAPIDState  = writeFilePrivateDurable
 )
 
-// loadVAPID loads the VAPID keypair, generating one on first run.
+// loadVAPID loads the VAPID keypair, generating one on first run, and claims a
+// durable generation for this successfully bound daemon boot. The generation
+// is persisted before push is enabled: reusing an old number after a failed
+// write could let delayed notifications overwrite the new daemon's state.
 func loadVAPID() error {
-	if data, err := os.ReadFile(vapidPath()); err == nil {
-		if json.Unmarshal(data, &vapid) == nil && vapid.Public != "" {
-			return nil
+	// Fail closed on every unsuccessful load. Tests may call this repeatedly in
+	// one process; production gets the same invariant if persisted state breaks.
+	vapid = vapidKeys{}
+	daemonGeneration = 0
+	var next vapidKeys
+	data, err := os.ReadFile(vapidPath())
+	switch {
+	case err == nil:
+		if json.Unmarshal(data, &next) != nil || next.Public == "" || next.Private == "" {
+			return fmt.Errorf("invalid VAPID state")
 		}
+	case os.IsNotExist(err):
+		priv, pub, genErr := webpush.GenerateVAPIDKeys()
+		if genErr != nil {
+			return genErr
+		}
+		next = vapidKeys{Public: pub, Private: priv}
+	default:
+		return err
 	}
-	priv, pub, err := webpush.GenerateVAPIDKeys()
+	if next.Generation >= maxDaemonGeneration {
+		return fmt.Errorf("VAPID generation exhausted")
+	}
+	next.Generation++
+	data, err = json.Marshal(next)
 	if err != nil {
 		return err
 	}
-	vapid = vapidKeys{Public: pub, Private: priv}
-	data, _ := json.Marshal(vapid)
-	return writeFilePrivate(vapidPath(), data)
+	if err = writeVAPIDState(vapidPath(), data); err != nil {
+		vapid = vapidKeys{}
+		daemonGeneration = 0
+		return err
+	}
+	vapid = next
+	daemonGeneration = next.Generation
+	return nil
 }
 
 // loadPushSubs restores stored push subscriptions.
@@ -236,14 +273,24 @@ func handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 
 // pushPayload is the notification shape the service worker renders.
 type pushPayload struct {
-	Title   string `json:"title"`
-	Body    string `json:"body"`
-	Tag     string `json:"tag,omitempty"`
-	Contact string `json:"contact,omitempty"` // deep-link target on tap
+	Title            string `json:"title"`
+	Body             string `json:"body"`
+	Tag              string `json:"tag,omitempty"`
+	Contact          string `json:"contact,omitempty"` // deep-link target on tap
+	ServerEpoch      string `json:"server_epoch,omitempty"`
+	ServerGeneration uint64 `json:"server_generation,omitempty"`
 	// Seq orders same-tag pushes: Web Push has no delivery-order guarantee, so
 	// the service worker drops any push older than what the tag already shows —
 	// a stale "✓ handled" can no longer replace a fresh "needs you" (round 2).
 	Seq int64 `json:"seq,omitempty"`
+}
+
+// stampPushPayload centralizes generation metadata so a new notification call
+// site cannot accidentally bypass restart ordering.
+func stampPushPayload(p pushPayload) pushPayload {
+	p.ServerEpoch = daemonEpoch
+	p.ServerGeneration = daemonGeneration
+	return p
 }
 
 // sendPush delivers one notification to every subscribed device. Dead
@@ -252,6 +299,7 @@ func sendPush(p pushPayload) (int, error) {
 	if vapid.Public == "" {
 		return 0, fmt.Errorf("no VAPID keys")
 	}
+	p = stampPushPayload(p)
 	body, _ := json.Marshal(p)
 	pushMu.Lock()
 	subs := make(map[string]*webpush.Subscription, len(pushSubs))

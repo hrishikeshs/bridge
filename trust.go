@@ -81,6 +81,58 @@ func writeFilePrivate(path string, data []byte) error {
 	return nil
 }
 
+// writeFilePrivateDurable is the power-loss-safe form of writeFilePrivate.
+// Use it for monotonic state whose rollback would violate a protocol invariant:
+// syncing the temp file makes its contents durable before rename, and syncing
+// the parent directory commits that rename before the caller acts on it.
+func writeFilePrivateDurable(path string, data []byte) error {
+	if err := ensureBridgeDir(); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		cleanup()
+		return err
+	}
+	if n, err := f.Write(data); err != nil {
+		cleanup()
+		return err
+	} else if n != len(data) {
+		cleanup()
+		return fmt.Errorf("short write: wrote %d of %d bytes", n, len(data))
+	}
+	if err := f.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
 // randomHex returns n cryptographically random bytes as a hex string.
 func randomHex(n int) string {
 	b := make([]byte, n)

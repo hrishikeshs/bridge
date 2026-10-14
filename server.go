@@ -102,6 +102,7 @@ func runServe(port int) error {
 	loadTails()    // restore per-contact tail offsets so a restart resumes, not skips (4b)
 
 	daemonStartUnix = timeNowUnix() // exposed on /api/status; anchors the wake watchdog
+	daemonEpoch = randomHex(16)     // generation token for PWA cache continuity
 
 	// Bind the port BEFORE claiming the lockfile (review H4). If another daemon
 	// already owns the port, fail here having touched nothing — so a stray
@@ -124,13 +125,15 @@ func runServe(port int) error {
 	defer removeOwnLockfile(localToken)
 
 	loadPaperState() // The Bridge Herald remembers its last edition (paper.go)
-	startHeartbeat()
-	startSessionManager() // reconcile.go: tail loops + liveness
 	if err := loadVAPID(); err != nil {
 		fmt.Printf("(push disabled: %v)\n", err)
 	}
 	loadPushSubs()
-	initPlugins() // hook runtime: docs/plugins.md
+	// Push identity/generation must be ready before reconciliation can emit a
+	// notification; otherwise the first post-boot prompt could escape unstamped.
+	startHeartbeat()
+	startSessionManager() // reconcile.go: tail loops + liveness
+	initPlugins()         // hook runtime: docs/plugins.md
 
 	srv := &http.Server{Handler: http.HandlerFunc(route)}
 
@@ -193,6 +196,13 @@ func route(w http.ResponseWriter, r *http.Request) {
 		handleEvents(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/status":
 		handleStatus(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/sync":
+		handleSync(w, r)
+	case generationBoundMutation(r) && !requestEpochMatches(r):
+		// New PWA mutations carry the epoch of the replica that authored them.
+		// Refuse a stale action after a daemon restart; additive/optional means
+		// existing API clients that send no epoch keep their old behaviour.
+		writeJSON(w, http.StatusPreconditionFailed, map[string]string{"error": "server-restarted"})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/mystatus":
 		handleMyStatus(w, r, id)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/history":
@@ -222,10 +232,36 @@ func route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// requestEpochMatches reports whether a generation-bound request belongs to
+// this daemon process. An absent header is the backwards-compatible v1 path.
+func requestEpochMatches(r *http.Request) bool {
+	expected := r.Header.Get("X-Bridge-Server-Epoch")
+	return expected == "" || expected == daemonEpoch
+}
+
+// generationBoundMutation identifies actions authored from the PWA's current
+// roster/event replica. Pairing and push-subscription maintenance are durable
+// device setup, not actions against a particular daemon generation.
+func generationBoundMutation(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	switch r.URL.Path {
+	case "/api/mystatus", "/api/send", "/api/react", "/api/approve",
+		"/api/v2/approve", "/api/compact", "/api/interrupt", "/api/upload":
+		return true
+	default:
+		return false
+	}
+}
+
 // writeJSON sends v as a no-store JSON response with the given status.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
+	if daemonEpoch != "" {
+		w.Header().Set("X-Bridge-Server-Epoch", daemonEpoch)
+	}
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }

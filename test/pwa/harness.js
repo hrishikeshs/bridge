@@ -7,7 +7,7 @@
    every browser API the app touches replaced by a controllable fake, then hands
    tests a driver they can steer through the app's real seams:
 
-     - a fake `fetch`      → canned /api/status & /api/history, a call log for
+     - a fake `fetch`      → canned /api/sync snapshots, a call log for
                              POST bodies, and per-path programmable responses
      - a fake `EventSource`→ tests inject SSE frames (attention/reply/hb/…)
      - a fake clock        → deterministic setTimeout/setInterval/Date.now/rAF
@@ -82,7 +82,8 @@ function injectApp(win) {
    Contacts carry: id, name, directory, status ("live"|"offline"),
    health ("ok"|"working"|"prompt"|"offline"), attention (bool), away,
    fields, transport, transport_flavor, context_pct. Rooms: id, name.
-   The status wrapper carries contacts, rooms, my_status, started, now. */
+   The status wrapper carries contacts, rooms, my_status, started,
+   server_epoch, server_generation, now. */
 function defaultStatus() {
   return {
     contacts: [
@@ -95,6 +96,8 @@ function defaultStatus() {
     version: 'test',
     now: 1720000000,
     started: 1720000000,
+    server_epoch: 'epoch-default',
+    server_generation: 1,
   };
 }
 
@@ -213,12 +216,18 @@ function toResponse(spec) {
   if (spec && typeof spec.json === 'function') return spec; // already response-like
   const status = (spec && spec.status) || 200;
   const body = spec ? spec.body : { ok: true };
+  const responseHeaders = (spec && spec.headers) || {};
   return {
     ok: status >= 200 && status < 300,
     status,
     async json() { return body; },
     async text() { return JSON.stringify(body); },
-    headers: { get() { return null; } },
+    headers: {
+      get(name) {
+        const key = Object.keys(responseHeaders).find((k) => k.toLowerCase() === String(name).toLowerCase());
+        return key ? responseHeaders[key] : null;
+      },
+    },
   };
 }
 function makeFetch(harness) {
@@ -232,9 +241,9 @@ function makeFetch(harness) {
 
     const h = harness.handlers[p];
     let spec;
-    if (typeof h === 'function') spec = h(call);
+    if (typeof h === 'function') spec = await h(call);
     else if (h) spec = h;
-    else spec = harness.defaultResponse(p, call);
+    else spec = await harness.defaultResponse(p, call);
     return toResponse(spec);
   };
 }
@@ -247,20 +256,29 @@ function installNotification(win, permission) {
   win.Notification = Notification;
 }
 
-function installServiceWorker(win) {
+function installServiceWorker(win, harness) {
+  const listeners = Object.create(null);
+  const postMessage = (data) => { harness.swMessages.push(data); };
   const registration = {
     getNotifications: async () => [],
     showNotification: async () => {},
+    active: { postMessage },
     pushManager: {
       getSubscription: async () => null,
       subscribe: async () => ({ endpoint: 'https://push.test/x', keys: {}, toJSON() { return { endpoint: 'https://push.test/x' }; } }),
     },
   };
   const sw = {
+    controller: { postMessage },
     register: async () => registration,
-    addEventListener: () => {},
+    addEventListener(type, fn) {
+      (listeners[type] || (listeners[type] = [])).push(fn);
+    },
     ready: Promise.resolve(registration),
   };
+  harness.swListeners = listeners;
+  harness.swRegistration = registration;
+  harness.serviceWorker = sw;
   Object.defineProperty(win.navigator, 'serviceWorker', { configurable: true, value: sw });
   win.PushManager = function PushManager() {};
 }
@@ -281,7 +299,16 @@ function installMisc(win, harness) {
 
 /* ---------- the loader ------------------------------------------------------ */
 async function loadApp(opts = {}) {
+  // Most behaviour fixtures specify only the status fields relevant to their
+  // assertion. Fill protocol-wide metadata (notably server_epoch) exactly as a
+  // real daemon would, while allowing the fixture's roster/rooms to replace it.
   const status = opts.status || defaultStatus();
+  if (opts.status) {
+    const protocolDefaults = defaultStatus();
+    for (const [key, value] of Object.entries(protocolDefaults)) {
+      if (status[key] === undefined) status[key] = value;
+    }
+  }
   const history = opts.history || [];
   const url = opts.url || 'http://localhost/';
   const notifPerm = opts.notificationPermission || 'default';
@@ -312,29 +339,59 @@ async function loadApp(opts = {}) {
     calls: [],
     handlers: {},
     esInstances: [],
+    swMessages: [],
     _uuid: 0,
     clock: null,
   };
 
-  harness.defaultResponse = (p /*, call */) => {
+  harness.defaultResponse = (p, call) => {
     if (p === '/api/status') return { status: 200, body: harness.status };
-    if (p === '/api/history') return { status: 200, body: { events: harness.history } };
+    if (p === '/api/history') {
+      return {
+        status: 200,
+        body: { server_epoch: harness.status.server_epoch, events: harness.history },
+        headers: { 'X-Bridge-Server-Epoch': harness.status.server_epoch },
+      };
+    }
+    if (p === '/api/sync') {
+      const u = new URL(call.url, 'http://localhost');
+      const expected = u.searchParams.get('epoch') || '';
+      const reset = !expected || expected !== harness.status.server_epoch;
+      const since = reset ? 0 : Number(u.searchParams.get('since') || 0);
+      return {
+        status: 200,
+        body: {
+          ...harness.status,
+          reset,
+          events: harness.history.filter((e) => Number(e.id) > since),
+        },
+        headers: { 'X-Bridge-Server-Epoch': harness.status.server_epoch },
+      };
+    }
     if (p === '/api/push/key') return { status: 200, body: { key: 'AAAA' } };
-    return { status: 200, body: { ok: true } };
+    return {
+      status: 200,
+      body: { ok: true },
+      headers: { 'X-Bridge-Server-Epoch': harness.status.server_epoch },
+    };
   };
+
+  // Initial-request race tests need handlers installed before app.js invokes
+  // init(). Per-test mutation after load remains supported through the same map.
+  Object.assign(harness.handlers, opts.handlers || {});
 
   // Install stubs BEFORE app.js runs — init() fires immediately on load.
   harness.clock = installClock(win);
   win.fetch = makeFetch(harness);
   win.EventSource = makeEventSource(harness.esInstances);
   installNotification(win, notifPerm);
-  installServiceWorker(win);
+  installServiceWorker(win, harness);
   installMisc(win, harness);
 
   // Run the app (THE SPLIT SEAM lives in injectApp / APP_ENTRY above).
   injectApp(win);
 
-  // init() is async (awaits /api/status then /api/history then connectEvents).
+  // init() is async (awaits one /api/sync snapshot, then connectEvents).
   // Wait until it has wired the stream (an EventSource exists) OR bounced to the
   // pairing screen; then flush pending rAFs so the DOM is settled.
   await waitFor(() => harness.esInstances.length > 0
@@ -391,6 +448,15 @@ async function loadApp(opts = {}) {
   };
 
   harness.setNotifPermission = (p) => { win.Notification.permission = p; };
+  harness.swControllerChange = (controller) => {
+    harness.serviceWorker.controller = controller;
+    for (const listener of (harness.swListeners.controllerchange || [])) {
+      listener(new win.Event('controllerchange'));
+    }
+  };
+  harness.swMessage = (data) => {
+    for (const listener of (harness.swListeners.message || [])) listener({ data });
+  };
 
   harness.teardown = () => { try { win.close(); } catch (_) {} };
 

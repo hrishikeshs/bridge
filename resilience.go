@@ -34,7 +34,8 @@ const (
 )
 
 var (
-	daemonStartUnix int64 // set in runServe; exposed on /api/status as "started"
+	daemonStartUnix int64  // set in runServe; exposed on /api/status as "started"
+	daemonEpoch     string // random per process; namespaces phone-side replicas
 
 	resilienceMu sync.Mutex
 	lastWakeFrom int64 // unix seconds; 0 = no sleep gap observed since start

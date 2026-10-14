@@ -48,8 +48,10 @@ func handlePair(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleStatus returns the roster and daemon version.
-func handleStatus(w http.ResponseWriter, r *http.Request) {
+// statusSnapshot returns the server-owned state shared by /api/status and the
+// PWA's generation-bound /api/sync endpoint. Keeping this in one constructor
+// prevents the two views from quietly drifting apart as fields are added.
+func statusSnapshot() map[string]any {
 	type item struct {
 		ID        string            `json:"id"`
 		Name      string            `json:"name"`
@@ -87,21 +89,56 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	// Clocks for phone-side presence truth (round 4): the phone compares `now`
 	// to its own clock and its last-contact timestamp to distinguish "my
-	// network is down" from "Mac unreachable"; `started` reveals a daemon
-	// restart; `wake_from`/`wake_to` surface the most recent sleep window so a
+	// network is down" from "Mac unreachable"; `started` describes the daemon
+	// boot while `server_epoch` unambiguously namespaces one process generation;
+	// `wake_from`/`wake_to` surface the most recent sleep window so a
 	// reconnecting phone can say "Mac was asleep 10:02–12:55" instead of a bare
 	// "unreachable".
 	resp := map[string]any{
-		"contacts":  items,
-		"rooms":     roomList(), // static for v1: the one built-in #crew party line
-		"version":   version,
-		"now":       timeNowUnix(),
-		"started":   daemonStartUnix,
-		"my_status": myStatus(), // the human's away line, for the settings sheet
+		"contacts":          items,
+		"rooms":             roomList(), // static for v1: the one built-in #crew party line
+		"version":           version,
+		"now":               timeNowUnix(),
+		"started":           daemonStartUnix,
+		"server_epoch":      daemonEpoch,
+		"server_generation": daemonGeneration,
+		"my_status":         myStatus(), // the human's away line, for the settings sheet
 	}
 	if from, to := wakeGap(); to != 0 {
 		resp["wake_from"], resp["wake_to"] = from, to
 	}
+	return resp
+}
+
+// handleStatus returns the roster and daemon version.
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	resp := statusSnapshot()
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleSync gives the PWA one self-consistent, generation-stamped replica
+// update. If the caller's epoch differs from this daemon process, its event
+// cursor belongs to another id namespace: ignore that cursor and return the
+// complete retained history. Combining status and history in one response
+// removes the restart window that existed between two separate requests.
+func handleSync(w http.ResponseWriter, r *http.Request) {
+	expected := r.URL.Query().Get("epoch")
+	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+	reset := expected == "" || expected != daemonEpoch
+	if reset {
+		since = 0
+	}
+	// Capture the event cut before the roster. Writers update roster truth before
+	// emitting its corresponding event (attention/status/mystatus), so this order
+	// guarantees the roster is never older than an event returned beside it. Any
+	// event emitted after this cut is replayed by the epoch-bound SSE connection.
+	evs := eventsSince(since)
+	if evs == nil {
+		evs = []Event{}
+	}
+	resp := statusSnapshot()
+	resp["events"] = evs
+	resp["reset"] = reset
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -112,12 +149,20 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 	if evs == nil {
 		evs = []Event{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"events": evs})
+	writeJSON(w, http.StatusOK, map[string]any{"events": evs, "server_epoch": daemonEpoch})
 }
 
 // handleEvents streams Server-Sent Events, replaying anything past the client's
 // cursor (Last-Event-ID header or ?since) before switching to live delivery.
 func handleEvents(w http.ResponseWriter, r *http.Request) {
+	// Event ids are meaningful only within one daemon generation. A new PWA
+	// binds its stream to the epoch it just synced; after a restart, reject the
+	// stale stream before it can mix generations. The parameter is optional so
+	// older clients continue to work while their cached shell updates.
+	if expected := r.URL.Query().Get("epoch"); expected != "" && expected != daemonEpoch {
+		writeJSON(w, http.StatusPreconditionFailed, map[string]string{"error": "server-restarted"})
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -126,6 +171,7 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Bridge-Server-Epoch", daemonEpoch)
 	w.WriteHeader(http.StatusOK)
 
 	since := int64(0)

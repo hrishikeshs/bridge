@@ -16,7 +16,7 @@
 // shared helpers/state from this core, and this core calls back into them (a
 // benign ESM cycle — every call is deferred to runtime, never eval-time).
 import { armScreensaver, wakeScreensaver, isMomentEvent, initScreensaver } from './screensaver.js';
-import { renderContextGauge } from './context-gauge.js';
+import { renderContextGauge, resetContextGaugeState } from './context-gauge.js';
 // Appearance (theme / scenery / light drift): the module applies the saved
 // look at import time (same startup point as before). The settings sheet's
 // theme/wallpaper/palette setters moved with it into ./settings.js, so the spine
@@ -43,14 +43,15 @@ import { exportSelectionPNG } from './export.js';
 // these four entry points back.
 import {
   updatePushButton, requestNotifyPermission, maybeNotify, clearDeliveredNotifications,
+  advanceNotificationGeneration,
 } from './notifications.js';
-// The settings sheet + Focus toggle. Self-contained (it wires its own listeners
-// at import time and reaches nothing back out of the spine); a bare import pulls
-// it into the graph so those side-effects run at the same startup point as before.
+// The settings sheet + Focus toggle. It wires its own listeners at import time;
+// importing its reset hook also pulls those side effects into the graph at the
+// same startup point as before.
 // settings.js imports renderList from this core (its toggleFocus re-renders the
 // list) — the re-export below keeps that a core import, avoiding a settings↔list
 // cycle. renderMyStatus lives in settings.js and the list module calls it.
-import './settings.js';
+import { resetSettingsState } from './settings.js';
 // The conversation list (roster view). The spine calls renderList (every
 // roster/status change) and updateUnreadTotals (the feed clears unread).
 import { renderList, updateUnreadTotals } from './list.js';
@@ -86,12 +87,19 @@ const REACTIONS = ['👍', '❤️', '😂', '🎉', '👀', '🚀'];
 // (perf round, 2026-07-06).
 const FEED_WINDOW = 60;
 
+// A cached event cursor is meaningful only inside the daemon generation that
+// produced it.  Version the replica explicitly so the first release carrying
+// generation metadata distrusts older caches once, then future opens can use
+// the cheap history delta again.
+const EVENT_CACHE_VERSION = 2;
+let cachedReplicaNeedsSync = false;
+
 // Exported: the peeled feature modules read live app state through this object
 // (screensaver: state.view; context-gauge: state.contacts/selected/view).
 /** @type {State} */
 export const state = {
-  contacts: [],          // roster from /api/status
-  rooms: [],             // shared threads from /api/status (v1: just #crew)
+  contacts: [],          // server roster from /api/sync
+  rooms: [],             // shared threads from /api/sync (v1: just #crew)
   events: [],            // chronological event list
   attentions: new Map(), // contact id -> latest unresolved attention event
   reactions: new Map(),  // target event id -> array of emoji (folded from 'reaction' events)
@@ -112,7 +120,9 @@ export const state = {
   pending: [],           // local echoes + outbox (see loadPending)
   guidance: null,        // {agent, until} — a No was tapped; next message is the "do this instead"
   lastContact: null,     // ms of the last successful reach to the daemon (presence truth)
-  serverStarted: null,   // daemon start unix (a change = it restarted)
+  serverStarted: null,   // daemon start unix, used for presence context
+  serverEpoch: null,     // random daemon generation; namespaces cached event ids
+  serverGeneration: null,// durable boot counter; orders notification generations
   seenWake: 0,           // newest wake_to the phone has already surfaced
   wakeNote: null,        // {from,to,until} — transient "Mac was asleep X–Y" banner
   wired: false,          // one-time listeners/intervals installed (init re-runs)
@@ -126,7 +136,7 @@ loadPending();
 
 /* ---------- rooms (party line) ----------
    A room is a shared thread everyone sees; v1 ships exactly one, #crew. It is
-   not a contact — it comes from /api/status `rooms` and lives in its own
+   not a contact — it comes from /api/sync `rooms` and lives in its own
    "room:" id namespace, so every helper keyed on a string id (unreadCount,
    newestMessage, lastActivityMs, the lastSeen cursor) just works, while the
    contact-shaped lookups (health, presence, panes) are guarded to skip it. */
@@ -153,6 +163,14 @@ export function threadName(id) {   // exported: context-gauge.js
 
 let reconnectDelay = 1000;   // capped exponential backoff for SSE
 let reconnectTimer = null;
+let syncReplicaPromise = null; // serialize authoritative syncs across wake paths
+let syncReplicaRequested = false; // rerun once when a wake arrives mid-sync
+let replicaRevision = 0; // invalidates responses that crossed a replica purge
+let stopOperation = 0; // prevents an old interrupt completion unlocking a new one
+// Mutations remain fenced until one generation-stamped /api/sync completes.
+// Every later wake/poll raises the fence synchronously before its fetch starts.
+let authoritativeSyncPending = true;
+let pairingRequired = false;
 
 setInterval(() => {                 // expire stale typing bubbles
   const now = Date.now();
@@ -167,21 +185,16 @@ setInterval(() => {                 // expire stale typing bubbles
 
 async function init() {
   // Replay the local cache into state before the first network round-trip, so a
-  // warm open paints instantly and loadHistory only has to fetch the delta since
+  // warm open paints instantly and /api/sync only has to fetch the delta after
   // the cached cursor. Guarded (once): init re-runs on pairing and the offline
   // retry loop, but the cache must fold in exactly once.
   hydrateCache();
-  const res = await fetch('/api/status').catch(() => null);
-  if (!res) return showOffline();          // unreachable: show cached feed
-  if (res.status === 401) return showPairing();
-  const data = await res.json();
-  state.contacts = data.contacts || [];
-  state.rooms = data.rooms || [];
-  state.myStatus = data.my_status || '';
-  noteServerClocks(data);
-  setConnected(true);
+  const ready = await syncReplica();
+  if (!ready) {
+    if (!pairingRequired) showOffline();   // unreachable: show cached feed read-only
+    return;
+  }
   showApp();
-  await loadHistory();
   // With the roster and history loaded, land on the view named by the URL:
   // the list, or — cold-open from a notification tap (/?contact=<id> or
   // #/c/<id>) — straight into that contact's thread. restoreView validates
@@ -195,14 +208,24 @@ async function init() {
     state.wired = true;
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(() => {});
+      // A just-installed worker may replace an older controller that ignored
+      // the new generation message sent during sync. Re-teach every controller
+      // as it takes over so its durable push fence is authoritative at once.
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        advanceNotificationGeneration();
+        void clearDeliveredNotifications();
+      });
       // Notification tap (app already open): the SW posts the contact to
-      // open. Validate it against the live roster before selecting — never
-      // trust a value from outside to pick the target agent.
+      // open. Validate both its generation and target against the live replica;
+      // a queued tap from a retired daemon must not navigate reused contact ids.
       navigator.serviceWorker.addEventListener('message', (e) => {
-        if (e.data && e.data.type === 'open-contact') selectContactIfValid(e.data.contact);
+        if (e.data && e.data.type === 'open-contact'
+            && notificationProvenanceMatches(e.data.server_generation, e.data.server_epoch)) {
+          selectContactIfValid(e.data.contact);
+        }
       });
     }
-    setInterval(refreshStatus, 30000);
+    setInterval(resumeFromBackground, 30000);
     // Stream liveness watchdog (H12): heartbeats are real events now, so a
     // healthy stream proves itself every 25s. 70s of silence (three missed
     // beats) on a non-closed source means the socket is a zombie — readyState
@@ -225,15 +248,20 @@ async function init() {
         if (state.source && Date.now() - (state.lastContact || 0) > 35000) {
           state.source.close();
         }
-        refreshStatus(); connectEvents(); flushOutbox();
-        clearDeliveredNotifications();   // you're looking at the app now
+        // Re-establish the generation-stamped server replica before reconnecting
+        // the stream or flushing the outbox: an unclean Mac restart may have
+        // rolled durable history behind the phone's cached event cursor.
+        resumeFromBackground();
         // Returning to the foreground on an open thread clears its unread.
         if (state.view === 'thread' && state.selected) markSeen(state.selected);
         renderList();
         wakeScreensaver();   // #19(b): come back to a lit UI, re-arm the timer
       }
     });
-    window.addEventListener('online', () => { connectEvents(); flushOutbox(); });
+    window.addEventListener('pageshow', (e) => {
+      if (e.persisted) resumeFromBackground(); // iOS/BFCache wake fallback
+    });
+    window.addEventListener('online', resumeFromBackground);
     window.addEventListener('offline', () => setConnected(false));
     initScreensaver();   // #19(b): wire the document-level idle detection (see ./screensaver.js)
   }
@@ -257,16 +285,19 @@ function showOffline() {
    - events.slice(-300): the tail we replay into the feed offline.
    - reactions: the folded badge map. Reactions (and status) events FOLD into
      maps and never enter state.events, so they live ONLY in server history.
-     Once loadHistory stops replaying from since=0, a reload would lose every
-     badge older than the delta unless the map itself rides the cache — this
-     field is that lifeline. (Status/away needs no caching: it re-arrives on the
-     first /api/status fetch.)
+     A reload would lose every badge older than the /api/sync delta unless the
+     map itself rides the cache — this field is that lifeline. (Status/away needs
+     no caching: it re-arrives in the authoritative sync.)
    - lastEventId: the SSE/history cursor. It can exceed the last cached event's
      id — a reaction/status folded and advanced the cursor without being stored
      — so it is cached explicitly rather than re-derived from events. */
 function cacheEvents() {
   try {
     localStorage.setItem('eventCache', JSON.stringify({
+      version: EVENT_CACHE_VERSION,
+      serverStarted: state.serverStarted,
+      serverEpoch: state.serverEpoch,
+      serverGeneration: state.serverGeneration,
       contacts: state.contacts,
       rooms: state.rooms,
       events: state.events.slice(-300),
@@ -278,17 +309,26 @@ function cacheEvents() {
 
 /* Fold the persisted cache back into state, exactly once. Called at the top of
    init() (which re-runs) and again from showOffline(); the hydrated guard makes
-   the second call a no-op. Ingesting with the SAME outbox reconcile loadHistory
-   does keeps a cached 'sent' from re-delivering its local echo. */
+   the second call a no-op. Using the same outbox reconciliation as /api/sync
+   keeps a cached 'sent' from re-delivering its local echo. */
 function hydrateCache() {
   if (state.hydrated) return;
   state.hydrated = true;
   const cached = JSON.parse(localStorage.getItem('eventCache') || 'null');
   if (!cached) return;                       // cold start: nothing cached
+  if (cached.version === EVENT_CACHE_VERSION && cached.serverEpoch) {
+    state.serverStarted = cached.serverStarted;
+    state.serverEpoch = cached.serverEpoch;
+    state.serverGeneration = Number(cached.serverGeneration) || null;
+  } else {
+    // Pre-v2 caches have no daemon generation.  Their cursors cannot prove
+    // continuity, so force one authoritative replay after status is reachable.
+    cachedReplicaNeedsSync = true;
+  }
   state.contacts = cached.contacts || [];
   state.rooms = cached.rooms || [];
   (cached.events || []).forEach((e) => {
-    // Same reconcile as loadHistory's replay (H10): a cached 'sent' the phone
+    // Same reconcile as /api/sync replay (H10): a cached 'sent' the phone
     // never saw live must still drop its outbox echo, or flushOutbox re-sends it.
     if (ingest(e) && e.type === 'sent') dropPendingEcho(e.agent, e.text, e.client_id);
   });
@@ -298,6 +338,76 @@ function hydrateCache() {
   // The cursor can sit past the newest cached event (a folded reaction/status
   // advanced it), so trust the cached cursor over the ids ingest just replayed.
   state.lastEventId = Math.max(state.lastEventId, cached.lastEventId || 0);
+}
+
+/* Drop the phone's entire operational replica after a daemon-generation
+   change. That deliberately includes the outbox: after a timed-out POST the
+   phone cannot know whether the old process durably accepted the message, so
+   preserving and replaying it could type the user's words twice. Server truth
+   wins. Device-only preferences and drafts are not replicas and survive. */
+function resetServerReplica() {
+  // Once the app has finished its first bootstrap, a daemon replacement also
+  // invalidates the current navigation target.  During cold bootstrap, retain
+  // a notification/deep-link URL long enough for restoreView() to consume it.
+  const discardCurrentRoute = state.wired;
+  replicaRevision++;
+  stopOperation++;
+  if (state.source) state.source.close();
+  state.source = null;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectDelay = 1000;
+  authoritativeSyncPending = true;
+  setConnected(false);
+
+  state.contacts = [];
+  state.rooms = [];
+  state.events = [];
+  state.attentions.clear();
+  state.reactions.clear();
+  state.myReactions.clear();
+  state.typing.clear();
+  state.lastEventId = 0;
+  state.lastSeen = {};
+  state.pending = [];
+  state.myStatus = '';
+  state.serverStarted = null;
+  state.serverEpoch = null;
+  state.serverGeneration = null;
+  state.quote = null;
+  state.selecting = false;
+  state.selectedIds.clear();
+  state.guidance = null;
+  state.feedWindow = FEED_WINDOW;
+  state.seenWake = 0;
+  state.wakeNote = null;
+  state.wakeSeenOnce = false;
+
+  localStorage.removeItem('eventCache');
+  localStorage.removeItem('lastSeen');
+  localStorage.removeItem('outbox');
+
+  // Remove closures over old event/contact ids immediately; the replacement
+  // sync may be slow or fail, and stale approval/reaction controls must never
+  // remain actionable while the generation fence is raised.
+  cancelBubbleGestures();
+  closeActionSheet();
+  closeForwardSheet();
+  resetContextGaugeState();
+  resetSettingsState();
+  $('feed').replaceChildren();
+  $('thread-name').textContent = '';
+  $('thread-status').textContent = '';
+  const stop = /** @type {HTMLButtonElement | null} */ ($('stop-btn'));
+  if (stop) {
+    stop.disabled = false;
+    stop.classList.add('hidden');
+  }
+  document.documentElement.classList.remove('selecting');
+  renderQuoteChip();
+  renderSelectBar();
+  showList();
+  if (discardCurrentRoute) history.replaceState({ view: 'list' }, '', '#/');
 }
 
 function showPairing() {
@@ -330,51 +440,138 @@ $('pair-btn').addEventListener('click', async () => {
 
 /* ---------- data ---------- */
 
-async function refreshStatus() {
-  const res = await fetch('/api/status').catch(() => null);
-  // A revoked or missing device token is an auth problem, not a dead Mac:
-  // route back to pairing instead of showing "unreachable" forever.
-  if (res && res.status === 401) return showPairing();
-  if (!res || !res.ok) return setConnected(false);
-  const data = await res.json();
-  const wasOffline = new Map(state.contacts.map((c) => [c.id, c.status === 'offline']));
+// visibilitychange, pageshow, online, the poller and SSE onopen can converge at
+// once after a phone wakes. One authoritative transaction owns the replacement;
+// every caller observes the same result before it may reconnect or send.
+function syncReplica() {
+  syncReplicaRequested = true;
+  // Raise the fence even when a nearly-settled transaction already exists. Its
+  // snapshot may predate this wake signal; syncReplicaLoop will run once more.
+  authoritativeSyncPending = true;
+  // Stop the old generation's live stream at the same boundary. Otherwise a
+  // frame can land after /api/sync captured its event cut but before we install
+  // the accompanying snapshot: consuming that frame's id and then overlaying
+  // the older snapshot would make the subsequent reconnect unable to repair it.
+  if (state.source) state.source.close();
+  state.source = null;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  const send = /** @type {HTMLButtonElement | null} */ ($('send-btn'));
+  if (send) send.disabled = true;
+  if (!syncReplicaPromise) {
+    syncReplicaPromise = syncReplicaLoop()
+      .finally(() => { syncReplicaPromise = null; });
+  }
+  return syncReplicaPromise;
+}
+
+async function syncReplicaLoop() {
+  let ready = false;
+  do {
+    syncReplicaRequested = false;
+    ready = await syncReplicaOnce();
+  } while (syncReplicaRequested);
+  // A failed final attempt stays fenced. A successful final attempt is the
+  // newest requested server snapshot, so mutations may resume.
+  if (ready) {
+    authoritativeSyncPending = false;
+    const send = /** @type {HTMLButtonElement | null} */ ($('send-btn'));
+    if (send) send.disabled = false;
+  }
+  return ready;
+}
+
+async function resumeFromBackground() {
+  const ready = await syncReplica();
+  if (!ready) {
+    if (!pairingRequired) scheduleReconnect();
+    return;
+  }
+  void clearDeliveredNotifications();
+  connectEvents();
+  flushOutbox();
+}
+
+async function syncReplicaOnce() {
+  const requestRevision = replicaRevision;
+  const expectedEpoch = cachedReplicaNeedsSync ? '' : (state.serverEpoch || '');
+  const since = expectedEpoch ? state.lastEventId : 0;
+  const query = '?since=' + since + (expectedEpoch ? '&epoch=' + encodeURIComponent(expectedEpoch) : '');
+  // A black-holed tailnet route must not hold the generation fence forever.
+  // Abort into the normal reconnect backoff just like a definite network error.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  let data = null;
+  try {
+    const res = await fetch('/api/sync' + query, { signal: ctrl.signal });
+    // A mutation response or another authority boundary may have purged the
+    // replica while this request was in flight. Its snapshot is now stale even
+    // if its own epoch is internally valid; the sync loop will run the requested
+    // catch-up pass instead of resurrecting it.
+    if (requestRevision !== replicaRevision) return false;
+    // A revoked or missing device token is an auth problem, not a dead Mac:
+    // route back to pairing instead of showing "unreachable" forever.
+    if (res.status === 401) {
+      pairingRequired = true;
+      showPairing();
+      return false;
+    }
+    if (!res.ok) { setConnected(false); return false; }
+    data = await res.json();
+  } catch (e) {
+    if (requestRevision === replicaRevision) setConnected(false);
+    return false;
+  } finally {
+    // Keep the deadline armed through body decoding too: fetch resolves once
+    // response headers arrive, while a broken route can still stall the body.
+    clearTimeout(timer);
+  }
+  if (requestRevision !== replicaRevision) return false;
+  if (!data) { setConnected(false); return false; }
+
+  // An epoch-less response cannot prove that its event ids belong to the
+  // cached replica (for example, a daemon binary rollback beneath a newer
+  // service-worker shell). Fail closed and leave mutations fenced.
+  const responseEpoch = typeof data.server_epoch === 'string' ? data.server_epoch.trim() : '';
+  if (!responseEpoch) {
+    resetServerReplica();
+    cachedReplicaNeedsSync = false;
+    setConnected(false);
+    return false;
+  }
+
+  const serverChanged = cachedReplicaNeedsSync || !expectedEpoch
+    || expectedEpoch !== responseEpoch || data.reset === true;
+  cachedReplicaNeedsSync = false;
+  if (serverChanged) resetServerReplica();
+
+  state.serverEpoch = responseEpoch;
+  state.serverGeneration = Number(data.server_generation) || null;
+  advanceNotificationGeneration();
+  noteServerClocks(data);
+  // Events were cut before statusSnapshot() on the server. Fold them first so
+  // their ids/history are retained, then let the newer snapshot win for roster
+  // and status fields. This also handles a crash after durable state changed but
+  // before its best-effort event append reached disk.
+  for (const event of (data.events || [])) {
+    if (ingest(event) && event.type === 'sent') {
+      dropPendingEcho(event.agent, event.text, event.client_id);
+    }
+  }
   state.contacts = data.contacts || [];
   state.rooms = data.rooms || [];
   state.myStatus = data.my_status || '';
-  noteServerClocks(data);
-  setConnected(true);
-  // A contact that just came back to life can receive its queued messages.
-  const revived = state.contacts.some(
-    (c) => c.status !== 'offline' && wasOffline.get(c.id));
-  if (revived) flushOutbox();
   pruneAttentions();
+  cacheEvents();
+  pairingRequired = false;
+  reconnectDelay = 1000; // a successful sync proves the route is healthy again
+  setConnected(true);
+  renderFeed();
   renderList();
   if (state.view === 'thread') updateThreadHeader();
   updateAttentionBanner();
-}
-
-async function loadHistory() {
-  // Fetch only what's newer than the cached cursor — a warm open pulls the
-  // delta, not all 500 events. A cold start (no cache) leaves lastEventId at 0,
-  // so this naturally becomes since=0, the full history.
-  const res = await fetch('/api/history?since=' + state.lastEventId).catch(() => null);
-  if (!res || !res.ok) return;
-  const data = await res.json();
-  (data.events || []).forEach((e) => {
-    // Reconcile the outbox against the replay exactly like the live path
-    // (H10): a 'sent' we never saw live (SSE died mid-send) must still drop
-    // its local echo, or the next flushOutbox re-delivers it — and after a
-    // daemon restart the client_id ring is empty, so the retry types into
-    // the pane a second time.
-    if (ingest(e) && e.type === 'sent') dropPendingEcho(e.agent, e.text, e.client_id);
-  });
-  pruneAttentions();   // history replay can resurrect orphaned attentions
-  cacheEvents();
-  renderFeed();
-  // A replay landing on an already-open thread (an offline-retry re-init) can
-  // backfill content under the fold after renderFeed's synchronous stick; hold
-  // the bottom as it settles — guarded, so only for a reader already at the end.
   if (state.view === 'thread' && state.selected) pinFeedBottom();
+  return true;
 }
 
 // Roster truth beats history replay. An attention whose clear never got
@@ -392,32 +589,41 @@ function pruneAttentions() {
 }
 
 function connectEvents() {
-  if (state.source && state.source.readyState !== EventSource.CLOSED) return;
+  if (authoritativeSyncPending || !state.serverEpoch) return;
   clearTimeout(reconnectTimer);
-  const source = new EventSource('/api/events?since=' + state.lastEventId);
+  reconnectTimer = null;
+  if (state.source && state.source.readyState !== EventSource.CLOSED) return;
+  const source = new EventSource('/api/events?since=' + state.lastEventId
+    + '&epoch=' + encodeURIComponent(state.serverEpoch));
   state.source = source;
   state.lastContact = Date.now();   // fresh socket gets its full liveness grace
   // Server heartbeat (every 25s, a named event so old clients ignore it):
   // proof the socket is genuinely alive, consumed by the H12 watchdog.
   source.addEventListener('hb', () => {
+    if (source !== state.source) return;
     state.lastContact = Date.now();
     setConnected(true);
   });
   source.onopen = () => {
-    reconnectDelay = 1000;   // healthy link — reset the backoff
+    if (source !== state.source) return;
+    // The stream URL carries the epoch accepted by /api/sync, and the server
+    // rejects a mismatched epoch before returning SSE headers. A successful
+    // open therefore proves continuity without a second, redundant sync.
+    reconnectDelay = 1000;
     state.lastContact = Date.now();
     setConnected(true);
-    refreshStatus();         // roster may have changed while we were away
     flushOutbox();           // drain anything queued during the outage
   };
   // Drive reconnection ourselves (capped backoff) rather than leaning on the
   // browser's opaque retry, so we can refresh status and flush on each try.
   source.onerror = () => {
+    if (source !== state.source) return;
     setConnected(false);
     source.close();
     scheduleReconnect();
   };
   source.onmessage = (msg) => {
+    if (source !== state.source) return;
     state.lastContact = Date.now();   // any frame proves the Mac is reachable
     const event = JSON.parse(msg.data);
     if (event.type === 'typing') {          // transient: never stored
@@ -444,8 +650,13 @@ function connectEvents() {
 }
 
 function scheduleReconnect() {
-  clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(connectEvents, reconnectDelay);
+  if (reconnectTimer) return;
+  // Re-discover/sync the daemon generation before opening another stream. A
+  // blind EventSource retry would keep presenting the old epoch forever.
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    void resumeFromBackground();
+  }, reconnectDelay);
   reconnectDelay = Math.min(reconnectDelay * 2, 15000);
 }
 
@@ -518,28 +729,26 @@ function updateAttentionBanner() {
   }
 }
 
-/* Record the daemon's clocks from a /api/status payload (round 4 presence
-   truth). Marks the reach time, notices a restart (started changed), and
-   surfaces a fresh sleep window once as a transient banner. */
-/** @param {any} data — the /api/status JSON (res.json() is untyped) */
+/* Record the daemon's clocks from a /api/sync payload (round 4 presence
+   truth). Generation comparison happens in syncReplicaOnce before this;
+   this helper owns only reachability and the one-shot sleep banner. */
+/** @param {any} data — the /api/sync JSON (res.json() is untyped) */
 function noteServerClocks(data) {
   if (!data) return;
+  const hadContact = !!state.lastContact;
   state.lastContact = Date.now();
-  if (data.started) {
-    if (state.serverStarted && data.started !== state.serverStarted) {
-      // The daemon restarted since we last looked — reset the SSE cursor so we
-      // re-sync from history rather than assuming continuity.
-      state.serverStarted = data.started;
-    } else if (!state.serverStarted) {
-      state.serverStarted = data.started;
-    }
-  }
+  if (data.started) state.serverStarted = data.started;
   if (data.wake_to && data.wake_to > state.seenWake) {
     state.seenWake = data.wake_to;
     // Don't cry wolf on the very first load (no prior contact to have missed).
-    if (state.lastContact && state.wakeSeenOnce) {
-      state.wakeNote = { from: data.wake_from, to: data.wake_to, until: Date.now() + 8000 };
-      setTimeout(() => { state.wakeNote = null; updateBanner(); }, 8200);
+    if (hadContact && state.wakeSeenOnce) {
+      const note = { from: data.wake_from, to: data.wake_to, until: Date.now() + 8000 };
+      state.wakeNote = note;
+      setTimeout(() => {
+        if (state.wakeNote !== note) return;
+        state.wakeNote = null;
+        updateBanner();
+      }, 8200);
     }
   }
   state.wakeSeenOnce = true;
@@ -659,10 +868,13 @@ function routeFromLocation() {
 // is in the live roster.
 function restoreView() {
   const m = (location.hash || '').match(/^#\/c\/(.+)$/);
-  const param = new URLSearchParams(location.search).get('contact');
+  const params = new URLSearchParams(location.search);
+  const param = params.get('contact');
   const id = m ? decodeURIComponent(m[1]) : param;
+  const provenanceOK = !!m || !param || notificationProvenanceMatches(
+    params.get('server_generation'), params.get('server_epoch'));
   history.replaceState({ view: 'list' }, '', '#/');
-  if (id && isValidTarget(id)) navigateToThread(id);
+  if (id && provenanceOK && isValidTarget(id)) navigateToThread(id);
   else showList();
 }
 
@@ -675,6 +887,17 @@ function selectContactIfValid(id) {
   if (id && isValidTarget(id)) navigateToThread(id);
 }
 
+// Notifications created before generation metadata remain valid legacy links.
+// Modern links must name the exact replica that supplied their contact id.
+/** @param {unknown} generation @param {unknown} epoch */
+function notificationProvenanceMatches(generation, epoch) {
+  const parsedGeneration = Number(generation) || 0;
+  const parsedEpoch = typeof epoch === 'string' ? epoch : '';
+  if (!parsedGeneration && !parsedEpoch) return true;
+  return parsedGeneration === Number(state.serverGeneration)
+    && parsedEpoch === state.serverEpoch;
+}
+
 $('back-btn').addEventListener('click', () => history.back());
 
 /* Interrupt: one tap → the daemon sends the agent a bare Escape (stop
@@ -683,9 +906,14 @@ $('back-btn').addEventListener('click', () => history.back());
 $('stop-btn').addEventListener('click', async () => {
   if (!state.selected) return;
   const btn = /** @type {HTMLButtonElement} */ ($('stop-btn'));
+  const agent = state.selected;
+  const renderedEpoch = state.serverEpoch;
+  const operation = ++stopOperation;
   btn.disabled = true;
-  await api('/api/interrupt', { agent: state.selected });
-  btn.disabled = false;
+  await api('/api/interrupt', { agent }, renderedEpoch);
+  if (operation === stopOperation && renderedEpoch === state.serverEpoch) {
+    btn.disabled = false;
+  }
 });
 
 /* ---------- feature #19(b): idle screensaver ----------
@@ -848,7 +1076,7 @@ function renderFeed() {
   /** @type {HTMLInputElement} */ ($('msg-input')).placeholder = (g && g.agent === state.selected && g.until > Date.now())
     ? 'Tell ' + (threadName(state.selected) || 'the agent') + ' what to do differently…'
     : 'Message ' + (threadName(state.selected) || 'contact') + '…';
-  /** @type {HTMLButtonElement} */ ($('send-btn')).disabled = false;
+  /** @type {HTMLButtonElement} */ ($('send-btn')).disabled = authoritativeSyncPending;
   // Photos are a 1:1 feature in v1 — the room upload path has no fan-out, so a
   // photo to #crew would stick queued. Disable the attach button in a room.
   /** @type {HTMLButtonElement} */ ($('attach-btn')).disabled = isRoomId(state.selected);
@@ -979,7 +1207,14 @@ function replyBubbles(event, cls, whoEl) {
   const parts = splitPleasing(event.text || '');
   // Long-press metadata for the action sheet: the whole event is the reaction
   // target (its id), and the pressed part's own text seeds a quote.
-  const meta = (text) => ({ id: event.id, name: event.name || 'agent', type: event.type, text });
+  const meta = (text) => ({
+    id: event.id,
+    agent: event.agent,
+    name: event.name || 'agent',
+    type: event.type,
+    text,
+    epoch: state.serverEpoch,
+  });
   if (parts.length <= 1) {
     const el = document.createElement('div');
     el.className = cls;
@@ -1221,23 +1456,24 @@ function promptOptions(text) {
 function approveKeys(event) {
   const keys = document.createElement('div');
   keys.className = 'keys';
+  const renderedEpoch = state.serverEpoch;
   for (const opt of promptOptions(event.text)) {
     const btn = document.createElement('button');
     btn.className = 'key-opt' + (opt.deny ? ' deny' : '');
     btn.textContent = opt.label;
-    btn.onclick = () => {
-      approve(event.agent, opt.key);
+    btn.onclick = async () => {
+      const accepted = await approve(event.agent, opt.key, renderedEpoch);
       // "No" in Claude Code means "no — and tell me what to do instead": the
       // agent opens a guidance input, and the next phone message lands straight
       // in it. Point the composer there instead of leaving the user wondering.
-      if (opt.deny) offerGuidance(event.agent, event.name);
+      if (accepted && opt.deny) offerGuidance(event.agent, event.name);
     };
     keys.appendChild(btn);
   }
   const esc = document.createElement('button');
   esc.className = 'key-opt esc';
   esc.textContent = '⎋ Esc';
-  esc.onclick = () => approve(event.agent, 'esc');
+  esc.onclick = () => { void approve(event.agent, 'esc', renderedEpoch); };
   keys.appendChild(esc);
   return keys;
 }
@@ -1364,6 +1600,13 @@ function sendMessage() {
   const body = input.value.trim();
   const image = pendingImage;
   if ((!body && !image) || !state.selected) return;
+  if (authoritativeSyncPending) {
+    // This intent has provably never reached a daemon, so it is a draft rather
+    // than ambiguous outbox state. Leave the composer/attachment intact across
+    // the sync; the user can send after the authoritative replica is ready.
+    localStorage.setItem(draftKey(), input.value);
+    return;
+  }
   input.value = '';
   localStorage.removeItem(draftKey());
   clearAttachment();
@@ -1456,7 +1699,17 @@ let actionOpenedAt = 0;
 /** @type {{id:number, t:number, x:number, y:number} | null} */
 let lastTap = null;   // the previous clean tap — the double-tap detector's memory
 
-/** @typedef {{id:number, name:string, type?:string, text:string}} BubbleMeta */
+// A daemon replacement can happen while a 500ms hold is still armed on an old
+// bubble. Cancel the timer as part of the replica purge so it cannot reopen a
+// sheet over the replacement UI with epoch-A metadata.
+function cancelBubbleGestures() {
+  clearTimeout(lpTimer);
+  lpTimer = null;
+  lpStart = null;
+  lastTap = null;
+}
+
+/** @typedef {{id:number, agent:string, name:string, type?:string, text:string, epoch:string|null}} BubbleMeta */
 /** @param {HTMLElement} el @param {BubbleMeta} meta */
 function attachBubbleActions(el, meta) {
   el.addEventListener('touchstart', (e) => {
@@ -1530,6 +1783,7 @@ function attachBubbleActions(el, meta) {
    so a mouse user's immediate click still lands. */
 /** @param {BubbleMeta} meta @param {{x:number, y:number}} at @param {'menu'|'react'} mode @param {boolean} [ghostGuard] */
 function openActionSheet(meta, at, mode, ghostGuard) {
+  if (authoritativeSyncPending || !meta.epoch || meta.epoch !== state.serverEpoch) return;
   /** @param {() => void} fn @returns {() => void} */
   const armed = (fn) => ghostGuard
     ? () => { if (Date.now() - actionOpenedAt < 350) return; fn(); }
@@ -1560,7 +1814,7 @@ function openActionSheet(meta, at, mode, ghostGuard) {
       if (already) {
         b.disabled = true;   // already reacted this session — pressed and inert
       } else {
-        b.onclick = armed(() => { react(state.selected, meta.id, emoji); closeActionSheet(); });
+        b.onclick = armed(() => { react(meta.agent, meta.id, emoji, meta.epoch); closeActionSheet(); });
       }
       quick.appendChild(b);
     }
@@ -1610,6 +1864,7 @@ async function copyBubbleText(text) {
    queueing, retry, and a normal echo in the receiving thread, all for free. */
 /** @param {BubbleMeta} meta */
 function openForwardSheet(meta) {
+  if (authoritativeSyncPending || !meta.epoch || meta.epoch !== state.serverEpoch) return;
   const list = $('forward-list');
   list.innerHTML = '';
   /** @type {Array<Room | Contact>} */
@@ -1630,9 +1885,9 @@ function openForwardSheet(meta) {
       row.appendChild(off);
     }
     row.onclick = () => {
-      forwardTo(t.id, meta);
+      const forwarded = forwardTo(t.id, meta);
       closeForwardSheet();
-      flashToast('Forwarded to ' + t.name);
+      if (forwarded) flashToast('Forwarded to ' + t.name);
     };
     list.appendChild(row);
   }
@@ -1641,8 +1896,11 @@ function openForwardSheet(meta) {
 
 function closeForwardSheet() { $('forward-sheet').classList.add('hidden'); }
 
-/** @param {string} targetId @param {BubbleMeta} meta */
+/** @param {string} targetId @param {BubbleMeta} meta @returns {boolean} */
 function forwardTo(targetId, meta) {
+  // Forwarding is an event-derived mutation: a picker rendered by an older
+  // daemon must not re-post its captured text after event ids/contacts reset.
+  if (authoritativeSyncPending || !meta.epoch || meta.epoch !== state.serverEpoch) return false;
   /** @type {PendingMsg} */
   const msg = {
     clientId: crypto.randomUUID(),
@@ -1661,9 +1919,10 @@ function forwardTo(targetId, meta) {
   if (!state.connected) {
     msg.mstate = 'queued';
     savePending();
-    return;
+    return true;
   }
   deliver(msg);
+  return true;
 }
 
 $('forward-close').addEventListener('click', closeForwardSheet);
@@ -1805,7 +2064,7 @@ function addEmojiPicker(reactions, quick, meta, armed) {
     const emoji = firstEmoji(picker.value);
     if (!emoji) return;                    // nothing pickable yet (empty / letters)
     fired = true;
-    react(state.selected, meta.id, emoji); // SAME path the 6 quick taps use
+    react(meta.agent, meta.id, emoji, meta.epoch); // SAME path the 6 quick taps use
     picker.blur();                         // dismiss the keyboard
     closeActionSheet();
   });
@@ -1889,14 +2148,18 @@ document.addEventListener('keydown', (e) => {
 /* Send an emoji reaction. The badge itself arrives via the daemon's echoed
    'reaction' event over SSE; myReactions only tracks this session's taps for the
    pressed/disabled state, so it rolls back if the POST doesn't land. */
-/** @param {string | null} agent @param {number} eventId @param {string} emoji */
-async function react(agent, eventId, emoji) {
+/** @param {string | null} agent @param {number} eventId @param {string} emoji
+    @param {string | null} renderedEpoch */
+async function react(agent, eventId, emoji, renderedEpoch) {
   if (!agent) return;
   const set = state.myReactions.get(eventId) || new Set();
   if (set.has(emoji)) return;
   set.add(emoji);
   state.myReactions.set(eventId, set);
-  const res = await api('/api/react', { agent, event_id: eventId, emoji });
+  const res = await api('/api/react', { agent, event_id: eventId, emoji }, renderedEpoch);
+  // resetServerReplica clears the map. Never let an old completion delete a
+  // same-id reaction set created by the replacement generation.
+  if (renderedEpoch !== state.serverEpoch || state.myReactions.get(eventId) !== set) return;
   if (!res || !res.ok) {
     set.delete(emoji);
     if (!set.size) state.myReactions.delete(eventId);
@@ -1915,6 +2178,7 @@ function quoteExcerptText(text) {
 
 /** @param {BubbleMeta} meta */
 function setQuote(meta) {
+  if (authoritativeSyncPending || !meta.epoch || meta.epoch !== state.serverEpoch) return;
   state.quote = { name: meta.name, excerpt: quoteExcerptText(meta.text) };
   renderQuoteChip();
   // ── BUG 1 (quote focus-steal) ───────────────────────────────────────────────
@@ -1942,17 +2206,45 @@ $('quote-chip-remove').addEventListener('click', () => { state.quote = null; ren
 /* Every POST is bounded by a 10s timeout: a hung request aborts and returns
    null (a failed send, retryable). Returns the Response otherwise so callers
    can read res.ok / res.status. */
-/** @param {string} path @param {any} payload @returns {Promise<Response | null>} */
-export async function api(path, payload) {   // exported: context-gauge.js POSTs /api/compact through it
+/** @param {string} path @param {any} payload @param {string | null} [renderedEpoch]
+    @returns {Promise<Response | null>} */
+export async function api(path, payload, renderedEpoch) {   // exported: context-gauge.js POSTs /api/compact through it
+  // A wake/status check raises this fence synchronously. Never let a closure
+  // over an old event/contact id mutate the replacement daemon while its
+  // authoritative replica is still being established.
+  const requestEpoch = renderedEpoch === undefined ? state.serverEpoch : renderedEpoch;
+  if (authoritativeSyncPending || !requestEpoch || requestEpoch !== state.serverEpoch) return null;
+  const requestRevision = replicaRevision;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
   try {
-    return await fetch(path, {
+    const res = await fetch(path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Bridge-Server-Epoch': requestEpoch,
+      },
       body: JSON.stringify(payload),
       signal: ctrl.signal,
     });
+    // Every daemon JSON response names its generation. If the process changed
+    // after our last sync, its route rejected this mutation before side effects;
+    // raise the fence immediately and rebuild in the background.
+    // If another sync replaced the replica while this POST was in flight, its
+    // result belongs to the old UI generation and must not update local state.
+    if (requestRevision !== replicaRevision || state.serverEpoch !== requestEpoch) return null;
+    const responseEpoch = res.headers && res.headers.get
+      ? res.headers.get('X-Bridge-Server-Epoch') : null;
+    if ((responseEpoch && responseEpoch !== requestEpoch)
+        || res.status === 412) {
+      // A replacement daemon rejected the stale action before side effects.
+      // Remove the old UI immediately; syncReplica will repopulate it only from
+      // that daemon's generation-stamped snapshot.
+      resetServerReplica();
+      void resumeFromBackground();
+      return null;
+    }
+    return res;
   } catch (e) {
     return null;   // network error or timeout
   } finally {
@@ -1964,8 +2256,12 @@ export async function api(path, payload) {   // exported: context-gauge.js POSTs
    retry that the server already saw comes back 200 duplicate — still ok. */
 /** @param {PendingMsg} msg */
 async function deliver(msg) {
+  // A rendered retry button can outlive a daemon-generation purge as a
+  // detached DOM node. Identity membership is the outbox ownership proof:
+  // never resurrect a message resetServerReplica deliberately discarded.
+  if (!state.pending.includes(msg)) return;
   if (msg.inflight) return;
-  if (!navigator.onLine) {
+  if (!navigator.onLine || authoritativeSyncPending || !state.serverEpoch) {
     msg.mstate = 'queued'; savePending(); renderFeed(); return;
   }
   msg.inflight = true;
@@ -1978,7 +2274,12 @@ async function deliver(msg) {
   // Quote rides on /api/send only (the upload path ignores it). Sent from
   // deliver() — not sendMessage — so a queued reply keeps its quote on retry.
   if (msg.quote && !msg.image) payload.quote = msg.quote;
+  const deliveryRevision = replicaRevision;
   const res = await api(msg.image ? '/api/upload' : '/api/send', payload);
+  // The outbox/message object belonged to a replica that reset while the POST
+  // was in flight. resetServerReplica already discarded it; do not let this
+  // detached continuation mark the replacement UI offline or persist anything.
+  if (deliveryRevision !== replicaRevision) return;
   msg.inflight = false;
   if (res && res.ok) {
     msg.mstate = 'sent';            // 2xx (incl. duplicate) — server has it
@@ -1996,7 +2297,7 @@ async function deliver(msg) {
 /* Retry every undelivered outbox message. Called on reconnect, on returning
    to the foreground, and when an offline contact comes back to life. */
 function flushOutbox() {
-  if (!navigator.onLine) return;
+  if (!navigator.onLine || authoritativeSyncPending) return;
   for (const msg of state.pending) {
     if (msg.inflight) continue;
     if (msg.mstate !== 'sent') deliver(msg);
@@ -2044,9 +2345,10 @@ function loadPending() {
   }));
 }
 
-/** @param {string} agent @param {string} key */
-async function approve(agent, key) {
-  await api('/api/approve', { agent, key });
+/** @param {string} agent @param {string} key @param {string | null} renderedEpoch */
+async function approve(agent, key, renderedEpoch) {
+  const res = await api('/api/approve', { agent, key }, renderedEpoch);
+  return !!(res && res.ok);
 }
 
 /* ---------- notifications (best-effort; no-op where unsupported) ----------

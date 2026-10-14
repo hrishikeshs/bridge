@@ -28,6 +28,22 @@ export async function clearDeliveredNotifications() {
     if (!('serviceWorker' in navigator)) return;
     const reg = await navigator.serviceWorker.ready;
     (await reg.getNotifications()).forEach((n) => {
+      const data = n.data || {};
+      const currentGeneration = Number(state.serverGeneration) || 0;
+      const notificationGeneration = Number(data.server_generation) || 0;
+      const currentEpoch = state.serverEpoch || '';
+      // A background tab can still hold generation A after the worker has
+      // already accepted a generation-B push. Older page truth has no authority
+      // to dismiss that future notification; its pending sync will catch up.
+      if (!currentEpoch) return;
+      if (currentGeneration && notificationGeneration > currentGeneration) return;
+      // A notification is another local replica. Anything not stamped by the
+      // authoritative daemon generation is stale (including legacy banners).
+      if (notificationGeneration !== currentGeneration
+          || data.server_epoch !== currentEpoch) {
+        n.close();
+        return;
+      }
       // Opening the app clears DELIVERED notifications — but a "needs you"
       // whose prompt is still open is a live demand, not a delivered one.
       // Closing it here silenced other agents' active prompts every time the
@@ -37,6 +53,23 @@ export async function clearDeliveredNotifications() {
       n.close();
     });
   } catch (e) { /* unsupported or not yet registered — nothing to clear */ }
+}
+
+// Advance the service worker's durable push fence as soon as /api/sync adopts
+// a daemon generation, even if that daemon has not sent a Web Push yet.
+export function advanceNotificationGeneration() {
+  if (!('serviceWorker' in navigator)) return;
+  const generation = Number(state.serverGeneration) || 0;
+  const epoch = state.serverEpoch || '';
+  if (!generation || !epoch) return;
+  const message = { type: 'server-generation', generation, epoch };
+  if (navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage(message);
+    return;
+  }
+  navigator.serviceWorker.ready
+    .then((reg) => { if (reg.active) reg.active.postMessage(message); })
+    .catch(() => {});
 }
 
 // Trace push setup/errors without breaking the flow. Was called but never
@@ -200,12 +233,30 @@ export function maybeNotify(event) {
   } else {
     return;
   }
+  const renderedEpoch = state.serverEpoch;
+  const renderedGeneration = Number(state.serverGeneration) || 0;
+  if (!renderedEpoch || !renderedGeneration) return;
+  const message = {
+    type: 'page-notification', title, body, tag, contact: event.agent,
+    server_epoch: renderedEpoch,
+    server_generation: renderedGeneration,
+  };
+  // The worker serializes this with push delivery and generation advancement.
+  // A direct registration.showNotification() can finish after a newer daemon's
+  // cleanup and repaint a stale banner; one worker queue makes that impossible.
+  if (navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage(message);
+    return;
+  }
   navigator.serviceWorker.ready
-    .then((reg) => reg.showNotification(title, {
-      body, tag,
-      icon: '/icons/icon-192.png',
-      badge: '/icons/icon-192.png',
-      data: { contact: event.agent },
-    }))
-    .catch(() => { try { new Notification(title, { body }); } catch (e) { /* blocked */ } });
+    .then((reg) => {
+      if (state.serverEpoch !== renderedEpoch
+          || Number(state.serverGeneration) !== renderedGeneration) return;
+      if (reg.active) reg.active.postMessage(message);
+    })
+    .catch(() => {
+      if (state.serverEpoch !== renderedEpoch
+          || Number(state.serverGeneration) !== renderedGeneration) return;
+      try { new Notification(title, { body }); } catch (e) { /* blocked */ }
+    });
 }
