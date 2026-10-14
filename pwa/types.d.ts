@@ -135,10 +135,12 @@ interface State {
   guidance: { agent: string; until: number } | null;
   lastContact: number | null;
   serverStarted: number | null;
+  serverEpoch: string | null;
+  serverGeneration: number | null;
   seenWake: number;
   wakeNote: { from?: number; to?: number; until: number } | null;
   wired: boolean;
   hydrated: boolean;
-  /** Set true after the first /api/status; gates the "Mac was asleep" banner. */
+  /** Set true after the first /api/sync; gates the "Mac was asleep" banner. */
   wakeSeenOnce?: boolean;
 }

@@ -5,7 +5,12 @@
 
 'use strict';
 
-const CACHE = 'bridge-v47';
+const CACHE = 'bridge-v49';
+// Unlike the replaceable shell cache, this tiny ledger is part of notification
+// correctness: it remembers which daemon generation the phone has accepted
+// even when the worker is replaced or the shell cache is upgraded.
+const GENERATION_CACHE = 'bridge-notification-generation-v1';
+const GENERATION_LEDGER_KEY = '/__bridge_notification_generation__';
 // app.js is a native ES module that imports these peeled modules; every one must
 // be precached (a missed entry = a broken PWA offline on the phone). Bump CACHE
 // whenever this list or any shell file changes.
@@ -34,7 +39,8 @@ self.addEventListener('install', (e) => {
 self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      Promise.all(keys.filter((k) => k !== CACHE && k !== GENERATION_CACHE)
+        .map((k) => caches.delete(k))))
   );
   self.clients.claim();
 });
@@ -69,6 +75,218 @@ self.addEventListener('fetch', (e) => {
   e.waitUntil(network.then(() => undefined, () => undefined));
 });
 
+/* Notification generation ledger.
+
+   The daemon's per-tag push sequence starts over after a restart. Comparing
+   only that sequence would let either a fresh low sequence be rejected by an
+   old high one, or a delayed old-generation push replace current state. The
+   durable daemon generation orders those two worlds globally; server_epoch
+   authenticates same-generation messages as belonging to the same process.
+
+   Both push delivery and app messages use this one promise chain. Service
+   worker events may overlap, and a read/modify/write ledger without this
+   serialization can lose an advancement even though Cache Storage persists
+   each individual write. */
+let generationLedger;
+let generationOperations = Promise.resolve();
+
+function serializedGenerationOperation(fn) {
+  const operation = generationOperations.then(fn, fn);
+  // A failed Cache Storage operation must not poison every later event.
+  generationOperations = operation.catch(() => undefined);
+  return operation;
+}
+
+function emptyGenerationLedger() {
+  return { generation: 0, epoch: '', sequences: Object.create(null) };
+}
+
+function corruptGenerationLedger() {
+  return { generation: 0, epoch: '', sequences: Object.create(null), corrupt: true };
+}
+
+function validGeneration(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function normalizeSequence(value) {
+  if (value === undefined || value === null || value === 0) return 0;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value : null;
+}
+
+function normalizeGenerationLedger(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      !(value.generation === 0 || validGeneration(value.generation)) ||
+      typeof value.epoch !== 'string' ||
+      !value.sequences || typeof value.sequences !== 'object' ||
+      Array.isArray(value.sequences)) return null;
+  const epoch = value.epoch.trim();
+  if ((value.generation === 0 && epoch) || (value.generation > 0 && !epoch)) return null;
+
+  const ledger = { generation: value.generation, epoch, sequences: Object.create(null) };
+  for (const [tag, seq] of Object.entries(value.sequences)) {
+    const normalized = normalizeSequence(seq);
+    if (!normalized) return null;
+    ledger.sequences[tag] = normalized;
+  }
+  return ledger;
+}
+
+function copyGenerationLedger(ledger) {
+  return {
+    generation: ledger.generation,
+    epoch: ledger.epoch,
+    sequences: Object.assign(Object.create(null), ledger.sequences),
+  };
+}
+
+async function loadGenerationLedger() {
+  if (generationLedger) return generationLedger;
+  const cache = await caches.open(GENERATION_CACHE);
+  const response = await cache.match(GENERATION_LEDGER_KEY);
+  if (!response) {
+    generationLedger = emptyGenerationLedger();
+    return generationLedger;
+  }
+  try {
+    generationLedger = normalizeGenerationLedger(await response.json()) ||
+      corruptGenerationLedger();
+  } catch (_) {
+    // Resetting corrupt durable state to generation 0 would admit delayed
+    // legacy pushes. Fail closed until the open PWA supplies an authoritative
+    // generation message, which can safely rebuild the ledger.
+    generationLedger = corruptGenerationLedger();
+  }
+  return generationLedger;
+}
+
+async function storeGenerationLedger(ledger) {
+  const cache = await caches.open(GENERATION_CACHE);
+  await cache.put(GENERATION_LEDGER_KEY, new Response(JSON.stringify(ledger), {
+    headers: { 'Content-Type': 'application/json' },
+  }));
+  generationLedger = ledger;
+}
+
+function notificationNamespace(notification) {
+  const data = notification && notification.data ? notification.data : {};
+  return {
+    generation: validGeneration(data.server_generation) ? data.server_generation : 0,
+    epoch: typeof data.server_epoch === 'string' ? data.server_epoch.trim() : '',
+  };
+}
+
+async function retireNotificationsOutside(generation, epoch, authoritative) {
+  const delivered = await self.registration.getNotifications();
+  for (const notification of delivered) {
+    const namespace = notificationNamespace(notification);
+    const outside = namespace.generation !== generation || namespace.epoch !== epoch;
+    const obsolete = namespace.generation < generation ||
+      (namespace.generation === generation && namespace.epoch !== epoch);
+    if ((authoritative && outside) || (!authoritative && obsolete)) notification.close();
+  }
+}
+
+// Returns the accepted namespace plus a private `advanced` flag, or null when
+// an event belongs to an old/unknown daemon. Missing generation is the legacy
+// generation 0 and remains acceptable only until a modern generation arrives.
+function acceptGeneration(ledger, data) {
+  const hasGeneration = Object.prototype.hasOwnProperty.call(data, 'server_generation');
+  if (!hasGeneration) {
+    if (ledger.generation !== 0) return null;
+    return { generation: 0, epoch: '', advanced: false };
+  }
+
+  const generation = data.server_generation;
+  const epoch = typeof data.server_epoch === 'string' ? data.server_epoch.trim() : '';
+  if (!validGeneration(generation) || !epoch || generation < ledger.generation) return null;
+  if (generation === ledger.generation) {
+    if (!ledger.epoch || ledger.epoch !== epoch) return null;
+    return { generation, epoch, advanced: false };
+  }
+  return { generation, epoch, advanced: true };
+}
+
+async function advanceGeneration(data, tag, seq, authoritative = false) {
+  const current = await loadGenerationLedger();
+  let accepted;
+  if (current.corrupt) {
+    const generation = data.server_generation;
+    const epoch = typeof data.server_epoch === 'string' ? data.server_epoch.trim() : '';
+    if (!authoritative || !validGeneration(generation) || !epoch) return null;
+    accepted = { generation, epoch, advanced: true };
+  } else {
+    accepted = acceptGeneration(current, data);
+  }
+  if (!accepted) return null;
+
+  let next = current.corrupt ? emptyGenerationLedger() : copyGenerationLedger(current);
+  let changed = false;
+  if (accepted.advanced) {
+    next.generation = accepted.generation;
+    next.epoch = accepted.epoch;
+    next.sequences = Object.create(null);
+    // Commit the namespace before retiring old notifications. If cleanup is
+    // interrupted, every later accepted modern event retries it below, so the
+    // two durable surfaces converge rather than stranding an old notification.
+    await storeGenerationLedger(next);
+    next = copyGenerationLedger(next);
+    changed = false;
+  }
+
+  if (accepted.generation > 0) {
+    await retireNotificationsOutside(accepted.generation, accepted.epoch, authoritative);
+  }
+
+  // Sequence 0 means deliberately unsequenced: it neither consults nor moves
+  // a tag's high-water mark. Positive sequences must strictly increase.
+  if (tag && seq) {
+    if (seq <= (next.sequences[tag] || 0)) return null;
+    next.sequences[tag] = seq;
+    changed = true;
+  }
+
+  if (changed) await storeGenerationLedger(next);
+  return accepted;
+}
+
+// An open PWA learns the daemon generation from authoritative sync and sends
+// it here. This closes stale lock-screen state immediately; no push has to
+// arrive before the service worker learns that the daemon was replaced.
+self.addEventListener('message', (e) => {
+  const data = e.data;
+  if (!data) return;
+  if (data.type === 'server-generation') {
+    e.waitUntil(serializedGenerationOperation(() => advanceGeneration({
+      server_generation: data.generation,
+      server_epoch: data.epoch,
+    }, '', 0, true)));
+    return;
+  }
+  if (data.type !== 'page-notification') return;
+  const tag = typeof data.tag === 'string' && data.tag ? data.tag : undefined;
+  e.waitUntil(serializedGenerationOperation(async () => {
+    // Page-originated banners share the exact generation queue used by Web
+    // Push. If displaying an old banner stalls while a new generation arrives,
+    // the queued advancement necessarily retires it after display completes.
+    const accepted = await advanceGeneration(data, tag, 0);
+    if (!accepted) return;
+    await self.registration.showNotification(data.title || 'bridge', {
+      body: data.body || '',
+      tag,
+      icon: '/icons/icon-192.png',
+      badge: '/icons/icon-192.png',
+      data: {
+        contact: data.contact || '',
+        seq: 0,
+        server_generation: accepted.generation,
+        server_epoch: accepted.epoch,
+      },
+    });
+  }));
+});
+
 // Web Push: the daemon fires these so the phone rings with the app closed.
 self.addEventListener('push', (e) => {
   let d = { title: 'bridge', body: '' };
@@ -78,36 +296,47 @@ self.addEventListener('push', (e) => {
     const parsed = e.data.json();
     d = (parsed && typeof parsed === 'object') ? parsed : {};
   } catch (_) { if (e.data) d.body = e.data.text(); }
-  const tag = d.tag || undefined;
-  const seq = Number(d.seq) || 0;
-  e.waitUntil((async () => {
-    // Web Push has no ordering guarantee: a same-tag push REPLACES what's on
-    // screen, so a stale "✓ handled" arriving late would erase a fresh "needs
-    // you". The daemon stamps a per-tag sequence; never show a push older
-    // than the notification already displayed for its tag.
-    if (tag && seq) {
-      const existing = await self.registration.getNotifications({ tag });
-      if (existing.some((n) => n.data && Number(n.data.seq) > seq)) return;
-    }
+  const tag = typeof d.tag === 'string' && d.tag ? d.tag : undefined;
+  const seq = normalizeSequence(d.seq);
+  e.waitUntil(serializedGenerationOperation(async () => {
+    if (seq === null) return;
+    const accepted = await advanceGeneration(d, tag, seq);
+    if (!accepted) return;
     await self.registration.showNotification(d.title || 'bridge', {
       body: d.body || '',
       tag,
       icon: '/icons/icon-192.png',
       badge: '/icons/icon-192.png',
-      data: { contact: d.contact || '', seq },   // deep-link target on tap + ordering
+      // Deep-link target on tap plus enough provenance to retire delivered
+      // notifications when a newer daemon generation is observed.
+      data: {
+        contact: d.contact || '',
+        seq,
+        server_generation: accepted.generation,
+        server_epoch: accepted.epoch,
+      },
     });
-  })());
+  }));
 });
 
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
   const contact = (e.notification.data && e.notification.data.contact) || '';
-  const url = contact ? '/?contact=' + encodeURIComponent(contact) : '/';
+  const namespace = notificationNamespace(e.notification);
+  let url = contact ? '/?contact=' + encodeURIComponent(contact) : '/';
+  if (contact && namespace.generation && namespace.epoch) {
+    url += '&server_generation=' + namespace.generation
+      + '&server_epoch=' + encodeURIComponent(namespace.epoch);
+  }
   e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true })
     .then((wins) => {
       for (const w of wins) {
         if ('focus' in w) {
-          if (contact) w.postMessage({ type: 'open-contact', contact });
+          if (contact) w.postMessage({
+            type: 'open-contact', contact,
+            server_generation: namespace.generation,
+            server_epoch: namespace.epoch,
+          });
           return w.focus();
         }
       }

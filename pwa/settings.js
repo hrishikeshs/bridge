@@ -22,13 +22,18 @@
 
 'use strict';
 
-import { $, state, renderList } from './app.js';
+import { $, state, renderList, api } from './app.js';
 import {
   THEMES, THEME_INFO, currentTheme, setTheme,
   WALLPAPERS, WALLPAPER_NAMES, currentWallpaper, setWallpaper,
   paletteFollowsSun, setPaletteSun,
 } from './appearance.js';
 import { updatePushButton, setPushEnabled, pushUserOff } from './notifications.js';
+
+// Epoch of the server replica that populated the open sheet. A daemon restart
+// invalidates edits still sitting in that old DOM, just like an old approval
+// button; device-local appearance and notification controls remain independent.
+let settingsEpoch = null;
 
 // The gear opens a slide-up sheet: a theme picker (applies + persists on tap)
 // and the notification control (state + enable flow, relocated from the gear).
@@ -70,33 +75,33 @@ document.getElementById('notif-row').addEventListener('click', async () => {
 // input, so an edit saves when you leave the field; Enter blurs to commit it.
 // The ✕ clears. Both POST /api/mystatus {text}; the daemon echoes a live
 // 'mystatus' event so every open phone (and the next agent to reach out) syncs.
-document.getElementById('mystatus-input').addEventListener('change', (e) => saveMyStatus(/** @type {HTMLInputElement} */ (e.target).value));
+document.getElementById('mystatus-input').addEventListener('change', (e) =>
+  saveMyStatus(/** @type {HTMLInputElement} */ (e.target).value, settingsEpoch));
 document.getElementById('mystatus-input').addEventListener('keydown', (e) => {
   if (/** @type {KeyboardEvent} */ (e).key === 'Enter') { e.preventDefault(); /** @type {HTMLInputElement} */ (e.target).blur(); }
 });
 // preventDefault on mousedown keeps the input focused when ✕ is tapped, so its
 // blur doesn't fire a spurious 'change' (old value) that races the clear's POST.
 document.getElementById('mystatus-clear').addEventListener('mousedown', (e) => e.preventDefault());
-document.getElementById('mystatus-clear').addEventListener('click', () => { /** @type {HTMLInputElement} */ ($('mystatus-input')).value = ''; saveMyStatus(''); });
+document.getElementById('mystatus-clear').addEventListener('click', () => {
+  /** @type {HTMLInputElement} */ ($('mystatus-input')).value = '';
+  saveMyStatus('', settingsEpoch);
+});
 
-/** @param {string} text */
-async function saveMyStatus(text) {
+/** @param {string} text @param {string | null} renderedEpoch */
+async function saveMyStatus(text, renderedEpoch) {
+  if (!renderedEpoch || renderedEpoch !== state.serverEpoch) return;
   // Mirror the daemon's clampAway: one line, capped — so the input and the
   // stored value never disagree (the daemon clamps again authoritatively).
   text = (text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120);
   state.myStatus = text;
   /** @type {HTMLInputElement} */ ($('mystatus-input')).value = text;
   renderMyStatus();
-  try {
-    await fetch('/api/mystatus', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
-  } catch (e) { /* offline — the daemon keeps its last value; a later edit retries */ }
+  await api('/api/mystatus', { text }, renderedEpoch);
 }
 
 export function openSettings() {
+  settingsEpoch = state.serverEpoch;
   renderThemeOptions();
   renderWallpaperOptions();
   renderPaletteSun();
@@ -161,6 +166,15 @@ function renderPaletteSun() {
 
 function closeSettings() {
   $('settings-sheet').classList.add('hidden');
+  settingsEpoch = null;
+}
+
+// Drop server-derived editor state when the daemon generation changes. Theme,
+// wallpaper, Focus and notification preferences are device-owned and survive.
+export function resetSettingsState() {
+  closeSettings();
+  const input = /** @type {HTMLInputElement | null} */ ($('mystatus-input'));
+  if (input) input.value = '';
 }
 
 function renderThemeOptions() {

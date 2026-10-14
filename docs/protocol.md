@@ -43,18 +43,35 @@ audited; bodies capped; history durable (JSONL on disk).
 - `POST /api/pair {code, device}` → Set-Cookie token. Codes: 6 digits,
   10-minute, single-use, printed only by `bridge pair` on the machine.
 - `GET  /api/status` → `{contacts: [{id, name, directory, status, health,
-  attention}], version}`. `status`: `live | offline`. `health`:
+  attention}], version, server_epoch, server_generation}`. `server_epoch` is a
+  fresh random value for each daemon process; `server_generation` is a durable,
+  monotonic boot counter used to order delayed notifications across restarts.
+  `status`: `live | offline`. `health`:
   `ok | working | prompt | offline`. Non-tmux contacts additionally carry
   `transport` (`"remote"`) and `transport_flavor` (`"emacs"`), so the buddy
   list can tell a vterm from a tmux window (§7).
+- `GET  /api/sync?since=N&epoch=E` → the status fields plus `{events, reset}`.
+  This is the PWA's authoritative wake transaction. When `E` matches the
+  current `server_epoch`, `events` is the delta after `N`; otherwise `reset` is
+  true and the daemon ignores `N`, returning all retained history. The PWA then
+  discards its operational replica—including ambiguous pending sends—and trusts
+  the server snapshot. Device preferences and drafts remain local.
 - `POST /api/send {agent, text, client_id}` → 200 | 200 duplicate | 409 offline.
   `agent` = contact id or name.
 - `POST /api/approve {agent, key}` — key ∈ `1 2 3 y n esc` and only while a
   prompt is open (hook-attested, see §5).
 - `POST /api/upload {agent, text, image, client_id}` — photo saved locally
   (daemon-named, 0600), path handed to the agent to Read.
-- `GET  /api/history?since=N`, `GET /api/events` (SSE, resume by id;
-  transient `typing` events carry no id).
+- `GET  /api/history?since=N`, `GET /api/events?since=N&epoch=E` (SSE, resume by
+  id; transient `typing` events carry no id). A stale SSE epoch is rejected with
+  412 before the stream opens.
+
+Generation-bound PWA actions carry `X-Bridge-Server-Epoch: E`. If the daemon
+restarted after the last sync, it rejects the mutation with 412 before invoking
+the endpoint. The header is optional for older API clients. Web Push payloads
+carry both generation fields; the service worker durably orders them by
+`(server_generation, per-tag sequence)` so an older daemon cannot repaint the
+new daemon's lock-screen state after delivery is delayed.
 
 Idempotency: `client_id` dedup (200-entry ring) — retries never
 double-deliver.

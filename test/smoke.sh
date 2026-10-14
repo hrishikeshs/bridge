@@ -240,6 +240,13 @@ body_has "status returns version"         '"version":"0.1.0"'  "$STATUS_BODY"
 # round 4: presence clocks for the phone (now + daemon start time)
 body_has "status returns server clock"    '"now":'             "$STATUS_BODY"
 body_has "status returns daemon start"    '"started":'         "$STATUS_BODY"
+body_has "status returns daemon epoch"    '"server_epoch":"'  "$STATUS_BODY"
+body_has "status returns daemon generation" '"server_generation":' "$STATUS_BODY"
+DAEMON_EPOCH=$(printf '%s' "$STATUS_BODY" | sed -n 's/.*"server_epoch":"\([^"]*\)".*/\1/p')
+SYNC_BODY=$(curl -s "${DEV_AUTH[@]}" "$BASE/api/sync?since=900&epoch=stale-epoch")
+body_has "sync replaces a stale generation" '"reset":true' "$SYNC_BODY"
+body_has "sync carries the current epoch" "\"server_epoch\":\"$DAEMON_EPOCH\"" "$SYNC_BODY"
+check "stale mutation is fenced -> 412" 412 "$(code "${DEV_AUTH[@]}" "${J[@]}" -H 'X-Bridge-Server-Epoch: stale-epoch' -d "$GHOST_BODY" $BASE/api/send)"
 
 # --- register a fake contact via the local API ----------------------------
 check "local/connect registers contact"   200 "$(code "${J[@]}" "${LOCAL_AUTH[@]}" -d "$CONNECT_BODY" $BASE/local/connect)"

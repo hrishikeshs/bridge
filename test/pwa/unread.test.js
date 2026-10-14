@@ -45,13 +45,15 @@ test('a fresh load seeded with the cursor stays cleared (the reopen honours it)'
   await h1.sse({ id: 100, type: 'reply', agent: 'vint', name: 'vint', text: 'hi', ts: '2026-07-07T10:00:00Z' });
   await h1.openContact('vint');   // markSeen
   const lastSeen = h1.win.localStorage.getItem('lastSeen');
+  const eventCache = h1.win.localStorage.getItem('eventCache');
   assert.ok(lastSeen, 'first session persisted a cursor');
+  assert.ok(eventCache, 'first session persisted the epoch-bound replica');
   h1.teardown();
 
   // Second session (a "reopen"): same history, seeded with that cursor. The
   // already-read reply must NOT re-surface as unread.
   const h2 = await loadApp({
-    localStorage: { lastSeen },
+    localStorage: { lastSeen, eventCache },
     history: [{ id: 100, type: 'reply', agent: 'vint', name: 'vint', text: 'hi', ts: '2026-07-07T10:00:00Z' }],
   });
   t.after(() => h2.teardown());

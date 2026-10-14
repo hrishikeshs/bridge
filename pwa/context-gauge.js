@@ -10,12 +10,12 @@
    idle — health "ok" is the one idle state; working / prompt / offline render it
    greyed and inert (you compact an agent who has put its pen down, not one
    mid-thought). A tap opens a confirm sheet; only on confirm does it POST
-   /api/compact {agent:id} — never a typed command. Contract: /api/status may
+   /api/compact {agent:id} — never a typed command. Contract: /api/sync may
    carry contact.context_pct (int 0-100, omitted when unknown); the daemon
    re-derives it after a compact, so the bar simply drops on the next poll.
 
    All per-contact fields (health, away, context_pct, …) ride on the raw contact
-   objects assigned in refreshStatus/init — nothing to store separately. */
+   objects assigned in syncReplica/init — nothing to store separately. */
 
 'use strict';
 
@@ -30,9 +30,12 @@ const CTX_COLOR_MIX = !!(window.CSS && CSS.supports &&
 // contact id -> ms until which an in-flight compact keeps the bar in its brief
 // "compacting…" state. Cleared when it expires or the next poll drops the bar.
 const compactState = new Map();
+const compactOperations = new Map();
+let compactOperationSeq = 0;
 const COMPACT_GRACE_MS = 30000;   // one status-poll cycle: a hard ceiling on "compacting…"
 
 let compactTarget = null;         // contact id the open confirm sheet acts on
+let compactEpoch = null;          // daemon generation that rendered the target
 let ctxToastTimer = null;
 
 // Validate context_pct off a contact per the contract: an int 0-100, or null
@@ -135,7 +138,7 @@ function ensureCompactUI() {
   root.appendChild(sheet);
   $('ctx-confirm-backdrop').addEventListener('click', closeCompactConfirm);
   $('ctx-confirm-cancel').addEventListener('click', closeCompactConfirm);
-  $('ctx-confirm-ok').addEventListener('click', () => doCompact(compactTarget));
+  $('ctx-confirm-ok').addEventListener('click', () => doCompact(compactTarget, compactEpoch));
 
   const toast = document.createElement('div');
   toast.id = 'ctx-toast';
@@ -147,6 +150,7 @@ function ensureCompactUI() {
 function openCompactConfirm(contact) {
   ensureCompactUI();
   compactTarget = contact.id;
+  compactEpoch = state.serverEpoch;
   const name = contact.name || threadName(contact.id) || 'this agent';
   $('ctx-confirm-msg').textContent =
     'Compact ' + name + '’s context? This summarizes the conversation so far to free up room.';
@@ -157,20 +161,34 @@ function closeCompactConfirm() {
   const el = $('ctx-confirm');
   if (el) el.classList.add('hidden');
   compactTarget = null;
+  compactEpoch = null;
+}
+
+// A daemon-generation change invalidates both the selected contact and any
+// optimistic "compacting…" state. The app calls this while replacing its whole
+// server replica; appearance preferences remain untouched.
+export function resetContextGaugeState() {
+  closeCompactConfirm();
+  compactState.clear();
+  compactOperations.clear();
 }
 
 // Confirmed: POST /api/compact (same device auth as every other /api/* POST via
 // api()). Show a brief optimistic "compacting…" state; on 200 the next poll
 // drops the bar; on 409/400/failure undo it and say so gently (never loudly).
-/** @param {string | null} id */
-async function doCompact(id) {
+/** @param {string | null} id @param {string | null} renderedEpoch */
+async function doCompact(id, renderedEpoch) {
   closeCompactConfirm();
   if (!id) return;
+  const operation = ++compactOperationSeq;
+  compactOperations.set(id, operation);
   compactState.set(id, Date.now() + COMPACT_GRACE_MS);
   if (state.view === 'thread') updateThreadHeader();
-  const res = await api('/api/compact', { agent: id });
+  const res = await api('/api/compact', { agent: id }, renderedEpoch);
+  if (renderedEpoch !== state.serverEpoch || compactOperations.get(id) !== operation) return;
   const name = threadName(id) || 'the agent';
   if (res && res.ok) return;                    // 200 {ok:true}: poll clears the bar
+  compactOperations.delete(id);
   compactState.delete(id);                      // undo the optimistic state
   if (state.view === 'thread') updateThreadHeader();
   if (res && res.status === 409) {
