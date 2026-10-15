@@ -22,7 +22,7 @@
 
 'use strict';
 
-import { $, state, renderList } from './app.js';
+import { $, state, renderList, bridgeFetch } from './app.js';
 import {
   THEMES, THEME_INFO, currentTheme, setTheme,
   WALLPAPERS, WALLPAPER_NAMES, currentWallpaper, setWallpaper,
@@ -88,7 +88,7 @@ async function saveMyStatus(text) {
   /** @type {HTMLInputElement} */ ($('mystatus-input')).value = text;
   renderMyStatus();
   try {
-    await fetch('/api/mystatus', {
+    await bridgeFetch('/api/mystatus', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),

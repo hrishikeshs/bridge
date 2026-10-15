@@ -153,6 +153,22 @@ export function threadName(id) {   // exported: context-gauge.js
 
 let reconnectDelay = 1000;   // capped exponential backoff for SSE
 let reconnectTimer = null;
+let offlineRetryTimer = null;
+
+// A tailnet route can be black-holed while the phone still reports itself
+// online. Bound status probes, and explain a sustained network-level failure
+// once per outage. Any HTTP response proves the route works, even if Bridge
+// itself answers with an error, so only a rejected/timed-out fetch earns the
+// Tailscale hint.
+const STATUS_TIMEOUT_MS = 5000;
+const CONNECTION_HELP_DELAY_MS = 6000;
+let statusRequestPromise = null;
+let connectionHelpTimer = null;
+let connectionHelpShownForOutage = false;
+let connectionHelpPreviousFocus = null;
+/** @type {HTMLElement[]} */
+let connectionHelpInerted = [];
+let connectionProofRevision = 0;
 
 setInterval(() => {                 // expire stale typing bubbles
   const now = Date.now();
@@ -165,16 +181,200 @@ setInterval(() => {                 // expire stale typing bubbles
 
 /* ---------- bootstrap ---------- */
 
+function userIsEditing() {
+  const active = document.activeElement;
+  if (!active) return false;
+  return active.tagName === 'INPUT' || active.tagName === 'TEXTAREA'
+    || active.tagName === 'SELECT' || /** @type {HTMLElement} */ (active).isContentEditable;
+}
+
+function connectionHelpTimerFired() {
+  connectionHelpTimer = null;
+  if (!navigator.onLine || document.hidden || connectionHelpShownForOutage) return;
+  // Never dismiss the iOS keyboard or steal a half-written message. The
+  // persistent banner remains visible, and the sheet waits until editing ends.
+  if (userIsEditing()) {
+    connectionHelpTimer = setTimeout(connectionHelpTimerFired, CONNECTION_HELP_DELAY_MS);
+    return;
+  }
+  showConnectionHelp();
+}
+
+function beginConnectionProbe() {
+  if (!navigator.onLine || document.hidden
+      || connectionHelpShownForOutage || connectionHelpTimer) return;
+  connectionHelpTimer = setTimeout(connectionHelpTimerFired, CONNECTION_HELP_DELAY_MS);
+}
+
+function cancelConnectionHelpTimer() {
+  clearTimeout(connectionHelpTimer);
+  connectionHelpTimer = null;
+}
+
+// Any response from /api/status proves that Tailscale/the network path reached
+// the Mac. Clear both a pending prompt and a visible one; HTTP/auth handling is
+// deliberately left to the caller.
+function noteConnectionPathReached() {
+  connectionProofRevision++;
+  cancelConnectionHelpTimer();
+  connectionHelpShownForOutage = false;
+  hideConnectionHelp();
+}
+
+function showConnectionHelp() {
+  if (!navigator.onLine) return;
+  connectionHelpShownForOutage = true;
+  const sheet = $('connection-help');
+  if (!sheet || !sheet.classList.contains('hidden')) return;
+  connectionHelpPreviousFocus = document.activeElement;
+  $('connection-help-result').classList.add('hidden');
+  $('connection-help-result').textContent = '';
+  const retry = /** @type {HTMLButtonElement} */ ($('connection-help-retry'));
+  retry.disabled = false;
+  retry.textContent = 'Try again';
+  sheet.classList.remove('hidden');
+  const app = $('app');
+  connectionHelpInerted = [];
+  if (app) {
+    for (const child of Array.from(app.children)) {
+      if (child === sheet || child.hasAttribute('inert')) continue;
+      child.setAttribute('inert', '');
+      connectionHelpInerted.push(/** @type {HTMLElement} */ (child));
+    }
+  }
+  retry.focus();
+}
+
+function hideConnectionHelp() {
+  const sheet = $('connection-help');
+  if (!sheet || sheet.classList.contains('hidden')) return;
+  sheet.classList.add('hidden');
+  for (const element of connectionHelpInerted) element.removeAttribute('inert');
+  connectionHelpInerted = [];
+  const previous = connectionHelpPreviousFocus;
+  connectionHelpPreviousFocus = null;
+  if (previous && typeof previous.focus === 'function') previous.focus();
+}
+
+// Going genuinely offline has its own accurate banner. Suppress the tailnet
+// hint until the next online status probe establishes a fresh route failure.
+function suspendConnectionHelp() {
+  cancelConnectionHelpTimer();
+  connectionHelpShownForOutage = false;
+  hideConnectionHelp();
+}
+
+/** @param {KeyboardEvent} event */
+function trapConnectionHelpFocus(event) {
+  if (event.key !== 'Tab') return;
+  const sheet = $('connection-help');
+  if (!sheet || sheet.classList.contains('hidden')) return;
+  const controls = /** @type {HTMLElement[]} */ (
+    Array.from(sheet.querySelectorAll('button:not([disabled])'))
+  );
+  if (!controls.length) return;
+  const first = controls[0], last = controls[controls.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault(); first.focus();
+  }
+}
+
+/** @returns {Promise<{kind:'ok', data:any}|{kind:'unauthorized'}|{kind:'server-error'}|{kind:'network-error', proofRevision:number}>} */
+function requestStatus() {
+  // A foreground caller can coalesce onto a request whose prompt timer was
+  // cancelled while hidden. Re-arm before the early return.
+  beginConnectionProbe();
+  if (statusRequestPromise) return statusRequestPromise;
+  const proofRevision = connectionProofRevision;
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), STATUS_TIMEOUT_MS);
+  /** @type {Promise<{kind:'ok', data:any}|{kind:'unauthorized'}|{kind:'server-error'}|{kind:'network-error', proofRevision:number}>} */
+  const request = (async () => {
+    try {
+      const res = await fetch('/api/status', { signal: ctrl.signal });
+      noteConnectionPathReached();
+      if (res.status === 401) return { kind: 'unauthorized' };
+      if (!res.ok) return { kind: 'server-error' };
+      try {
+        return { kind: 'ok', data: await res.json() };
+      } catch (_) {
+        return { kind: 'server-error' };
+      }
+    } catch (_) {
+      // Leave the grace timer armed. A successful retry inside the grace
+      // period cancels it; otherwise the help sheet appears exactly once.
+      return { kind: 'network-error', proofRevision };
+    } finally {
+      clearTimeout(timeout);
+    }
+  })();
+  statusRequestPromise = request;
+  void request.finally(() => {
+    if (statusRequestPromise === request) statusRequestPromise = null;
+  });
+  return request;
+}
+
+async function retryConnectionNow() {
+  const retry = /** @type {HTMLButtonElement} */ ($('connection-help-retry'));
+  const result = $('connection-help-result');
+  retry.disabled = true;
+  retry.textContent = 'Checking…';
+  result.classList.add('hidden');
+  clearTimeout(offlineRetryTimer);
+  offlineRetryTimer = null;
+
+  let reached = false;
+  if (state.wired) {
+    reached = await refreshStatus();
+    if (reached) { connectEvents(); flushOutbox(); }
+  } else {
+    await init();
+    reached = state.connected;
+  }
+  // Success (or a 401) already closed the sheet through requestStatus().
+  if ($('connection-help').classList.contains('hidden')) return;
+  if (!reached) {
+    result.textContent = 'Still can’t reach Bridge. Check Tailscale and your Mac, then try again.';
+    result.classList.remove('hidden');
+    retry.disabled = false;
+    retry.textContent = 'Try again';
+  }
+}
+
+// The service worker updates shell assets independently. During an upgrade an
+// old cached index can briefly execute this new app.js, so every new-shell
+// binding is optional until the next coherent load.
+const connectionRetry = $('connection-help-retry');
+const connectionDismiss = $('connection-help-dismiss');
+const connectionBackdrop = $('connection-help-backdrop');
+const connectionSheet = $('connection-help');
+if (connectionRetry) connectionRetry.addEventListener('click', retryConnectionNow);
+if (connectionDismiss) connectionDismiss.addEventListener('click', hideConnectionHelp);
+if (connectionBackdrop) connectionBackdrop.addEventListener('click', hideConnectionHelp);
+if (connectionSheet) connectionSheet.addEventListener('keydown', trapConnectionHelpFocus);
+window.addEventListener('offline', suspendConnectionHelp);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) cancelConnectionHelpTimer();
+});
+
 async function init() {
   // Replay the local cache into state before the first network round-trip, so a
   // warm open paints instantly and loadHistory only has to fetch the delta since
   // the cached cursor. Guarded (once): init re-runs on pairing and the offline
   // retry loop, but the cache must fold in exactly once.
   hydrateCache();
-  const res = await fetch('/api/status').catch(() => null);
-  if (!res) return showOffline();          // unreachable: show cached feed
-  if (res.status === 401) return showPairing();
-  const data = await res.json();
+  const status = await requestStatus();
+  if (status.kind === 'network-error') {
+    return showOffline(status.proofRevision === connectionProofRevision);
+  }
+  if (status.kind === 'unauthorized') return showPairing();
+  if (status.kind !== 'ok') return showOffline();
+  const data = status.data;
+  clearTimeout(offlineRetryTimer);
+  offlineRetryTimer = null;
   state.contacts = data.contacts || [];
   state.rooms = data.rooms || [];
   state.myStatus = data.my_status || '';
@@ -246,11 +446,16 @@ async function init() {
    was already folded in at the top of init(); hydrateCache is idempotent (its
    guard, and ingest's id guard, skip everything already seen), so this call is
    a no-op that keeps the read-only-offline path honest on its own. */
-function showOffline() {
+/** @param {boolean} [markDisconnected] */
+function showOffline(markDisconnected = true) {
   hydrateCache();
   showApp();
-  setConnected(false);
-  setTimeout(init, 5000);
+  if (markDisconnected) setConnected(false);
+  clearTimeout(offlineRetryTimer);
+  offlineRetryTimer = setTimeout(() => {
+    offlineRetryTimer = null;
+    void init();
+  }, 5000);
 }
 
 /* Persist enough to reopen warm AND to fetch only the delta next time:
@@ -331,12 +536,18 @@ $('pair-btn').addEventListener('click', async () => {
 /* ---------- data ---------- */
 
 async function refreshStatus() {
-  const res = await fetch('/api/status').catch(() => null);
+  const status = await requestStatus();
   // A revoked or missing device token is an auth problem, not a dead Mac:
   // route back to pairing instead of showing "unreachable" forever.
-  if (res && res.status === 401) return showPairing();
-  if (!res || !res.ok) return setConnected(false);
-  const data = await res.json();
+  if (status.kind === 'unauthorized') { showPairing(); return false; }
+  if (status.kind === 'network-error') {
+    // A reply, heartbeat, or POST may have proved the route after this status
+    // request began. Never let its older timeout overwrite that newer truth.
+    if (status.proofRevision === connectionProofRevision) setConnected(false);
+    return false;
+  }
+  if (status.kind !== 'ok') { setConnected(false); return false; }
+  const data = status.data;
   const wasOffline = new Map(state.contacts.map((c) => [c.id, c.status === 'offline']));
   state.contacts = data.contacts || [];
   state.rooms = data.rooms || [];
@@ -351,13 +562,14 @@ async function refreshStatus() {
   renderList();
   if (state.view === 'thread') updateThreadHeader();
   updateAttentionBanner();
+  return true;
 }
 
 async function loadHistory() {
   // Fetch only what's newer than the cached cursor — a warm open pulls the
   // delta, not all 500 events. A cold start (no cache) leaves lastEventId at 0,
   // so this naturally becomes since=0, the full history.
-  const res = await fetch('/api/history?since=' + state.lastEventId).catch(() => null);
+  const res = await bridgeFetch('/api/history?since=' + state.lastEventId).catch(() => null);
   if (!res || !res.ok) return;
   const data = await res.json();
   (data.events || []).forEach((e) => {
@@ -419,6 +631,7 @@ function connectEvents() {
   };
   source.onmessage = (msg) => {
     state.lastContact = Date.now();   // any frame proves the Mac is reachable
+    setConnected(true);
     const event = JSON.parse(msg.data);
     if (event.type === 'typing') {          // transient: never stored
       state.typing.set(event.agent, Date.now() + 6000);
@@ -491,6 +704,7 @@ function ingest(event) {
 /** @param {boolean} on */
 function setConnected(on) {
   state.connected = !!on;
+  if (on) noteConnectionPathReached();
   // Both view headers carry a connection dot; keep them in lockstep.
   document.querySelectorAll('.dot').forEach((d) => d.classList.toggle('on', !!on));
   updateBanner();
@@ -571,10 +785,10 @@ function updateBanner() {
   } else if (state.lastContact) {
     // Reachability, not just "unreachable": name when we last had the Mac, so a
     // sleeping/asleep laptop reads as a gap since HH:MM rather than a dead app.
-    banner.textContent = '⚠️ Mac unreachable since ' + clockUnix(state.lastContact / 1000) + ' — retrying…';
+    banner.textContent = '⚠️ Can’t reach Bridge since ' + clockUnix(state.lastContact / 1000) + ' — retrying…';
     banner.className = 'banner';
   } else {
-    banner.textContent = '⚠️ Mac unreachable — retrying…';
+    banner.textContent = '⚠️ Can’t reach Bridge — retrying…';
     banner.className = 'banner';
   }
 }
@@ -1883,7 +2097,11 @@ $('action-sheet').addEventListener('click', (e) => {
   closeActionSheet();
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') { closeActionSheet(); closeForwardSheet(); }
+  if (e.key === 'Escape') {
+    closeActionSheet();
+    closeForwardSheet();
+    hideConnectionHelp();
+  }
 });
 
 /* Send an emoji reaction. The badge itself arrives via the daemon's echoed
@@ -1942,12 +2160,26 @@ $('quote-chip-remove').addEventListener('click', () => { state.quote = null; ren
 /* Every POST is bounded by a 10s timeout: a hung request aborts and returns
    null (a failed send, retryable). Returns the Response otherwise so callers
    can read res.ok / res.status. */
+/**
+ * Fetch a Bridge endpoint and record any HTTP response as reachability proof.
+ * A 4xx can reject an operation while still proving the tailnet route is live.
+ * @param {RequestInfo | URL} input
+ * @param {RequestInit} [init]
+ * @returns {Promise<Response>}
+ */
+export async function bridgeFetch(input, init) {
+  const res = await fetch(input, init);
+  state.lastContact = Date.now();
+  setConnected(true);
+  return res;
+}
+
 /** @param {string} path @param {any} payload @returns {Promise<Response | null>} */
 export async function api(path, payload) {   // exported: context-gauge.js POSTs /api/compact through it
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
   try {
-    return await fetch(path, {
+    return await bridgeFetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),

@@ -16,7 +16,7 @@
 
 'use strict';
 
-import { $, state, isRoomId } from './app.js';
+import { $, state, isRoomId, bridgeFetch } from './app.js';
 
 /* iMessage behavior: opening the app clears its pile from Notification
    Center — everything a delivered banner said is richer in-app anyway. iOS
@@ -77,7 +77,7 @@ async function reconcilePushOff() {
     const sub = await reg.pushManager.getSubscription();
     if (!sub) return;
     try {
-      await fetch('/api/push/unsubscribe', { method: 'POST' });
+      await bridgeFetch('/api/push/unsubscribe', { method: 'POST' });
     } catch (e) { pushDebug('reconcile POST failed (offline?) — daemon prunes on 410 later'); }
     await sub.unsubscribe();
     pushDebug('reconciled: leaked subscription removed');
@@ -119,7 +119,7 @@ export async function setPushEnabled(on) {
   }
   localStorage.setItem(PUSH_OFF_KEY, '1');
   try {
-    await fetch('/api/push/unsubscribe', { method: 'POST' });
+    await bridgeFetch('/api/push/unsubscribe', { method: 'POST' });
   } catch (e) { pushDebug('unsubscribe POST failed (offline?) — daemon prunes on 410 later'); }
   try {
     if ('serviceWorker' in navigator) {
@@ -147,7 +147,7 @@ async function enablePush() {
     const reg = await navigator.serviceWorker.ready;
     let sub = await reg.pushManager.getSubscription();
     if (!sub) {
-      const res = await fetch('/api/push/key');
+      const res = await bridgeFetch('/api/push/key');
       if (!res.ok) { pushDebug('key fetch failed ' + res.status); return; }
       const { key } = await res.json();
       sub = await reg.pushManager.subscribe({
@@ -157,7 +157,7 @@ async function enablePush() {
         applicationServerKey: /** @type {BufferSource} */ (urlB64ToUint8Array(key)),
       });
     }
-    const subRes = await fetch('/api/push/subscribe', {
+    const subRes = await bridgeFetch('/api/push/subscribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(sub),
