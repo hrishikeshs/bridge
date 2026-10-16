@@ -633,6 +633,30 @@ header {
   background: var(--attn);
   border-color: var(--attn);
 }
+
+/* Sustained route failure help.  It shares the ordinary bottom-sheet and
+   button chrome, but sits above every other sheet because connectivity help
+   can arrive while settings or a compact confirmation is open. */
+#connection-help { z-index: 90; }
+.connection-help-panel { text-align: left; }
+.connection-help-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 8px 0 18px;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--ink);
+}
+.connection-help-note { color: var(--dim); }
+.connection-help-result {
+  margin: -6px 0 14px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--danger);
+}
+.connection-help-actions { display: flex; flex-direction: column; gap: 10px; }
+.connection-help-actions button:disabled { opacity: 0.55; }
 /* A quiet, self-dismissing toast for the gentle 409/400 messages. */
 .ctx-toast {
   position: fixed;

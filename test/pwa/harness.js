@@ -226,13 +226,16 @@ function makeFetch(harness) {
     const method = (init.method || 'GET').toUpperCase();
     let body = null;
     if (init.body != null) { try { body = JSON.parse(init.body); } catch (_) { body = init.body; } }
-    const call = { url: String(url), method, body, headers: init.headers || {} };
+    const call = {
+      url: String(url), method, body, headers: init.headers || {},
+      signal: init.signal || null,
+    };
     harness.calls.push(call);
     const p = call.url.split('?')[0];
 
     const h = harness.handlers[p];
     let spec;
-    if (typeof h === 'function') spec = h(call);
+    if (typeof h === 'function') spec = await h(call);
     else if (h) spec = h;
     else spec = harness.defaultResponse(p, call);
     return toResponse(spec);
@@ -325,11 +328,19 @@ async function loadApp(opts = {}) {
 
   // Install stubs BEFORE app.js runs — init() fires immediately on load.
   harness.clock = installClock(win);
+  Object.assign(harness.handlers, opts.handlers || {});
+  if (Object.prototype.hasOwnProperty.call(opts, 'online')) {
+    Object.defineProperty(win.navigator, 'onLine', {
+      configurable: true,
+      value: !!opts.online,
+    });
+  }
   win.fetch = makeFetch(harness);
   win.EventSource = makeEventSource(harness.esInstances);
   installNotification(win, notifPerm);
   installServiceWorker(win);
   installMisc(win, harness);
+  if (typeof opts.beforeApp === 'function') opts.beforeApp(win);
 
   // Run the app (THE SPLIT SEAM lives in injectApp / APP_ENTRY above).
   injectApp(win);
@@ -339,7 +350,10 @@ async function loadApp(opts = {}) {
   // pairing screen; then flush pending rAFs so the DOM is settled.
   await waitFor(() => harness.esInstances.length > 0
     || (win.document.getElementById('pair-screen')
-        && !win.document.getElementById('pair-screen').classList.contains('hidden')));
+        && !win.document.getElementById('pair-screen').classList.contains('hidden'))
+    || (opts.allowOffline
+        && win.document.getElementById('app')
+        && !win.document.getElementById('app').classList.contains('hidden')));
   harness.clock.tick(20);
   await flush();
 

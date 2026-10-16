@@ -186,6 +186,28 @@
         <button id="notif-row" class="sheet-row"><span id="notif-state"></span></button>
       </div>
     </div>
+
+    <!-- CONNECTION HELP — shown once per sustained network outage.  The PWA
+         cannot inspect Tailscale directly, so it names it as the most likely
+         thing to check without claiming it is definitely the cause. -->
+    <div id="connection-help" class="sheet hidden" role="dialog" aria-modal="true"
+         aria-labelledby="connection-help-title" aria-describedby="connection-help-copy">
+      <div class="sheet-backdrop" id="connection-help-backdrop" aria-hidden="true"></div>
+      <div class="sheet-panel connection-help-panel">
+        <div class="sheet-grip"></div>
+        <h2 id="connection-help-title" class="sheet-title">Can’t reach your Mac</h2>
+        <div id="connection-help-copy" class="connection-help-copy">
+          <p>Bridge couldn’t fetch the latest state.</p>
+          <p>Check that Tailscale is connected on this phone. If it is, make sure your Mac is awake and Bridge is running.</p>
+          <p class="connection-help-note">Cached conversations may be out of date. Bridge will keep retrying.</p>
+        </div>
+        <p id="connection-help-result" class="connection-help-result hidden" aria-live="polite"></p>
+        <div class="connection-help-actions">
+          <button type="button" class="ctx-btn primary" id="connection-help-retry">Try again</button>
+          <button type="button" class="ctx-btn" id="connection-help-dismiss">Not now</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script type="module" src="/app.js"></script>
